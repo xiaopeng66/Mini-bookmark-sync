@@ -1,1046 +1,1138 @@
-// background.js
+// ====== Step 0: 初始化 MiniSync 命名空间 ======
+var MiniSync = MiniSync || {};
 
-// ========== 常量定义 ==========
-const SYNC_ALARM = 'webdav_bookmark_auto_sync';
-
-const ROOT_ID = 'root';
-const HOME_FOLDER_ID = '__home_folder__';
-
-const FOLDER_TITLES = {
-  bookmarkBar: ['书签栏', 'bookmarks bar', '收藏夹栏'],
-  otherBookmarks: ['其他书签', 'other bookmarks', '其他收藏夹'],
-  mobileBookmarks: ['移动设备书签', 'mobile bookmarks'],
-  berryHome: ['berry主页', 'berry home']
-};
-
-const BERRY_HOME_TITLE = 'Berry主页';
-
-// ========== 自定义错误类型 ==========
-// 云端书签文件不存在（HTTP 404）——和网络故障/认证失败区分开，
-// 让上层能精准判断"是真没文件"还是"只是这次请求出错了"
-class CloudNotFoundError extends Error {
-  constructor(message = '云端没有书签文件') {
-    super(message);
-    this.name = 'CloudNotFoundError';
-  }
+// ====== Step 1: 加载所有模块 ======
+// ⚠️ 两种宿主加载方式不同，都要能跑：
+//   · MV3 service worker（Chrome/Edge）—— 有 importScripts，靠它按序加载；
+//   · MV2 事件页（Firefox/Gecko 系宿主，如可拓/雨见这类用 Gecko 扩展引擎的浏览器）
+//     —— 是普通文档，没有 importScripts；那些文件由 manifest 的 background.scripts
+//     按同一顺序加载，这里必须跳过。
+//   背景：Gecko 系宿主不支持 MV3 的 background.service_worker（清单校验直接报
+//   "background.service_worker is currently disabled. Add background.scripts."），
+//   在那种宿主上 MV3 包的【后台从不运行】：界面能打开，但书签数恒为 0、
+//   设备 ID 永不生成、同步完全不可能。
+if (typeof importScripts === 'function') {
+  importScripts(
+    'lib/constants.js',
+    'lib/utils.js',
+    'model/xbel.js',
+    'model/xbel-path.js',
+    'model/tombstone.js',
+    'lib/webdav.js',
+    'adapters/browser-detect.js',
+    'adapters/edge-adapter.js',
+    'adapters/berry-adapter.js',
+    'adapters/via-adapter.js',
+    'adapters/aira-adapter.js',
+    'core/bridge-patcher.js',
+    'core/storage.js',
+    'lib/import.js',
+    'lib/merge.js',
+    'core/sync-input.js',
+    'core/sync-merge.js',
+    'core/sync-orchestrator.js',
+    'lib/sync-actions.js'
+  );
 }
 
-// ========== 同步互斥锁 ==========
-// MV3 Service Worker 可能被随时回收，因此用 storage 里的时间戳做分布式锁。
-// 内存变量只作为同一次 SW 生命周期内的快路径，真正判定以 storage 为准。
-const SYNC_LOCK_KEY = 'sync_lock_at';
-const SYNC_LOCK_TIMEOUT_MS = 2 * 60 * 1000; // 2 分钟后强制视为过期
-let _memLock = false;
+// 工具栏图标 API：MV3 是 chrome.action，MV2 是 chrome.browserAction
+const ACTION_API = (typeof chrome !== 'undefined') ? (chrome.action || chrome.browserAction || null) : null;
+// 书签 API 是否可用：部分移动端分支的扩展宿主根本不向扩展开放书签接口。
+// 这种情况必须让设置页显示「不可用」，而不是伪装成「0 条」——否则排查时分不清
+// 「浏览器没给 API」和「书签真的是空的」。
+const HAS_BOOKMARKS_API = (typeof chrome !== 'undefined') && !!chrome.bookmarks && typeof chrome.bookmarks.getTree === 'function';
 
-async function acquireSyncLock(reason) {
-  if (_memLock) return false;
-  const r = await chrome.storage.local.get([SYNC_LOCK_KEY]);
-  const lockedAt = r[SYNC_LOCK_KEY] || 0;
-  if (lockedAt && Date.now() - lockedAt < SYNC_LOCK_TIMEOUT_MS) {
-    return false;
-  }
-  _memLock = true;
-  await chrome.storage.local.set({ [SYNC_LOCK_KEY]: Date.now() });
-  return true;
-}
+// ====== Step 1.5: 统一全局日志（散落的 console 自动走 MiniSync.logger，并持久化最近错误）======
+if (MiniSync.logger && MiniSync.logger.install) MiniSync.logger.install();
 
-async function releaseSyncLock() {
-  _memLock = false;
-  try { await chrome.storage.local.remove(SYNC_LOCK_KEY); } catch (_) {}
-}
-
-// 本地快照备份 key：importBookmarksFromData 清空本地前会先写一份，防止
-// Service Worker 中途被回收导致本地书签丢失。
-const LOCAL_BACKUP_KEY = 'local_backup_before_import';
-
-// 读取自动同步设置
-async function getSyncSettings() {
-  const r = await chrome.storage.local.get(['sync_enabled', 'sync_interval', 'sync_type']);
-  return {
-    enabled: !!r.sync_enabled,
-    interval: Math.max(5, Math.min(1440, parseInt(r.sync_interval, 10) || 30)),
-    type: r.sync_type || 'merge'
-  };
-}
-
-// 根据设置重新建立 alarm
-async function rescheduleAlarm() {
-  await chrome.alarms.clear(SYNC_ALARM);
-  const { enabled, interval } = await getSyncSettings();
-  if (!enabled) {
-    return;
-  }
-  chrome.alarms.create(SYNC_ALARM, {
-    delayInMinutes: 1,
-    periodInMinutes: interval
+// 加载期/运行期错误留痕：宿主形态千奇百怪（移动端 fork），后台一旦「半死」，
+// 页面上只能看到「后台未响应」。这里把错误收集起来，由 diagnose 一并报出去。
+var _bgErrors = [];
+if (typeof self !== 'undefined' && self.addEventListener) {
+  self.addEventListener('error', (e) => {
+    _bgErrors.push({ at: Date.now(), kind: 'error', message: String((e && e.message) || e) });
+    if (_bgErrors.length > 20) _bgErrors.shift();
+    persistBootReport('runtime-error');
+  });
+  self.addEventListener('unhandledrejection', (e) => {
+    const r = e && e.reason;
+    _bgErrors.push({ at: Date.now(), kind: 'unhandledrejection', message: String((r && r.message) || r) });
+    if (_bgErrors.length > 20) _bgErrors.shift();
+    persistBootReport('unhandled-rejection');
   });
 }
 
-// 自动同步：根据用户配置的 sync_type 决定执行哪种同步策略。
-//   - 'upload'   → 上传书签（本地覆盖云端）
-//   - 'download' → 下载书签（云端覆盖本地）
-//   - 'merge'    → 合并书签（两端合并，默认）
-async function runAutoSync(reason) {
-  if (!await acquireSyncLock(reason)) return;
+// ====== 开机登记 + 消息台账（★ 不依赖消息通道的排查凭据）======
+// 背景：手机端 Gecko fork 上出现过「后台答过一次消息、之后所有消息都无响应」的现象。
+// 而消息通道一旦不通，就再也问不出「后台到底有没有跑起来、消息有没有到过、崩在哪一步」——
+// 于是把状态写进 storage.local（storage 在页面侧是通的），页面直接读。
+// ⚠️ 这里不要引用 HAS_BOOKMARKS_API 等 const：本函数在脚本最开始就会被调用，
+//    那时它们还在 TDZ 里，typeof 也会抛 ReferenceError；直接问 chrome 更稳。
+var _bgBoot = { scriptAt: Date.now(), loads: 0, stage: 'script-start' };
+var _bgLastMessage = null;
+var _bgMsgCount = 0;
+
+function persistBootReport(stage) {
   try {
-    // 检查 host 权限
-    const cfg = await getWebDAVConfig();
-    if (!await hasHostPermission(cfg.url)) {
+    if (stage === 'script-start') _bgBoot.loads = (_bgBoot.loads || 0) + 1;
+    _bgBoot.stage = stage;
+    const manifest = (chrome.runtime && chrome.runtime.getManifest) ? chrome.runtime.getManifest() : {};
+    chrome.storage.local.set({
+      bg_boot_report: {
+        at: Date.now(),
+        scriptAt: _bgBoot.scriptAt,
+        loads: _bgBoot.loads || 1,
+        stage: stage,
+        version: manifest.version,
+        manifestVersion: manifest.manifest_version,
+        id: (chrome.runtime && chrome.runtime.id) || null,
+        ua: (typeof navigator !== 'undefined' && navigator.userAgent) || '(无 navigator)',
+        importScripts: typeof importScripts,
+        hasBookmarksApi: !!(chrome.bookmarks && typeof chrome.bookmarks.getTree === 'function'),
+        hasActionApi: !!(chrome.action || chrome.browserAction),
+        msgCount: _bgMsgCount || 0,
+        lastMessage: _bgLastMessage,
+        errors: (_bgErrors || []).slice(-10)
+      }
+    }, () => { void chrome.runtime.lastError; });
+  } catch (_) { /* 诊断能力不该拖垮后台：存储不可用就算了 */ }
+}
+
+function recordIncoming(type) {
+  try {
+    _bgMsgCount = (_bgMsgCount || 0) + 1;
+    _bgLastMessage = { type: type, at: Date.now(), total: _bgMsgCount };
+    chrome.storage.local.set({ bg_last_message: _bgLastMessage }, () => { void chrome.runtime.lastError; });
+  } catch (_) {}
+}
+
+// ====== 消息重放台账 ======
+// 背景：同一条消息可能被投递两次 —— 页面先走宿主消息管道（后台执行完了，但响应被宿主丢掉），
+// 页面侧超时后再走直接句柄兜底。两次都要经过 onRuntimeMessage，没有台账的话同一次同步
+// 就会【执行两遍】：白等一个超时、云端被并发写两次，UI 还只能看到第二遍的结果。
+// 页面侧给每条消息打了 __msgId（同一个 id 会随两次投递一起来），这里按它复用第一次的结果：
+// 第二次投递只拿结果，绝不重跑处理器。
+const MSG_LEDGER_TTL_MS = 60000;
+const MSG_LEDGER_MAX = 40;
+const _msgLedger = new Map(); // msgId -> { at:number, promise:Promise }
+let _msgLedgerReplays = 0;
+
+function ledgerLookup(id) {
+  const now = Date.now();
+  // 顺手清理过期项（Map 保持小尺寸，不必额外定时器）
+  for (const [k, v] of _msgLedger) {
+    if (now - v.at > MSG_LEDGER_TTL_MS) _msgLedger.delete(k);
+  }
+  return _msgLedger.get(id) || null;
+}
+
+persistBootReport('script-start');
+
+// ====== Step 2: 注册 Chrome 事件监听 ======
+
+// 安装/更新后按配置重建自动同步定时器
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === 'install') {
+    // 设置默认配置
+    chrome.storage.local.set({
+      sync_status: IDLE,
+      last_sync_time: null,
+      sync_error: ''
+    });
+  }
+  // 安装/更新后按配置重建自动同步定时器
+  setupAutoSyncAlarm().catch((e) => console.warn('[MiniSync] 设置自动同步失败:', e.message));
+});
+
+// ⚠️ 书签类监听必须整段放在 HAS_BOOKMARKS_API 守卫内：宿主不开放书签 API 时
+//    chrome.bookmarks.onRemoved 是 undefined，裸调用会在【加载期】抛异常，
+//    导致后面的 onMessage 处理器注册不上 —— 表现是设置页「后台未响应」、
+//    弹窗按钮全无反应，比单纯「不能用」更难排查。
+if (HAS_BOOKMARKS_API && chrome.bookmarks.onRemoved && chrome.bookmarks.onMoved) {
+
+// 书签删除监听：将本地删除写入墓碑，使删除能传播到云端
+chrome.bookmarks.onRemoved.addListener((id, removeInfo) => {
+  handleBookmarkRemoved(id, removeInfo).catch(e =>
+    console.warn('[MiniSync] 删除监听处理失败（忽略）:', e.message)
+  );
+});
+
+// 书签移动监听：移动（同/跨文件夹）会使相关墓碑失效，及时清除防止误删。
+// 背景：① 部分浏览器（实测 Edge）对移动操作也会派发 onRemoved，「挪动的书签」
+//   被写入墓碑后，下一轮合并会按墓碑把它删除（表现为「挪动后书签消失」）；
+//   ② 即使只有 onMoved，旧路径上的墓碑残留也会误杀后来出现在同路径的节点。
+chrome.bookmarks.onMoved.addListener((id, moveInfo) => {
+  (async () => {
+    const curStatus = await MiniSync.storage.getSyncStatus();
+    if (curStatus.status === SYNCING) return; // 落盘自身的移动不产生也不清理墓碑
+    const data = await MiniSync.storage.getLocal([STORAGE_KEYS.TOMBSTONES]);
+    const tombstones = data[STORAGE_KEYS.TOMBSTONES] || [];
+
+    // 1. 移动前快照：取该子树的旧 pathKey
+    const snapData = await MiniSync.storage.getLocal([STORAGE_KEYS.SNAPSHOTS]);
+    const prevTree = (snapData[STORAGE_KEYS.SNAPSHOTS] && snapData[STORAGE_KEYS.SNAPSHOTS].localTree) || [];
+    const prevPKMap = prevTree.length > 0 ? MiniSync.xbelPath.computeJsonPathKeys(prevTree) : new Map();
+    const subIds = new Set();
+    (function collect(n) {
+      if (n) { subIds.add(String(n.id)); (n.children || []).forEach(collect); }
+    })(moveInfo && moveInfo.node);
+    const affected = new Set();
+    for (const [nid, pk] of prevPKMap) {
+      if (subIds.has(String(nid))) affected.add(pk);
+    }
+
+    // 2. 刷新快照到移动后，取该子树的新 pathKey（新位置历史上如有墓碑一并清除）
+    await MiniSync.orchestrator.saveLocalSnapshot();
+    const newData = await MiniSync.storage.getLocal([STORAGE_KEYS.SNAPSHOTS]);
+    const newTree = (newData[STORAGE_KEYS.SNAPSHOTS] && newData[STORAGE_KEYS.SNAPSHOTS].localTree) || [];
+    if (newTree.length > 0) {
+      const newPKMap = MiniSync.xbelPath.computeJsonPathKeys(newTree);
+      for (const [nid, pk] of newPKMap) {
+        if (subIds.has(String(nid))) affected.add(pk);
+      }
+    }
+
+    // 3. ★ 记录移动意图：合并时据此判定本端是移动「发起方」（本地即最新状态，不迁移）。
+    //    显式意图标记不依赖跨端时钟（服务器时间/本机时间口径不一致，曾导致接收端被
+    //    误判为发起端，表现为「挪动书签后另一端合并不跟随」）。
+    if (affected.size > 0) {
+      const intentsData = await MiniSync.storage.getLocal(['sync_move_intents']);
+      const intents = intentsData.sync_move_intents || {};
+      const devId = await MiniSync.storage.getDeviceId();
+      const ts = Date.now();
+      for (const pk of affected) intents[pk] = { time: ts, deviceId: devId };
+      await MiniSync.storage.setLocal({ sync_move_intents: intents });
+    }
+
+    // 4. 清理相关墓碑（有墓碑才清）
+    if (tombstones.length) {
+      const filtered = tombstones.filter(t => !affected.has(t.key));
+      if (filtered.length !== tombstones.length) {
+        await MiniSync.storage.setLocal({ [STORAGE_KEYS.TOMBSTONES]: filtered });
+        console.log(`[MiniSync] 书签移动：清理相关墓碑 ${tombstones.length - filtered.length} 条`);
+      }
+    }
+
+    // 5. 防抖触发一次合并，让移动尽快传播（与 onRemoved 的处理一致）。
+    //    若只依赖下个自动同步周期（默认 30 分钟）：① 移动要等最长一个间隔才传播；
+    //    ② 一旦合并时超出移动意图 TTL，本端会被判为「接收方」，把本次移动
+    //    迁回云端旧位置（表现为「挪动书签后自动同步，书签又跑回原处」）。
+    if (affected.size > 0) {
+      const moveCfg = await MiniSync.storage.getLocal(['sync_enabled', 'webdav_url']);
+      if (moveCfg.sync_enabled && moveCfg.webdav_url) {
+        if (_moveDebounceTimer) clearTimeout(_moveDebounceTimer);
+        _moveDebounceTimer = setTimeout(async () => {
+          _moveDebounceTimer = null;
+          try {
+            const status = await MiniSync.storage.getSyncStatus();
+            if (status.status === SYNCING) return;
+            await runAutoSync();
+          } catch (e) {
+            console.warn('[MiniSync] 移动监听触发合并失败（忽略）:', e.message);
+          }
+        }, MOVE_DEBOUNCE_MS);
+      }
+    }
+  })().catch(e =>
+    console.warn('[MiniSync] 移动监听清理墓碑失败（忽略）:', e.message)
+  );
+});
+
+} // end if (HAS_BOOKMARKS_API && onRemoved && onMoved)
+
+// ====== 工具栏图标状态徽章 ======
+// 三态徽章（叠加在右下角，风格同系统 DevicePicker 徽章）：
+//   ok    绿色勾：WebDAV 配置完整且上次同步未失败
+//   unset 灰色勾：WebDAV 配置不完整（未配置好）
+//   error 黄色叹号：配置完整但上次同步失败
+// 同步进行中（SYNCING）保持当前徽章不变，避免「黄→绿→黄」来回闪跳。
+const ACTION_ICONS = {
+  ok:    { 16: 'icons/status-ok-16.png',    32: 'icons/status-ok-32.png' },
+  unset: { 16: 'icons/status-unset-16.png', 32: 'icons/status-unset-32.png' },
+  error: { 16: 'icons/status-error-16.png', 32: 'icons/status-error-32.png' }
+};
+let _currentIconState = null;
+let _iconDebounceTimer = null;
+
+/** 计算应有的图标状态；返回 null 表示「保持现状」（同步进行中） */
+async function computeIconState() {
+  const config = await MiniSync.storage.getWebdavConfig();
+  if (!config.url || !config.username || !config.password) return 'unset';
+  const status = await MiniSync.storage.getSyncStatus();
+  if (status.status === SYNCING) return null;   // 同步中：保持现状
+  if (status.status === FAILED) return 'error';
+  return 'ok';                                   // success / idle（已配置即视为正常）
+}
+
+/** 按状态切换工具栏图标（100ms 防抖合并批量写入；相同状态跳过） */
+async function updateActionIcon() {
+  if (_iconDebounceTimer) clearTimeout(_iconDebounceTimer);
+  _iconDebounceTimer = setTimeout(async () => {
+    _iconDebounceTimer = null;
+    try {
+      const state = await computeIconState();
+      if (!state || state === _currentIconState) return;
+      _currentIconState = state;
+      if (!ACTION_API) return; // MV2/MV3 都没有（极端宿主）：跳过，不影响同步
+      await ACTION_API.setIcon({ path: ACTION_ICONS[state] });
+    } catch (e) {
+      console.warn('[MiniSync] 更新工具栏图标失败（忽略）:', e.message);
+    }
+  }, 100);
+}
+
+// 配置或同步状态落盘变化 → 刷新图标（覆盖：保存配置、同步成功/失败、清除配置）
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  const watched = ['sync_status', 'sync_error', 'webdav_config', 'webdav_url', 'webdav_user', 'webdav_password'];
+  if (watched.some(k => k in changes)) updateActionIcon();
+});
+
+// SW 每次唤醒执行顶层代码时校准一次，保证图标与存储状态一致
+updateActionIcon();
+
+// ====== 自动同步定时器 ======
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (!alarm || alarm.name !== SYNC_ALARM) return;
+  const status = await MiniSync.storage.getSyncStatus();
+  if (status.status === SYNCING) {
+    return;
+  }
+  try {
+    const result = await runAutoSync();
+    if (result && result.success === false) {
+      console.warn('[MiniSync] 自动同步未完成:', result.message || result.code || '未知原因');
+    }
+  } catch (e) {
+    console.error('[MiniSync] 自动同步失败:', e.message);
+  }
+});
+
+// 启动崩溃恢复：本地书签为空且存在备份时自动恢复
+chrome.runtime.onStartup.addListener(async () => {
+  try {
+    await startupRecovery();
+  } catch (e) {
+    console.error('[MiniSync] 启动恢复检查失败:', e.message);
+  }
+});
+
+// ★ 同步任务（上传/下载/合并）进行中判定：供检测类消息短路，
+//   避免检测请求与进行中的同步并发访问云端、互相干扰。
+// 返回 { busy, action }：action 为任务类型，供前端显示「XX进行中」。
+async function getSyncBusyInfo() {
+  try {
+    const s = await MiniSync.storage.getSyncStatus();
+    if (s && s.status === SYNCING) return { busy: true, action: s.action || 'merge' };
+    return { busy: false };
+  } catch (_) {
+    return { busy: false };
+  }
+}
+
+// 给任意 promise 套一个硬超时：移动端 fork 上 AbortController 未必生效
+//（webdav.testConnection 的 15s 中断就成了空话），那样后台会永远不回消息，
+// 页面上只能看到一句「后台无响应」。有了它，后台至少能给出「多慢/为什么」的结论。
+function withTimeout(promise, ms, timeoutMessage) {
+  return new Promise((resolve) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      resolve({ success: false, timedOut: true, message: timeoutMessage });
+    }, ms);
+    Promise.resolve(promise).then(
+      (v) => { if (done) return; done = true; clearTimeout(timer); resolve(v); },
+      (e) => { if (done) return; done = true; clearTimeout(timer); resolve({ success: false, message: (e && e.message) || String(e) }); }
+    );
+  });
+}
+
+// 消息路由（兼容旧格式 action + 新格式 type）
+// ⚠️ 写成具名函数而不是内联箭头：__MiniSyncDispatchDirect（见文件下方）要复用同一份分发逻辑。
+function onRuntimeMessage(message, sender, sendResponse) {
+  if (!message) return false;
+
+  // 兼容旧格式：action 字段
+  const msgType = message.type || message.action;
+  if (!msgType) return false;
+
+  // 消息台账：每收到一条就记一次（写进 storage，页面侧可读）。
+  // 这是「消息到底有没有到后台」的唯一凭据 —— 消息通道不回话时，只能靠它分辨
+  // 「后台没收到」和「收到了但没答」。
+  recordIncoming(msgType);
+
+  // ★ 重放台帐：同一条消息的第二次投递（兜底重发）只取第一次的结果，绝不重复执行
+  const ledgerId = (message && typeof message.__msgId === 'string' && message.__msgId) ? message.__msgId : null;
+  if (ledgerId) {
+    const hit = ledgerLookup(ledgerId);
+    if (hit) {
+      _msgLedgerReplays++;
+      // 第一次那次可能还在跑：这里等它出结果，然后把同一个结果回给兜底那条路。
+      // ⚠️ 先 settle 台账再调 sendResponse —— 后者可能在「消息端口已关闭」时抛错，
+      //    不能让一个已经拿到结果的请求因为这个抛错而永远挂着。
+      hit.promise.then(
+        (r) => { try { sendResponse(r); } catch (_) { /* 端口已关：结果已在台账里，忽略 */ } },
+        () => sendResponse({ success: false, message: '重放上次结果失败' })
+      );
+      return true;
+    }
+    if (_msgLedger.size >= MSG_LEDGER_MAX) {
+      const oldest = _msgLedger.keys().next().value;
+      if (oldest !== undefined) _msgLedger.delete(oldest);
+    }
+    let settle;
+    const p = new Promise((resolve) => { settle = resolve; });
+    _msgLedger.set(ledgerId, { at: Date.now(), promise: p });
+    // 包一层 sendResponse：任何一次回应都会把结果连同台账一起落定
+    const origSend = sendResponse;
+    sendResponse = (r) => { settle(r); try { origSend(r); } catch (_) { /* 见上 */ } };
+  }
+
+  switch (msgType) {
+    // 新格式 / 旧格式兼容
+    case 'upload':
+      handleAsyncResponse(sendResponse, () =>
+        MiniSync.actions.uploadBookmarks({
+          ...(message.options || {}),
+          ...(message.force !== undefined ? { force: message.force } : {})
+        })
+      );
+      return true;
+
+    case 'DOWNLOAD_BOOKMARKS':
+    case 'download':
+      handleAsyncResponse(sendResponse, () =>
+        MiniSync.actions.downloadBookmarks(message.options)
+      );
+      return true;
+
+    case 'MERGE_SYNC':
+    case 'merge':
+      handleAsyncResponse(sendResponse, () =>
+        MiniSync.actions.mergeSync(message.options)
+      );
+      return true;
+
+    case 'GET_STATUS':
+    case 'getStatus':
+      handleAsyncResponse(sendResponse, async () => {
+        const status = await MiniSync.storage.getSyncStatus();
+        return { success: true, data: status };
+      });
+      return true;
+
+    case 'GET_CONFIG':
+    case 'getConfig':
+      handleAsyncResponse(sendResponse, async () => {
+        const config = await MiniSync.storage.getWebdavConfig();
+        return { success: true, data: config };
+      });
+      return true;
+
+    case 'SAVE_CONFIG':
+    case 'saveConfig':
+      handleAsyncResponse(sendResponse, async () => {
+        await MiniSync.storage.setWebdavConfig(message.config);
+        return { success: true, message: '配置已保存' };
+      });
+      return true;
+
+    case 'GET_ENDPOINTS':
+    case 'getEndpoints':
+      handleAsyncResponse(sendResponse, async () => {
+      // 如果传了 webdavUrl，说明是从云端读取（popup.js），需按 deviceId 解包
+        if (message.webdavUrl) {
+          const config = await MiniSync.webdav.getWebDAVConfig();
+          if (!config.url) return { ok: false, message: '未配置 WebDAV' };
+          const xbelStr = await MiniSync.webdav.getFile(config.url, config.username, config.password, config.filename);
+          if (!xbelStr) return { ok: false, message: '无法读取 XBEL' };
+          const pluginData = MiniSync.xbel.parseXbelFromString(xbelStr);
+          if (!pluginData) return { ok: false, message: 'XBEL 解析失败' };
+          const allDeviceEps = pluginData.endpoints || {};
+          const devId = await MiniSync.storage.getDeviceId();
+      // 兼容旧格式：如果 endpoints 不是按设备分（直接是 {berry:{},via:{}}），直接返回
+          const isLegacyFormat = !allDeviceEps[devId] && (allDeviceEps.berry || allDeviceEps.via);
+          const myEps = isLegacyFormat ? allDeviceEps : (allDeviceEps[devId] || {});
+          return { ok: true, endpoints: myEps };
+        }
+      // 否则返回本地数据（options.js 使用，本地已是扁平格式）
+        const data = await MiniSync.storage.getLocal(['sync_endpoints']);
+        return { ok: true, endpoints: data.sync_endpoints || {} };
+      });
+      return true;
+
+    case 'SAVE_ENDPOINTS':
+    case 'saveEndpoints':
+      handleAsyncResponse(sendResponse, async () => {
+        await MiniSync.storage.setLocal({ sync_endpoints: message.endpoints });
+        return { ok: true, message: '端点配置已保存' };
+      });
+      return true;
+
+    // ---- 旧版辅助消息（完整实现）----
+
+    // 测试 WebDAV 连接（使用 popup 传入的参数）
+    case 'testConnection':
+      handleAsyncResponse(sendResponse, async () => {
+        // 优先使用 popup 传入的参数（用户刚输入的新值）
+        const testUrl = message.webdavUrl || '';
+        const testUser = message.webdavUser || '';
+        const testPass = message.webdavPassword || '';
+        // 路径暂不用于连接测试，仅记录
+
+        if (!testUrl) {
+          return { success: false, message: '请先填写 WebDAV 地址' };
+        }
+
+        const config = { url: testUrl, username: testUser, password: testPass };
+        const result = await MiniSync.actions.testConnection(config);
+        return {
+          success: result.success,
+          code: result.code,
+          message: result.success ? result.message : ('连接失败: ' + (result.message || '未知错误'))
+        };
+      });
+      return true;
+
+    // 检查配置连通性（真实访问云端，而非仅本地完整性判断）
+    case 'checkConfig':
+      handleAsyncResponse(sendResponse, async () => {
+        // ★ 同步进行中跳过连通性检测（前端显示「XX进行中」，不报失败/未就绪）
+        const busyInfo = await getSyncBusyInfo();
+        if (busyInfo.busy) return { ok: false, busy: true, action: busyInfo.action, message: '同步进行中，已跳过检测' };
+        const config = await MiniSync.storage.getWebdavConfig();
+        if (!config.url || !config.username || !config.password) {
+          return {
+            ok: false,
+            hasUrl: !!config.url,
+            hasAuth: !!(config.username && config.password),
+            error: '未配置 WebDAV 地址、用户名或密码'
+          };
+        }
+        // 真实连接测试（自带 15s 超时，含权限守门）
+        // ⚠️ 外面再套一层 20s 硬超时：宿主若不理会 AbortController，
+        //    里层永不返回，后台就永远不回消息（页面只能显示「后台无响应」）。
+        const result = await withTimeout(
+          MiniSync.actions.testConnection({
+            url: config.url,
+            username: config.username,
+            password: config.password
+          }),
+          20000,
+          'WebDAV 连接测试 20s 未返回（宿主可能不支持请求中断，请检查网络或地址）'
+        );
+        if (!result || !result.success) {
+          return {
+            ok: false,
+            hasUrl: !!config.url,
+            hasAuth: true,
+            // code='NEED_PERMISSION' 时前端要显示「授权域名访问」按钮（授权必须在页面手势里做）
+            code: (result && result.code) || undefined,
+            error: (result && result.message) || '连接失败'
+          };
+        }
+        // 连接成功后附带检查同步文件是否存在
+        let fileExists = false;
+        try {
+          fileExists = !!(await MiniSync.webdav.checkFileExists(config.filename));
+        } catch (_) { /* 文件检查失败不影响连接判断 */ }
+        return {
+          ok: true,
+          hasUrl: !!config.url,
+          hasAuth: true,
+          hasPath: !!config.filename && config.filename !== DEFAULT_FILENAME,
+          isCustomPath: config.filename !== DEFAULT_FILENAME,
+          fileExists: fileExists
+        };
+      });
+      return true;
+
+    // 后台是否活着（最轻量的探针：不碰任何宿主 API）
+    // ⚠️ 响应必须「同步 sendResponse + return true」：某些移动端 fork 上，
+    //    监听器返回 false 时会把紧随其后的同步响应一起丢掉（手机实测「ping 返回空」）。
+    //    返回 true 在 Chromium / Gecko 上都是合法的（响应已发出，通道随即关闭）。
+    case 'ping':
+      sendResponse({
+        ok: true,
+        at: Date.now(),
+        version: (chrome.runtime.getManifest ? chrome.runtime.getManifest().version : null),
+        manifestVersion: (chrome.runtime.getManifest ? chrome.runtime.getManifest().manifest_version : null),
+        hasBookmarksApi: HAS_BOOKMARKS_API,
+        hasActionApi: !!ACTION_API,
+        transport: 'ping'
+      });
+      return true;
+
+    // 同上，但故意沿用「同步 sendResponse + return false」的旧写法。
+    // 这是给诊断用的对照探针：两个探针结果不同 ⇒ 该宿主的响应语义是「返回 false 就丢响应」。
+    case 'pingLegacy':
+      sendResponse({ ok: true, at: Date.now(), transport: 'pingLegacy-sync-return-false' });
+      return false;
+
+    // 后台自述诊断：只报后台这一侧才知道的事实（页面侧另有 collectDiagnostics）
+    case 'diagnose':
+      handleAsyncResponse(sendResponse, async () => {
+        const manifest = chrome.runtime.getManifest ? chrome.runtime.getManifest() : {};
+        let bookmarkCount = null;
+        try {
+          bookmarkCount = { ok: true, count: await countLocalBookmarks() };
+        } catch (e) {
+          bookmarkCount = { ok: false, error: (e && e.message) || String(e) };
+        }
+        const cfg = await MiniSync.storage.getLocal(['webdav_url', 'sync_enabled']);
+        const perm = cfg.webdav_url
+          ? await MiniSync.utils.hasHostPermission(cfg.webdav_url)
+          : { ok: true, skipped: true };
+        return {
+          ok: true,
+          at: new Date().toISOString(),
+          extensionId: chrome.runtime.id,
+          extensionVersion: manifest.version,
+          manifestVersion: manifest.manifest_version,
+          manifestPermissions: manifest.permissions,
+          manifestHostPermissions: manifest.host_permissions || manifest.optional_host_permissions,
+          ua: (typeof navigator !== 'undefined' && navigator.userAgent) || '(无 navigator)',
+          // ⚠️ 不能用 typeof importScripts 判断：手机端 fork 连普通扩展页面都暴露 importScripts，
+          //    会把 MV2 页面误标成 mv3-service-worker。真凭据只有 manifest_version。
+          backgroundType: (manifest.manifest_version === 3) ? 'mv3-service-worker' : 'mv2-background-page',
+          bootStage: _bgBoot.stage,
+          bootLoads: _bgBoot.loads,
+          msgCount: _bgMsgCount || 0,
+          lastMessage: _bgLastMessage,
+          globals: {
+            importScripts: typeof importScripts,
+            action: typeof chrome.action,
+            browserAction: typeof chrome.browserAction,
+            bookmarks: typeof chrome.bookmarks,
+            bookmarksOnRemoved: (chrome.bookmarks && typeof chrome.bookmarks.onRemoved) || 'undefined',
+            permissions: typeof chrome.permissions,
+            alarms: typeof chrome.alarms,
+            storageLocal: !!(chrome.storage && chrome.storage.local)
+          },
+          hasBookmarksApi: HAS_BOOKMARKS_API,
+          bookmarkCount,               // ★ 书签接口能不能真读，这里带原始报错
+          webdavUrl: cfg.webdav_url || '',
+          syncEnabled: !!cfg.sync_enabled,
+          permissionQuery: perm,       // 权限接口可用性（不可用会带超时原文）
+          moduleErrors: _bgErrors.slice(-10)
+        };
+      });
+      return true;
+
+    // 获取本地书签数量（后台统计避免页面直读 getTree 卡顿）
+    case 'getLocalBookmarksCount':
+      handleAsyncResponse(sendResponse, async () => {
+        // 宿主未开放书签 API：明确上报，设置页据此显示「不可用」而不是「0 条」
+        if (!HAS_BOOKMARKS_API) {
+          return { ok: false, code: 'NO_BOOKMARKS_API', message: '当前浏览器未向扩展开放书签 API' };
+        }
+        // 读得到就报数量；读不到必须把【原始报错】一起回去（页面据此显示真因，
+        // 不能再统一显示成「后台未响应」——那会让人以为后台没运行）
+        try {
+          return { ok: true, count: await countLocalBookmarks() };
+        } catch (e) {
+          const msg = (e && e.message) || String(e);
+          return {
+            ok: false,
+            code: msg === 'NO_BOOKMARKS_API' ? 'NO_BOOKMARKS_API' : 'BOOKMARKS_API_FAILED',
+            message: msg
+          };
+        }
+      });
+      return true;
+
+    // 获取/生成设备 ID（确保首次打开即生成）
+    case 'getDeviceId':
+      handleAsyncResponse(sendResponse, async () => {
+        const deviceId = await MiniSync.storage.getDeviceId();
+        return { deviceId };
+      });
+      return true;
+
+    // 检查远程文件是否存在
+    case 'checkFileExists':
+      handleAsyncResponse(sendResponse, async () => {
+        // ★ 同步进行中跳过文件状态检测（前端保持中性显示，不误报待初始化/异常）
+        const busyInfo2 = await getSyncBusyInfo();
+        if (busyInfo2.busy) return { exists: false, folderExists: true, busy: true, action: busyInfo2.action, message: '同步进行中，已跳过检测' };
+        const p = normalizeBookmarkPath(message.path || '');
+        const f = message.file || message.filePath || DEFAULT_FILENAME;
+        const filePath = p ? p + '/' + f : f;
+        const exists = await MiniSync.webdav.checkFileExists(filePath);
+        return { exists: !!exists, folderExists: true };
+      });
+      return true;
+
+    // 校验并（必要时）强制创建本地 home 文件夹（现名「移动端主页」，原「Berry主页」）。
+    // 仅在「其他收藏夹」下查找标题匹配 FOLDER_TITLES.berryHome 的文件夹；
+    // 不存在则在「其他收藏夹」(id='2') 下创建；命中旧名则自动迁移改名。
+    // 返回真实文件夹 id。
+    case 'ensureBerryHome':
+      handleAsyncResponse(sendResponse, async () => {
+        const titles = (MiniSync.constants && MiniSync.constants.FOLDER_TITLES) || FOLDER_TITLES;
+        const berryTitles = (titles.berryHome || ['移动端主页']).map(t => String(t).toLowerCase());
+        const standardTitle = (titles.berryHome && titles.berryHome[0]) || '移动端主页';
+        let tree;
+        try { tree = await chrome.bookmarks.getTree(); } catch (e) { return { ok: false, error: e.message }; }
+        const root = tree && tree[0];
+        const other = (root.children || []).find(c =>
+          String(c.id) === '2' || (titles.otherBookmarks || []).some(t => String(t).toLowerCase() === String(c.title || '').toLowerCase()));
+        if (other) {
+          const existing = (other.children || []).find(c =>
+            !c.url && berryTitles.includes(String(c.title || '').toLowerCase()));
+          if (existing) {
+            // 存量迁移：旧名「Berry主页」→ 新名「移动端主页」。
+            // 容器标题不参与 pathKey（home 区由 HOME_FOLDER_ID 虚拟根归一为 ROOT:home），
+            // update 仅改标题、不动树结构，改名不影响同步口径。
+            let renamed = false;
+            if (String(existing.title || '') !== standardTitle) {
+              try {
+                await chrome.bookmarks.update(String(existing.id), { title: standardTitle });
+                renamed = true;
+              } catch (e) {
+                console.warn('[MiniSync] home 文件夹改名迁移失败（忽略）:', e.message);
+              }
+            }
+            return { ok: true, created: false, renamed, folderId: String(existing.id) };
+          }
+          try {
+            const created = await chrome.bookmarks.create({ parentId: String(other.id), title: standardTitle });
+            return { ok: true, created: true, folderId: String(created.id) };
+          } catch (e) {
+            return { ok: false, error: e.message };
+          }
+        }
+        return { ok: false, error: '未找到「其他收藏夹」容器' };
+      });
+      return true;
+
+    // 列出远程目录
+    case 'listFolders':
+      handleAsyncResponse(sendResponse, async () => {
+        const config = await MiniSync.storage.getWebdavConfig();
+        if (!config.url) return [];
+        try {
+          const items = await MiniSync.webdav.listWebDAVDir(config.url, '', config.username, config.password);
+          return items.filter(item => item.isDirectory).map(item => item.name);
+        } catch (e) {
+          console.warn('[MiniSync] listFolders 失败:', e.message);
+          return [];
+        }
+      });
+      return true;
+
+    // 设置端点开关
+    case 'setEndpointSwitch':
+      handleAsyncResponse(sendResponse, async () => {
+        const data = await MiniSync.storage.getLocal(['sync_endpoints']);
+        const eps = data.sync_endpoints || {};
+        if (eps[message.key]) {
+          eps[message.key].enabled = !!message.enabled;
+          await MiniSync.storage.setLocal({ sync_endpoints: eps });
+        }
+        return { ok: true };
+      });
+      return true;
+
+    // 设置端点文件夹路径
+    case 'setEndpointFolder':
+      handleAsyncResponse(sendResponse, async () => {
+        const data = await MiniSync.storage.getLocal(['sync_endpoints']);
+        const eps = data.sync_endpoints || {};
+        if (eps[message.key]) {
+          eps[message.key].folder = message.folder || '';
+          await MiniSync.storage.setLocal({ sync_endpoints: eps });
+        }
+        return { ok: true };
+      });
+      return true;
+
+    // 从备份恢复（安全阀弹窗「从历史备份恢复」）
+    case 'restoreFromBackup':
+      handleAsyncResponse(sendResponse, async () => {
+        const restored = await MiniSync.orchestrator.restoreLocalBackup();
+        if (restored && restored.restored > 0) {
+          return {
+            ok: true,
+            success: true,
+            message: `已从备份恢复 ${restored.restored} 条书签`,
+            restored: restored.restored
+          };
+        }
+        return { ok: false, success: false, message: '没有可用的备份数据' };
+      });
+      return true;
+
+    // 同步间隔更新（开启/关闭自动同步定时器）
+    case 'updateSyncInterval':
+      handleAsyncResponse(sendResponse, async () => {
+        await setupAutoSyncAlarm();
+        return { ok: true };
+      });
+      return true;
+
+    // 清除同步缓存（区分当前设备 / 全部设备）
+    case 'clearSyncCache':
+      handleAsyncResponse(sendResponse, async () => {
+        const scope = message.scope || 'current';
+        const devId = await MiniSync.storage.getDeviceId();
+
+      // 始终清除本地缓存
+      // 注意补全此前遗漏的 key：aira_pathkey_snapshot（Aira 删除检测快照）、
+      // _is_non_chrome_browser（浏览器类型缓存）——遗漏会导致「清除后重建同步」
+      // 仍带旧快照；同步状态键一并复位，避免残留 SYNCING/旧错误信息。
+        await MiniSync.storage.removeLocal([
+          STORAGE_KEYS.CLOUD_LAST_MODIFIED,
+          STORAGE_KEYS.SNAPSHOTS,
+          STORAGE_KEYS.TOMBSTONES,
+          'berry_pathkey_snapshot',
+          'via_pathkey_snapshot',
+          'aira_pathkey_snapshot',
+          (MiniSync.browserDetect && MiniSync.browserDetect.NON_CHROME_CACHE_KEY) || '_is_non_chrome_browser',
+          'sync_status',
+          'sync_error',
+          'last_sync_time'
+        ]);
+
+      // 根据范围处理云端墓碑
+        // 云端无文件/未配置视为无需清理（cloudCleared=true）；仅网络等异常才标记 false
+        let cloudCleared = true;
+        if (scope === 'all') {
+          // 清除全部设备：上传空墓碑到云端
+          try {
+            const config = await MiniSync.webdav.getWebDAVConfig();
+            if (config.url) {
+              // 下载当前 XBEL，清空 tombstones 和 snapshots，写回（endpoints 随 xbelToJson→jsonToXbel 往返保留）
+              const xbelStr = await MiniSync.webdav.getFile(config.url, config.username, config.password, config.filename);
+              if (xbelStr) {
+                const pluginData = MiniSync.xbel.xbelToJson(xbelStr);
+                pluginData.tombstones = [];
+                pluginData.snapshots = {};
+                pluginData.lastModified = Date.now();
+                const newXbel = MiniSync.xbel.jsonToXbel(pluginData);
+                await MiniSync.webdav.putFile(config.url, config.username, config.password, config.filename, newXbel);
+              }
+            }
+          } catch (e) {
+            cloudCleared = false;
+            console.warn('[sync] 清除云端墓碑失败:', e.message);
+          }
+        } else {
+          // 清除当前设备：从云端过滤掉当前设备的墓碑，保留其他设备的
+          try {
+            const config = await MiniSync.webdav.getWebDAVConfig();
+            if (config.url) {
+              const xbelStr = await MiniSync.webdav.getFile(config.url, config.username, config.password, config.filename);
+              if (xbelStr) {
+                const pluginData = MiniSync.xbel.xbelToJson(xbelStr);
+                if (pluginData.tombstones && Array.isArray(pluginData.tombstones)) {
+                  // 过滤掉当前设备的墓碑
+                  pluginData.tombstones = pluginData.tombstones.filter(t => t.deviceId !== devId);
+                }
+                pluginData.lastModified = Date.now();
+                const newXbel = MiniSync.xbel.jsonToXbel(pluginData);
+                await MiniSync.webdav.putFile(config.url, config.username, config.password, config.filename, newXbel);
+              }
+            }
+          } catch (e) {
+            cloudCleared = false;
+            console.warn('[sync] 过滤云端当前设备墓碑失败:', e.message);
+          }
+        }
+
+        // ★ 修复：返回值补 success 字段。popup 判定 result.success，
+        //   此前只返回 {ok:true} 导致两个清理按钮永远显示「重置失败：未知错误」。
+        return { ok: true, success: true, scope, cloudCleared };
+      });
+      return true;
+
+    default:
+      sendResponse({ success: false, message: `未知消息类型: ${msgType}` });
+      return false;
+  }
+}
+
+chrome.runtime.onMessage.addListener(onRuntimeMessage);
+
+// 监听器已注册 ⇒ 记一笔「后台已就绪」。
+persistBootReport('ready');
+
+// ★ 直接句柄自检（不经过消息通道）
+// 设置页可以用 chrome.runtime.getBackgroundPage() 拿到本页 window 直接调用本函数。
+// 当「消息不回话」时，这是唯一还能问到后台内部状态的路：后台到底加载到哪一步、
+// 模块齐不齐、有没有报错、收到过哪些消息。返回纯数据（可 JSON 序列化）。
+try {
+  const bgGlobal = (typeof window !== 'undefined') ? window : self;
+
+  bgGlobal.__MiniSyncSelfCheck = function () {
+    return {
+      ok: true,
+      at: Date.now(),
+      bootStage: _bgBoot.stage,
+      bootLoads: _bgBoot.loads,
+      scriptAt: _bgBoot.scriptAt,
+      version: (chrome.runtime.getManifest ? chrome.runtime.getManifest().version : null),
+      manifestVersion: (chrome.runtime.getManifest ? chrome.runtime.getManifest().manifest_version : null),
+      moduleNames: (typeof MiniSync !== 'undefined' && MiniSync) ? Object.keys(MiniSync) : null,
+      hasBookmarksApi: HAS_BOOKMARKS_API,
+      hasActionApi: !!ACTION_API,
+      msgCount: _bgMsgCount || 0,
+      lastMessage: _bgLastMessage,
+      // 重放台账：>0 说明页面侧的兜底重发被成功去重（同一次同步没有跑两遍）
+      msgLedgerReplays: _msgLedgerReplays,
+      msgLedgerSize: _msgLedger.size,
+      hasOnMessageListener: !!(chrome.runtime && chrome.runtime.onMessage),
+      errors: _bgErrors.slice(-20)
+    };
+  };
+
+  // ★ 直接分发通道（第二条传输带，同样不经过宿主的消息管道）
+  // 页面侧 sendMessage 收不到响应时，可用 getBackgroundPage() 拿到本页 window 调这里。
+  // 实现就是复用【同一个】onRuntimeMessage：把 sendResponse 换成 resolve，
+  // 并且【完全不看监听器的返回值】—— 这正是它比宿主消息管道更可靠的地方：
+  // 某些移动端 fork 会丢掉「监听器返回 false」时的同步响应（手机实测 ping 返回空）。
+  bgGlobal.__MiniSyncDispatchDirect = function (message) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve({ success: false, code: 'DIRECT_TIMEOUT', message: '直接调用 25s 未返回（后台可能在跑慢操作）' });
+      }, 25000);
+      const send = (r) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(r);
+      };
+      let ret;
+      try {
+        ret = onRuntimeMessage(message, { id: 'direct-handle', direct: true }, send);
+      } catch (e) {
+        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        resolve({ success: false, code: 'DIRECT_THREW', message: (e && e.message) || String(e) });
+        return;
+      }
+      // 同步处理器返回 false 且没给响应（例如消息里没有 type/action）⇒ 当场定性，
+      // 别让页面干等 15s。异步处理器一律返回 true，所以这条不会误伤它们。
+      if (ret !== true && !settled) {
+        send({ success: false, code: 'DIRECT_NO_RESPONSE', message: '后台没给响应（同步处理器未回值）' });
+      }
+    });
+  };
+} catch (_) { /* 自检/直接通道挂不上不该拖垮后台 */ }
+
+/**
+ * 统一异步消息处理
+ */
+function handleAsyncResponse(sendResponse, asyncFn) {
+  asyncFn()
+    .then(result => sendResponse(result))
+    .catch(error => {
+      console.error('[MiniSync] 处理失败:', error);
+      sendResponse({ success: false, message: error.message || '未知错误' });
+    });
+}
+
+// 自动同步与启动恢复
+
+/**
+ * 根据配置创建/清除自动同步 alarm
+ */
+async function setupAutoSyncAlarm() {
+  const r = await MiniSync.storage.getLocal(['sync_enabled', 'sync_interval', 'webdav_url']);
+  const enabled = !!r.sync_enabled;
+  // ★ 必须夹取：这个值可以由导入的备份文件/被手工改过的 storage 直通这里，
+  //   负数会让 chrome.alarms.create 抛错（自动同步静默失效），极小值会被夹到 1 分钟高频轮询。
+  const interval = MiniSync.utils.clampSyncInterval(r.sync_interval);
+  const configured = !!r.webdav_url;
+  await chrome.alarms.clear(SYNC_ALARM);
+  if (enabled && configured) {
+    await chrome.alarms.create(SYNC_ALARM, { periodInMinutes: interval });
+  }
+}
+
+/**
+ * 执行一次自动同步（按用户选择的同步模式）
+ * @returns {Promise<Object>}
+ */
+async function runAutoSync() {
+  const r = await MiniSync.storage.getLocal(['sync_type', 'sync_enabled', 'webdav_url']);
+  if (!r.sync_enabled) return { ok: true, skipped: true, message: '自动同步未开启' };
+  if (!r.webdav_url) return { ok: true, skipped: true, message: '未配置 WebDAV' };
+  const mode = r.sync_type || MERGE_MODE;
+  const fn = {
+    [UPLOAD_MODE]: () => MiniSync.actions.uploadBookmarks({ auto: true }),
+    [DOWNLOAD_MODE]: () => MiniSync.actions.downloadBookmarks({ auto: true }),
+    [MERGE_MODE]: () => MiniSync.actions.mergeSync({ auto: true })
+  }[mode];
+  if (!fn) return { ok: false, message: `未知同步模式: ${mode}` };
+  return fn();
+}
+
+// 统计本地书签数量（含所有文件夹下的 URL 节点）
+// ⚠️ 必须带超时：移动端 fork 上实测存在「getTree 是函数、但回调永不触发」的情况，
+//    没有超时的话消息永远不回，页面只能显示「后台未响应」，真因完全看不出来。
+const BOOKMARKS_QUERY_TIMEOUT_MS = 5000;
+function countLocalBookmarks() {
+  return new Promise((resolve, reject) => {
+    if (!HAS_BOOKMARKS_API) {
+      reject(new Error('NO_BOOKMARKS_API'));
       return;
     }
-    const { type } = await getSyncSettings();
-    let result;
-    if (type === 'upload') {
-      result = await uploadToCloud();
-    } else if (type === 'download') {
-      result = await downloadFromCloud();
-    } else {
-      result = await mergeSync();
-    }
-  } catch (e) {
-    console.error('[sync] 自动同步异常:', e);
-  } finally {
-    await releaseSyncLock();
-  }
-}
-
-// 插件安装/更新
-chrome.runtime.onInstalled.addListener(async (details) => {
-  await rescheduleAlarm();
-  // 仅浏览器更新或插件更新时才自动同步，首次安装（install）不立即同步，
-  // 避免用户还没配置就被云端空数据覆盖本地书签。
-  if (details.reason === 'update') {
-    const { enabled } = await getSyncSettings();
-    if (enabled) runAutoSync('onInstalled-update');
-  }
-});
-
-// 浏览器启动
-chrome.runtime.onStartup.addListener(async () => {
-
-  // 检查是否有未完成导入留下的快照备份 —— 如果有，说明上次清空后 SW 被杀了
-  try {
-    const r = await chrome.storage.local.get([LOCAL_BACKUP_KEY]);
-    const backup = r[LOCAL_BACKUP_KEY];
-    if (backup && backup.data && Array.isArray(backup.data.bookmarks)) {
-      // 检查当前本地书签是否为空（被清空后没恢复）
-      const tree = await new Promise(resolve => chrome.bookmarks.getTree(resolve));
-      const root = tree && tree[0];
-      let totalBookmarks = 0;
-      const rootChildren = (root && root.children) || [];
-      for (const topNode of rootChildren) {
-        if (topNode.children) totalBookmarks += topNode.children.length;
-      }
-      if (totalBookmarks === 0 && backup.data.bookmarks.length > 0) {
-        console.warn(`[sync] 检测到本地书签为空但有 ${backup.data.bookmarks.length} 条快照备份，正在恢复...`);
-        await importBookmarksFromData(backup.data);
-      } else {
-        // 本地不为空，说明上次导入成功了，只是快照没来得及清理
-        await chrome.storage.local.remove(LOCAL_BACKUP_KEY);
-      }
-    }
-  } catch (e) {
-    console.error('[sync] 启动时检查/恢复快照失败:', e);
-  }
-
-  await rescheduleAlarm();
-  const { enabled } = await getSyncSettings();
-  if (enabled) runAutoSync('onStartup');
-});
-
-// 定时触发
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === SYNC_ALARM) runAutoSync('alarm');
-});
-
-// 从 storage 获取 WebDAV 配置
-async function getWebDAVConfig() {
-  const result = await chrome.storage.local.get([
-    'webdav_url',
-    'webdav_user',
-    'webdav_password',   // 这里存储应用密码
-    'webdav_bookmark_path'
-  ]);
-  return {
-    url: result.webdav_url || '',
-    user: result.webdav_user || '',
-    password: result.webdav_password || '',
-    path: normalizeBookmarkPath(result.webdav_bookmark_path)
-  };
-}
-
-// 生成 Basic Auth 头
-// 注意：btoa 不支持非 Latin1 字符，用户名/密码含中文/emoji 会抛异常。
-// 这里先用 TextEncoder 转成 UTF-8 字节，再逐字节塞进 btoa。
-function getAuthHeader(user, password) {
-  const bytes = new TextEncoder().encode(`${user}:${password}`);
-  let bin = '';
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return `Basic ${btoa(bin)}`;
-}
-
-// 检查是否拥有对应域名的 host 权限（动态权限申请后才有）
-function hasHostPermission(url) {
-  return new Promise((resolve) => {
-    if (!url) { resolve(false); return; }
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`chrome.bookmarks.getTree 回调 ${BOOKMARKS_QUERY_TIMEOUT_MS}ms 内没回来（宿主没实现该接口）`));
+    }, BOOKMARKS_QUERY_TIMEOUT_MS);
     try {
-      const origin = new URL(url).origin + '/*';
-      chrome.permissions.contains({ origins: [origin] }, resolve);
-    } catch (e) { resolve(false); }
-  });
-}
-
-// ========== 路径归一化 + 安全校验 ==========
-// 用户输入的 bookmark_path 可能是纯文件夹（/minibookmark）、
-// 含文件名（/minibookmark/mybook.json）、或末尾带斜杠（/minibookmark/）。
-//
-// 归一化规则：
-//   末段含 '.' → 视为文件名，整体作为完整路径
-//   末段不含 '.' / 末尾是 '/' / 空值 → 追加 /bookmarks.json
-//
-// 安全校验（非法直接抛 Error，由调用方捕获并提示用户）：
-//   - 字符白名单：只允许 [a-zA-Z0-9_.\-/]
-//   - 分段禁止 '.' 或 '..'（防止路径逃逸，部分 WebDAV 服务器会把 /foo/.. 解析为 /）
-//
-// ⚠️ popup.js 里也有一份同名副本（UI 校验用），修改时两边必须同步。
-function normalizeBookmarkPath(raw) {
-  let p = (raw || '').trim().replace(/\\/g, '/');
-  // 空输入或仅根目录 → 无效（约定：返回空串表示"未配置"）
-  if (!p || p === '/') return '';
-  // 确保以 / 开头
-  if (!p.startsWith('/')) p = '/' + p;
-
-  // 安全校验：字符白名单
-  if (!/^\/[a-zA-Z0-9_.\-/]*$/.test(p)) {
-    throw new Error('路径只能包含字母、数字、-、_、/、. 且必须以 / 开头');
-  }
-  // 安全校验：分段禁止 . / ..（字符白名单允许 . 但要禁独立段）
-  const segments = p.split('/').filter(Boolean);
-  for (const seg of segments) {
-    if (seg === '.' || seg === '..') {
-      throw new Error('路径不能包含 . 或 .. 段');
-    }
-  }
-
-  // 归一化
-  if (p.endsWith('/')) return p + 'bookmarks.json';
-  const lastSeg = segments[segments.length - 1];
-  if (lastSeg.includes('.')) return p; // 含扩展名 → 视为完整文件路径
-  return p + '/bookmarks.json';        // 纯文件夹 → 追加默认文件名
-}
-
-// 把 base URL 和 path 安全拼接：保证中间只有一个 "/"
-// 兼容 path 未以 "/" 开头、base 尾部有多个 "/"、path 含空格/中文/# 等情况
-function joinWebDAVUrl(baseUrl, path) {
-  const cleanBase = (baseUrl || '').replace(/\/+$/, '');
-  const rawSegments = (path || '').replace(/^\/+|\/+$/g, '').split('/');
-  // 对每一段做 encodeURIComponent，避免空格、中文、#、? 等字符导致 400/404
-  const encoded = rawSegments
-    .filter(s => s.length > 0)
-    .map(s => encodeURIComponent(s))
-    .join('/');
-  return cleanBase + '/' + encoded;
-}
-
-// ========== 确保远端文件夹存在（MKCOL 递归创建） ==========
-// WebDAV 的 PUT 不会自动创建父文件夹，需要提前 MKCOL。
-// 逐级创建，如 /a/b/c.json → 确保 /a/ 和 /a/b/ 都存在。
-// 忽略 405（已存在）和 301（重定向，有些服务器会对已存在目录返回 301）。
-async function ensureWebDAVDir(baseUrl, filePath, user, password) {
-  const authHeader = getAuthHeader(user, password);
-  // 拿到文件所在目录路径：/a/b/c.json → ['a','b']
-  const segments = filePath.replace(/^\/+|\/+$/g, '').split('/');
-  segments.pop(); // 去掉文件名
-  if (segments.length === 0) return; // 文件在根目录，无需创建
-
-  let currentPath = '';
-  for (const seg of segments) {
-    currentPath += '/' + seg + '/';
-    const dirUrl = joinWebDAVUrl(baseUrl, currentPath);
-    try {
-      // 先用 PROPFIND 检查目录是否已存在，避免直接 MKCOL 触发 401 弹窗
-      const checkResp = await fetch(dirUrl, {
-        method: 'PROPFIND',
-        headers: {
-          'Authorization': authHeader,
-          'Depth': '0',
-          'Content-Type': 'application/xml'
+      chrome.bookmarks.getTree((tree) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const le = chrome.runtime.lastError; // 主动读掉，避免「Unchecked runtime.lastError」
+        if (le) {
+          reject(new Error('bookmarks.getTree 报错：' + (le.message || String(le))));
+          return;
         }
+        if (!Array.isArray(tree)) {
+          reject(new Error('bookmarks.getTree 回调给的不是数组：' + JSON.stringify(tree)));
+          return;
+        }
+        let count = 0;
+        (function walk(node) {
+          if (!node) return;
+          if (node.url) count++;
+          (node.children || []).forEach(walk);
+        })(tree[0]);
+        resolve(count);
       });
-      // 207 = 存在，直接跳过
-      if (checkResp.status === 207) continue;
-
-      // 目录不存在才发 MKCOL 创建（用 redirect:'manual' 防止浏览器弹认证框）
-      const resp = await fetch(dirUrl, {
-        method: 'MKCOL',
-        headers: { 'Authorization': authHeader }
-      });
-      // 201=已创建, 405=已存在, 301=重定向(部分服务器), 401=未授权
-      if (resp.ok || resp.status === 405 || resp.status === 301 || resp.status === 401) continue;
-      console.warn(`[sync] MKCOL ${currentPath} → ${resp.status}`);
     } catch (e) {
-      console.warn(`[sync] MKCOL ${currentPath} 异常:`, e.message);
-    }
-  }
-}
-
-// 上传书签数据到 WebDAV
-async function uploadBookmarks(data) {
-  const config = await getWebDAVConfig();
-  if (!config.url) {
-    throw new Error('WebDAV 地址未配置');
-  }
-  if (!config.user || !config.password) {
-    throw new Error('WebDAV 未配置');
-  }
-  if (!config.path) {
-    throw new Error('云端文件路径未配置，请至少指定一个文件夹');
-  }
-  // 确保远端文件夹存在
-  await ensureWebDAVDir(config.url, config.path, config.user, config.password);
-  const fullUrl = joinWebDAVUrl(config.url, config.path);
-  const response = await fetch(fullUrl, {
-    method: 'PUT',
-    headers: {
-      'Authorization': getAuthHeader(config.user, config.password),
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(data, null, 2)
-  });
-  if (!response.ok) {
-    throw new Error(`上传失败: ${response.status} ${response.statusText}`);
-  }
-  return true;
-}
-
-// 从 WebDAV 下载书签数据
-async function downloadBookmarks() {
-  const config = await getWebDAVConfig();
-  if (!config.url) {
-    throw new Error('WebDAV 地址未配置');
-  }
-  if (!config.user || !config.password) {
-    throw new Error('WebDAV 未配置');
-  }
-  if (!config.path) {
-    throw new Error('云端文件路径未配置，请至少指定一个文件夹');
-  }
-  const fullUrl = joinWebDAVUrl(config.url, config.path);
-  const response = await fetch(fullUrl, {
-    method: 'GET',
-    headers: {
-      'Authorization': getAuthHeader(config.user, config.password)
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error('bookmarks.getTree 抛异常：' + ((e && e.message) || String(e))));
+      }
     }
   });
-  if (response.status === 404) {
-    // 云端还没有书签文件——用专用错误类型，让调用方能精准区分
-    throw new CloudNotFoundError();
+}
+
+// 启动崩溃恢复：检测到本地书签为空且存在备份时自动恢复
+async function startupRecovery() {
+  const data = await MiniSync.storage.getLocal([STORAGE_KEYS.LOCAL_BACKUP]);
+  const backup = data[STORAGE_KEYS.LOCAL_BACKUP];
+  if (!Array.isArray(backup) || backup.length === 0) return;
+  const currentCount = await countLocalBookmarks();
+  if (currentCount > 0) {
+    return;
   }
-  if (!response.ok) {
-    throw new Error(`下载失败: ${response.status} ${response.statusText}`);
+  console.warn(`[MiniSync] 检测到本地书签为空，正在从备份恢复 ${backup.length} 条书签...`);
+  const restored = await MiniSync.orchestrator.restoreLocalBackup();
+  if (restored && restored.restored > 0) {
+    // 恢复成功后清理备份，避免下次启动重复恢复同一份数据
+    await MiniSync.storage.removeLocal([STORAGE_KEYS.LOCAL_BACKUP]);
   }
-  return await response.json();
 }
 
-// 获取或生成设备 ID（用于标识数据来源）
-async function getDeviceId() {
-  const result = await chrome.storage.local.get(['berry_device_id']);
-  if (result.berry_device_id) return result.berry_device_id;
-  const newId = 'berry_' + Math.random().toString(36).slice(2, 10);
-  await chrome.storage.local.set({ berry_device_id: newId });
-  return newId;
-}
+// 初始化
 
-// 统计本地书签（有 URL 的条目）数量，用于同步后回写 last_sync_count
-async function countLocalBookmarks() {
-  return new Promise((resolve) => {
-    chrome.bookmarks.getTree((tree) => {
-      let c = 0;
-      const walk = (node) => {
-        if (node.url) c++;
-        if (node.children) node.children.forEach(walk);
-      };
-      (tree || []).forEach(walk);
-      resolve(c);
-    });
-  });
-}
+// 启动时为删除监听构建初始本地快照（若尚无）
+MiniSync.orchestrator.saveLocalSnapshot().catch(e =>
+  console.warn('[MiniSync] 初始化本地快照失败（忽略）:', e.message)
+);
 
-// 获取整个书签树并转换为扁平列表格式（与 berry 书签 JSON 格式保持一致）
-//
-// 映射规则（方案 A：给根级节点加 source 标记，实现双向无损同步）：
-//   Chrome 书签栏                                → parentId=ROOT_ID, source='bar'
-//   Chrome 其他收藏夹（排除 "Berry主页" 文件夹本身）  → parentId=ROOT_ID, source='other'
-//   Chrome 其他收藏夹 → Berry主页 下的内容          → parentId=HOME_FOLDER_ID（剥掉"Berry主页"这层）
-//   Chrome 移动设备书签                           → 跳过
-async function serializeBookmarks() {
-  const deviceId = await getDeviceId();
-  return new Promise((resolve) => {
-    chrome.bookmarks.getTree((tree) => {
-      const bookmarks = [];
+// 删除监听处理函数
 
-      // 递归写入一个节点及其所有子孙。
-      // rootParentId / rootSource 仅用于"该节点作为根级节点"时的 parentId 和 source；
-      // 子孙节点的 parentId 永远跟着 Chrome 的节点 id 走，source 不再下发。
-      function traverseNode(node, rootParentId, rootSource) {
-        // 跳过空文件夹（Berry 端可能不处理空文件夹）
-        if (node.children && node.children.length === 0) return;
+// 防抖：多次连续删除只在静默期结束后触发一次合并
+let _removeDebounceTimer = null;
+const REMOVE_DEBOUNCE_MS = 3000;
 
-        const isFolder = !node.url;
-        const entry = {
-          id: node.id,
-          title: node.title || '',
-          url: node.url || '',
-          isFolder: isFolder,
-          parentId: rootParentId,
-          addedAt: node.dateAdded || Date.now(),
-          color: '',
-          favicon: '',
-          customIcon: ''
-        };
-        // 只有根级节点写 source 字段（'bar' 或 'other'），供下载时回填使用
-        if (rootSource) {
-          entry.source = rootSource;
-        }
-        bookmarks.push(entry);
-        if (node.children) {
-          for (const child of node.children) {
-            // 子孙节点的 parentId 跟随 Chrome 节点 id，不再携带 source
-            traverseNode(child, node.id, null);
-          }
-        }
-      }
+// 防抖：移动（拖拽产生连续 onMoved）只在静默期结束后触发一次合并
+let _moveDebounceTimer = null;
+const MOVE_DEBOUNCE_MS = 3000;
 
-      const root = tree[0];
-      const rootChildren = (root && root.children) || [];
+// 处理本地书签删除：收集被删子树所有节点的 pathKey，写入 sync_tombstones。
+async function handleBookmarkRemoved(id, removeInfo) {
+  if (!removeInfo || !removeInfo.node) return;
 
-      let hasHomeFolderContent = false;
-
-      for (let i = 0; i < rootChildren.length; i++) {
-        const topNode = rootChildren[i];
-        if (!topNode.children || topNode.children.length === 0) continue;
-
-        const title = (topNode.title || '').toLowerCase();
-
-        // 跳过"移动设备书签"
-        if (FOLDER_TITLES.mobileBookmarks.some(t => t.toLowerCase() === title)) continue;
-
-        // 书签栏：所有子项 → parentId=ROOT_ID, source='bar'
-        if (FOLDER_TITLES.bookmarkBar.some(t => t.toLowerCase() === title)) {
-          for (const child of topNode.children) {
-            traverseNode(child, ROOT_ID, 'bar');
-          }
-          continue;
-        }
-
-        // 其他收藏夹：区分 "Berry主页" 文件夹和其他普通子项
-        if (FOLDER_TITLES.otherBookmarks.some(t => t.toLowerCase() === title)) {
-          for (const child of topNode.children) {
-            const childTitle = (child.title || '').toLowerCase();
-            const isBerryHome = !child.url && FOLDER_TITLES.berryHome.some(t => t.toLowerCase() === childTitle);
-
-            if (isBerryHome) {
-              // Berry主页 文件夹本身不保留，子内容挂到 HOME_FOLDER_ID
-              if (child.children) {
-                for (const grandChild of child.children) {
-                  traverseNode(grandChild, HOME_FOLDER_ID, null);
-                  hasHomeFolderContent = true;
-                }
-              }
-            } else {
-              // 其他收藏夹的普通子项 → parentId=ROOT_ID, source='other'
-              traverseNode(child, ROOT_ID, 'other');
-            }
-          }
-          continue;
-        }
-
-        // 兜底：不认识的根级文件夹，按"其他收藏夹"处理
-        for (const child of topNode.children) {
-          traverseNode(child, ROOT_ID, 'other');
-        }
-      }
-
-
-      // 如果 __home_folder__ 下有内容，创建该节点并插入到数组最前面
-      // Berry 要求 __home_folder__ 在其子节点之前出现
-      if (hasHomeFolderContent) {
-        bookmarks.unshift({
-          id: HOME_FOLDER_ID,
-          title: '主页文件夹',
-          url: '',
-          isFolder: true,
-          parentId: ROOT_ID,
-          addedAt: Date.now(),
-          color: '',
-          favicon: '',
-          customIcon: ''
-        });
-      }
-
-      resolve({
-        version: 1,
-        lastModified: Date.now(),
-        deviceId: deviceId,
-        bookmarks: bookmarks
+  // ★ 防御：部分浏览器（实测 Edge）对「移动书签」也会派发 onRemoved。此时节点
+  //   只是换了个位置、仍然存在于书签树中——绝不能写墓碑，否则下一轮合并会按
+  //   墓碑把它删除（表现为「挪动书签后书签消失」）。写墓碑前先确认节点确实不存在。
+  const stillThere = await new Promise((resolve) => {
+    try {
+      chrome.bookmarks.get(String(id), (results) => {
+        void chrome.runtime.lastError;
+        resolve(Array.isArray(results) && results.length > 0);
       });
-    });
+    } catch (_) {
+      resolve(false);
+    }
   });
-}
-
-// 递归删除所有书签（清空书签栏和其他书签下的所有子节点）
-async function clearAllBookmarks() {
-  const tree = await new Promise(resolve => chrome.bookmarks.getTree(resolve));
-  const root = tree && tree[0];
-  const children = (root && root.children) || [];
-
-  for (const topNode of children) {
-    // 跳过没有子节点的根文件夹
-    if (!topNode.children || !topNode.children.length) continue;
-    for (const node of topNode.children) {
-      await new Promise(r => chrome.bookmarks.removeTree(node.id, r));
-    }
-  }
-}
-
-// 整体导入（先清空，再从扁平列表重建书签树）
-//
-// 下载映射规则（方案 A：根级节点的 source 字段决定回填目标）：
-//   parentId === ROOT_ID 且 source === 'bar'    → Chrome 书签栏
-//   parentId === ROOT_ID 且 source === 'other'  → Chrome 其他收藏夹
-//   parentId === ROOT_ID 且无 source（老数据兜底） → Chrome 其他收藏夹
-//   parentId === HOME_FOLDER_ID              → Chrome 其他收藏夹 → Berry主页 文件夹（自动创建）
-async function importBookmarksFromData(cloudData) {
-  // cloudData 格式：{ version, lastModified, deviceId, bookmarks: [...] }
-  if (!cloudData || !Array.isArray(cloudData.bookmarks)) {
-    throw new Error('云端数据格式不兼容，请重新上传一次书签后再同步');
-  }
-  const bookmarkList = cloudData.bookmarks;
-
-  // ⚠️ 安全阀：云端空列表但本地有书签 → 拒绝清空
-  // 场景：云端 JSON 被误编辑/损坏/未授权返回空 body 解析出空数组时，
-  // 防止静默把本地几百条书签全部抹掉。如需"清空同步"，用户可手动先清本地再下载。
-  if (bookmarkList.length === 0) {
-    const localCount = await countLocalBookmarks();
-    if (localCount > 0) {
-      throw new Error(
-        `云端书签为空但本地有 ${localCount} 条书签，已拒绝清空。` +
-        `如需重置，请先手动清空本地书签再下载。`
-      );
-    }
-    // 本地也为空：无事可做，直接返回
+  if (stillThere) {
+    console.warn('[MiniSync] onRemoved 触发但节点仍存在（判定为移动事件），跳过墓碑');
     return;
   }
 
-  // 动态获取 Chrome 书签栏和其他书签的真实 ID
-  const tree = await new Promise(resolve => chrome.bookmarks.getTree(resolve));
-  const root = tree && tree[0];
-  const rootChildren = (root && root.children) || [];
-  let bookmarkBarId = '1';   // 默认值
-  let otherBookmarksId = '2'; // 默认值
-  for (const topNode of rootChildren) {
-    const title = (topNode.title || '').toLowerCase();
-    if (FOLDER_TITLES.bookmarkBar.some(t => t.toLowerCase() === title)) {
-      bookmarkBarId = topNode.id;
-    } else if (FOLDER_TITLES.otherBookmarks.some(t => t.toLowerCase() === title)) {
-      otherBookmarksId = topNode.id;
-    }
-  }
-
-  // ⚠️ 关键：清空前先做一份本地快照，防止 SW 中途被回收导致本地书签永久丢失。
-  // 下次启动时可从 storage.local 里的 LOCAL_BACKUP_KEY 恢复。
-  try {
-    const backup = await serializeBookmarks();
-    await chrome.storage.local.set({
-      [LOCAL_BACKUP_KEY]: {
-        savedAt: Date.now(),
-        data: backup
-      }
-    });
-  } catch (e) {
-    console.warn('[sync] 本地快照备份失败（继续执行导入）:', e && e.message);
-  }
-
-  await clearAllBookmarks();
-
-  // 分流 parentId === ROOT_ID 的根级节点（排除 HOME_FOLDER_ID 本身）
-  const rootLevel = bookmarkList.filter(n => n.parentId === ROOT_ID && n.id !== HOME_FOLDER_ID);
-  const barChildren = rootLevel.filter(n => n.source === 'bar');
-  const otherChildren = rootLevel.filter(n => n.source === 'other');
-  const unlabeledChildren = rootLevel.filter(n => n.source !== 'bar' && n.source !== 'other');
-  // __home_folder__ 下的内容
-  const homeChildren = bookmarkList.filter(n => n.parentId === HOME_FOLDER_ID);
-
-
-  // 1) source='bar' → 书签栏
-  for (const child of barChildren) {
-    await buildNode(child, bookmarkBarId, bookmarkList);
-  }
-
-  // 2) source='other' → 其他收藏夹
-  for (const child of otherChildren) {
-    await buildNode(child, otherBookmarksId, bookmarkList);
-  }
-
-  // 3) 无 source 标记（来自老版本数据）→ 兜底进其他收藏夹
-  //    兼容旧逻辑：若节点本身是"其他书签/其他收藏夹"同名文件夹，剥一层
-  for (const child of unlabeledChildren) {
-    const title = (child.title || '').toLowerCase();
-    if (child.isFolder && FOLDER_TITLES.otherBookmarks.some(t => t.toLowerCase() === title)) {
-      const subChildren = bookmarkList.filter(n => n.parentId === child.id);
-      for (const sub of subChildren) {
-        await buildNode(sub, otherBookmarksId, bookmarkList);
-      }
-    } else {
-      await buildNode(child, otherBookmarksId, bookmarkList);
-    }
-  }
-
-  // 4) __home_folder__ 的内容 → 在其他收藏夹下创建 "Berry主页" 文件夹并放入
-  if (homeChildren.length > 0) {
-    const berryHomeFolder = await new Promise((resolve, reject) => {
-      chrome.bookmarks.create(
-        { parentId: otherBookmarksId, title: BERRY_HOME_TITLE },
-        (result) => {
-          if (chrome.runtime.lastError) {
-            reject(chrome.runtime.lastError);
-          } else {
-            resolve(result);
-          }
-        }
-      );
-    });
-
-    for (const child of homeChildren) {
-      await buildNode(child, berryHomeFolder.id, bookmarkList);
-    }
-  }
-
-  // 导入成功，清除快照
-  try { await chrome.storage.local.remove(LOCAL_BACKUP_KEY); } catch (_) {}
-}
-
-// 把移动端可能写成 "www.baidu.com" / "baidu.com/path" / "//baidu.com" 的 URL
-// 规范化为 Chrome 能接受的带 scheme 形式。无法识别时返回 null，交由上层跳过。
-function normalizeUrl(rawUrl) {
-  if (!rawUrl) return null;
-  let u = String(rawUrl).trim();
-  if (!u) return null;
-
-  // 已经是常见合法 scheme 的，直接用
-  // chrome.bookmarks.create 支持 http(s)、ftp、file、chrome、about、javascript、data 等
-  if (/^[a-zA-Z][a-zA-Z0-9+.\-]*:/.test(u)) {
-    return u;
-  }
-  // 协议相对 URL: //example.com/xxx
-  if (u.startsWith('//')) {
-    return 'https:' + u;
-  }
-  // 裸域名 / 带路径：www.baidu.com、baidu.com/path、example.com:8080
-  // 粗略判断：至少含一个 "." 或 ":"
-  if (/[.:]/.test(u)) {
-    return 'https://' + u;
-  }
-  return null;
-}
-
-// 递归创建书签节点（失败时只跳过这一条，不中断整棵树）
-async function buildNode(node, chromeParentId, bookmarkList) {
-  const createProps = {
-    parentId: chromeParentId,
-    title: node.title || ''
-  };
-  if (!node.isFolder && node.url) {
-    const fixedUrl = normalizeUrl(node.url);
-    if (!fixedUrl) {
-      console.warn(`[sync] 跳过非法 URL 书签: title="${node.title}" url="${node.url}"`);
-      return; // 这条建不了，子节点也没意义，直接返回
-    }
-    if (fixedUrl !== node.url) {
-    }
-    createProps.url = fixedUrl;
-  }
-
-  let created;
-  try {
-    created = await new Promise((resolve, reject) => {
-      chrome.bookmarks.create(createProps, (result) => {
-        if (chrome.runtime.lastError) {
-          reject(chrome.runtime.lastError);
-        } else {
-          resolve(result);
-        }
-      });
-    });
-  } catch (err) {
-    // 最终兜底：单条失败就跳过，不要让整棵树挂掉
-    console.error(
-      `[sync] create 失败，已跳过: ${err.message}, parentId="${chromeParentId}" ` +
-      `title="${node.title}" url="${createProps.url || ''}"`
-    );
+  // 同步进行中的删除（由合并/下载落盘自身产生）不写墓碑，避免循环回写
+  const curStatus = await MiniSync.storage.getSyncStatus();
+  if (curStatus.status === SYNCING) {
     return;
   }
 
-  const children = bookmarkList.filter(n => n.parentId === node.id);
-  for (const child of children) {
-    await buildNode(child, created.id, bookmarkList);
-  }
-}
-
-async function uploadToCloud() {
-  try {
-    const bookmarksData = await serializeBookmarks();
-    await uploadBookmarks(bookmarksData);
-    const count = await countLocalBookmarks();
-    await chrome.storage.local.set({ last_sync_at: Date.now(), last_sync_count: count });
-    return { success: true, message: "从本地上传成功" };
-  } catch (e) {
-    console.error('[sync] 上传失败:', e);
-    return { success: false, message: '上传失败：' + (e && e.message ? e.message : String(e)) };
-  }
-}
-
-async function downloadFromCloud() {
-  try {
-    const cloudData = await downloadBookmarks();
-    await importBookmarksFromData(cloudData);
-    const count = await countLocalBookmarks();
-    await chrome.storage.local.set({ last_sync_at: Date.now(), last_sync_count: count });
-    return { success: true, message: "从云端下载成功" };
-  } catch (e) {
-    if (e instanceof CloudNotFoundError) {
-      return { success: false, message: "云端没有书签文件" };
-    }
-    console.error('[sync] 下载失败:', e);
-    return { success: false, message: '下载失败：' + (e && e.message ? e.message : String(e)) };
-  }
-}
-
-// ========== 两端合并 ==========
-// 合并策略（v2，基于"路径身份"）：
-// 1) 本地先 serialize → localData（含 bookmarks 扁平数组）
-// 2) 远端 download → cloudData（可能为 null，表示云端还没有文件）
-// 3) 对两边扁平列表递归计算路径身份（把每个节点的父链路径算出来做 key）
-//    - 因为 Chrome 节点 id 是本地递增的，两端必然不同，不能作为身份
-//    - 路径身份规则：
-//        根定位：`ROOT:bar` / `ROOT:other` / `ROOT:home`（__home_folder__ 下的）
-//        folder：父路径 + `/F:<title>`
-//        leaf  ：父路径 + `/L:<normalizeUrl(url)>`
-// 4) 合并后的扁平列表 → importBookmarksFromData 重建本地 + uploadBookmarks 写回云端
-// 5) 时间冲突取 max(addedAt)
-
-// 给扁平列表里的每个节点算一个稳定的路径身份，返回 Map<originalId, pathKey>
-// 同时对"根落点"的不同也做归一化（source=bar/other、__home_folder__）
-function computePathKeys(list) {
-  // 建 id → node 索引
-  const byId = new Map();
-  for (const n of list) byId.set(n.id, n);
-
-  const memo = new Map();
-  function pathOf(node) {
-    if (memo.has(node.id)) return memo.get(node.id);
-    let parentPath;
-    if (node.id === HOME_FOLDER_ID) {
-      // __home_folder__ 自身归一化为 ROOT:home 这个"位置"
-      memo.set(node.id, 'ROOT:home');
-      return 'ROOT:home';
-    }
-    const pid = node.parentId;
-    if (pid === ROOT_ID) {
-      // 根级：按 source 区分书签栏/其他
-      if (node.source === 'bar') parentPath = 'ROOT:bar';
-      else parentPath = 'ROOT:other'; // 没标或标为 other 都按其他走
-    } else if (pid === HOME_FOLDER_ID) {
-      parentPath = 'ROOT:home';
-    } else {
-      const parent = byId.get(pid);
-      if (!parent) {
-        // 孤儿：找不到父，当成 ROOT:other 兜底
-        parentPath = 'ROOT:other';
-      } else {
-        parentPath = pathOf(parent);
-      }
-    }
-    const seg = node.isFolder
-      ? `F:${(node.title || '').trim()}`
-      : `L:${normalizeUrl(node.url) || node.url || ''}`;
-    const key = parentPath + '/' + seg;
-    memo.set(node.id, key);
-    return key;
-  }
-  for (const n of list) pathOf(n);
-  return memo;
-}
-
-// 合并两端扁平列表。策略：按"路径身份"去重，两端在同一路径的节点视为同一条书签。
-// 时间取 max(addedAt)，title/url 允许后来者更新。
-function mergeBookmarkLists(localList, cloudList) {
-  const localKeys = computePathKeys(localList || []);
-  const cloudKeys = computePathKeys(cloudList || []);
-
-  // Map<pathKey, mergedNode>
-  const map = new Map();
-  // 记录每侧的 id → 保留下来的节点 id，用于回填子节点 parentId
-  const idRemap = new Map(); // key: "L:<origId>" / "C:<origId>" → keptId
-
-  function feed(list, keysMap, tag) {
-    if (!Array.isArray(list)) return;
-    for (const n of list) {
-      const key = keysMap.get(n.id);
-      if (!key) continue;
-      const existing = map.get(key);
-      if (!existing) {
-        // 深拷贝第一次出现的节点
-        map.set(key, { ...n });
-        idRemap.set(`${tag}:${n.id}`, n.id);
-      } else {
-        idRemap.set(`${tag}:${n.id}`, existing.id);
-        if ((n.addedAt || 0) > (existing.addedAt || 0)) {
-          existing.addedAt = n.addedAt;
-          if (n.title) existing.title = n.title;
-          if (!existing.isFolder && n.url) existing.url = n.url;
-        }
-      }
-    }
+  // 1. 从删除前快照取 pathKey 映射
+  const snapData = await MiniSync.storage.getLocal([STORAGE_KEYS.SNAPSHOTS]);
+  const snapshots = snapData[STORAGE_KEYS.SNAPSHOTS];
+  const prevTree = (snapshots && snapshots.localTree) || [];
+  let prevPKMap = new Map();
+  if (prevTree.length > 0) {
+    prevPKMap = MiniSync.xbelPath.computeJsonPathKeys(prevTree);
   }
 
-  feed(localList, localKeys, 'L');
-  feed(cloudList, cloudKeys, 'C');
+  // 2. 收集被删子树所有节点 id（含子孙）
+  const removedIds = [];
+  (function collect(node) {
+    if (!node) return;
+    removedIds.push(node.id);
+    (node.children || []).forEach(collect);
+  })(removeInfo.node);
 
-  // 修正 parentId：对合并后的每个节点，若 parentId 指向的是两侧 id，就映射到保留 id
-  const merged = [];
-  for (const node of map.values()) {
-    const copy = { ...node };
-    const parent = copy.parentId;
-    if (parent && parent !== ROOT_ID && parent !== HOME_FOLDER_ID) {
-      const k1 = `L:${parent}`;
-      const k2 = `C:${parent}`;
-      if (idRemap.has(k1)) copy.parentId = idRemap.get(k1);
-      else if (idRemap.has(k2)) copy.parentId = idRemap.get(k2);
-    }
-    merged.push(copy);
+  // 3. 取这些 id 在删除前的 pathKey，写入墓碑
+  const newlyDeleted = new Set();
+  for (const rid of removedIds) {
+    const pk = prevPKMap.get(rid);
+    if (pk) newlyDeleted.add(pk);
   }
 
-  // 保证 __home_folder__ 存在于列表最前面（如果有内容挂在它下面）
-  const hasHomeChildren = merged.some(n => n.parentId === HOME_FOLDER_ID);
-  const hasHomeFolder = merged.some(n => n.id === HOME_FOLDER_ID);
-  if (hasHomeChildren && !hasHomeFolder) {
-    merged.unshift({
-      id: HOME_FOLDER_ID,
-      title: '主页文件夹',
-      url: '',
-      isFolder: true,
-      parentId: ROOT_ID,
-      addedAt: Date.now(),
-      color: '',
-      favicon: '',
-      customIcon: ''
-    });
+  if (newlyDeleted.size > 0) {
+    const existing = (await MiniSync.storage.getLocal([STORAGE_KEYS.TOMBSTONES]))[STORAGE_KEYS.TOMBSTONES] || [];
+    const devId = await MiniSync.storage.getDeviceId();
+    const merged = MiniSync.tombstone.mergeTombstones(existing, newlyDeleted, null, devId);
+    await MiniSync.storage.setLocal({ [STORAGE_KEYS.TOMBSTONES]: merged });
   }
-  return merged;
-}
 
-async function mergeSync() {
-  try {
-    const localData = await serializeBookmarks();
+  // 4. 刷新本地快照（删除后当前树）
+  await MiniSync.orchestrator.saveLocalSnapshot();
 
-    // 只对"云端没有书签文件"（404）这一种情况容错——按仅上传处理是合理的。
-    // 其他错误（401 认证失败 / 网络超时 / 5xx 服务器故障）必须中断合并，
-    // 否则会用本地（可能不完整的）数据覆盖云端上其他设备已经同步好的书签。
-    let cloudList = [];
+  // 5. 防抖触发一次合并，把墓碑推上云并消费云端墓碑
+  const cfg = await MiniSync.storage.getLocal(['sync_enabled', 'webdav_url']);
+  if (!cfg.sync_enabled || !cfg.webdav_url) {
+    return;
+  }
+  if (_removeDebounceTimer) clearTimeout(_removeDebounceTimer);
+  _removeDebounceTimer = setTimeout(async () => {
+    _removeDebounceTimer = null;
     try {
-      const cloudData = await downloadBookmarks();
-      if (cloudData && Array.isArray(cloudData.bookmarks)) {
-        cloudList = cloudData.bookmarks;
+      const status = await MiniSync.storage.getSyncStatus();
+      if (status.status === SYNCING) {
+        return;
       }
+      await runAutoSync();
     } catch (e) {
-      if (e instanceof CloudNotFoundError) {
-        console.info('[sync] 云端暂无书签文件，按首次上传处理');
-      } else {
-        throw e; // 网络/认证/服务器错误 → 让外层 catch 统一返回失败
-      }
+      console.warn('[MiniSync] 删除监听触发合并失败（忽略）:', e.message);
     }
-
-    const mergedList = mergeBookmarkLists(localData.bookmarks, cloudList);
-
-    // 给合并后的节点重新分配唯一 id（保留 __home_folder__ 这种虚拟 id 不动）
-    // 这一步非常关键：否则两端 Chrome 数字 id 可能碰撞，重建时子节点会挂错位置。
-    const renumbered = renumberBookmarks(mergedList);
-
-    const deviceId = await getDeviceId();
-    const mergedData = {
-      version: 1,
-      lastModified: Date.now(),
-      deviceId: deviceId,
-      bookmarks: renumbered
-    };
-
-    // 重建本地
-    await importBookmarksFromData(mergedData);
-    // 回写云端
-    await uploadBookmarks(mergedData);
-
-    const count = await countLocalBookmarks();
-    await chrome.storage.local.set({ last_sync_at: Date.now(), last_sync_count: count });
-    return { success: true, message: '两端合并成功' };
-  } catch (e) {
-    console.error('[sync] 合并失败:', e);
-    return { success: false, message: '合并失败：' + (e && e.message ? e.message : String(e)) };
-  }
-}
-
-// 给扁平列表重新分配唯一 id（保留 ROOT_ID / HOME_FOLDER_ID 这种特殊 id）
-// 返回的新数组：节点 id 为 m1/m2/...，parentId 也会跟着重映射
-function renumberBookmarks(list) {
-  const idMap = new Map(); // 旧 id → 新 id
-  idMap.set(ROOT_ID, ROOT_ID);
-  idMap.set(HOME_FOLDER_ID, HOME_FOLDER_ID);
-  let counter = 0;
-  for (const n of list) {
-    if (!idMap.has(n.id)) {
-      idMap.set(n.id, 'm' + (++counter));
-    }
-  }
-  return list.map(n => {
-    const copy = { ...n };
-    copy.id = idMap.get(n.id) || n.id;
-    if (n.parentId && idMap.has(n.parentId)) {
-      copy.parentId = idMap.get(n.parentId);
-    }
-    return copy;
-  });
-}
-
-// ========== 消息处理 ==========
-// 通用消息处理函数：带锁的异步操作包装器
-async function handleMessageWithLock(actionName, handler) {
-  if (!await acquireSyncLock(`manual-${actionName}`)) {
-    return { success: false, message: '有同步正在进行，请稍后再试' };
-  }
-  try {
-    return await handler();
-  } catch (e) {
-    return { success: false, message: e.message || '操作异常' };
-  } finally {
-    await releaseSyncLock();
-  }
-}
-
-// ⚠️ 不要把 listener 写成 async。Chrome 的 MV3 onMessage 要求回调返回 true 才保持
-// sendResponse 通道异步可用；async 函数返回的是 Promise，Chrome 视为"同步无返回"，
-// sendResponse 会被立刻销毁。下面用同步函数 + 内部 IIFE 处理异步。
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  const syncActions = {
-    'upload': () => handleMessageWithLock('upload', uploadToCloud),
-    'download': () => handleMessageWithLock('download', downloadFromCloud),
-    'merge': () => handleMessageWithLock('merge', mergeSync)
-  };
-
-  if (syncActions[request.action]) {
-    (async () => {
-      try {
-        // 同步操作前检查 host 权限
-        const cfg = await getWebDAVConfig();
-        if (!await hasHostPermission(cfg.url)) {
-          sendResponse({ success: false, message: '缺少域名访问权限，请重新保存配置以授权' });
-          return;
-        }
-        const result = await syncActions[request.action]();
-        sendResponse(result);
-      } catch (e) {
-        sendResponse({ success: false, message: e && e.message ? e.message : String(e) });
-      }
-    })();
-    return true; // 保持消息通道开启，等待异步 sendResponse
-  }
-
-  if (request.action === 'updateSyncInterval') {
-    rescheduleAlarm().then(() => sendResponse({ success: true }));
-    return true;
-  }
-
-  if (request.action === 'testConnection') {
-    testConnection(request).then(sendResponse);
-    return true;
-  }
-
-  // popup 打开时检查配置连通性（走 background 避免 extension page 弹 HTTP 认证框）
-  if (request.action === 'checkConfig') {
-    (async () => {
-      try {
-        const { webdavUrl, webdavUser, webdavPassword, webdavPath } = request;
-        const normalizedPath = normalizeBookmarkPath(webdavPath);
-        if (!normalizedPath) {
-          sendResponse({ ok: false });
-          return;
-        }
-        const fullUrl = joinWebDAVUrl(webdavUrl, normalizedPath);
-        const authHeader = getAuthHeader(webdavUser, webdavPassword);
-        const resp = await fetch(fullUrl, {
-          method: 'GET',
-          headers: { 'Authorization': authHeader }
-        });
-        sendResponse({ ok: resp.ok || resp.status === 404 });
-      } catch (e) {
-        sendResponse({ ok: false });
-      }
-    })();
-    return true;
-  }
-});
-
-// ========== 测试 WebDAV 连接 ==========
-async function testConnection(request) {
-  const { webdavUrl, webdavUser, webdavPassword, webdavPath } = request;
-  const normalizedPath = normalizeBookmarkPath(webdavPath);
-  if (!normalizedPath) {
-    return { success: false, message: '请填写云端文件路径，至少指定一个文件夹' };
-  }
-  const fullUrl = joinWebDAVUrl(webdavUrl, normalizedPath);
-
-  // 先用更通用的方式测试：PROPFIND（WebDAV 标准方法）
-  // 如果 PROPFIND 失败再降级为 GET/HEAD
-  const authHeader = getAuthHeader(webdavUser, webdavPassword);
-
-  async function tryMethod(method) {
-    const headers = { 'Authorization': authHeader };
-    if (method === 'PROPFIND') {
-      headers['Content-Type'] = 'application/xml; charset=utf-8';
-      headers['Depth'] = '0';
-    }
-    const resp = await fetch(fullUrl, {
-      method,
-      headers
-    });
-    return resp;
-  }
-
-  try {
-    let response;
-
-    // 策略：先尝试 PROPFIND（最标准的 WebDAV 测试方法）
-    try {
-      response = await tryMethod('PROPFIND');
-    } catch (e) {
-      // PROPFIND 可能被 CORS 或服务器拦截，降级到 GET
-      console.warn('[test] PROPFIND 失败，降级到 GET:', e.message);
-      response = await tryMethod('GET');
-    }
-
-    // 成功状态：2xx 表示可访问，404 表示服务器可达但文件不存在
-    if (response.ok || response.status === 404) {
-      return { success: true, message: response.status === 404 ? '连接成功，文件尚未创建' : '连接成功' };
-    }
-
-    // 401 / 403 → 认证失败
-    if (response.status === 401 || response.status === 403) {
-      return { success: false, message: `认证失败(${response.status})，请检查用户名和密码` };
-    }
-
-    // 其他错误
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-  } catch (e) {
-    console.error('[test] 连接测试失败:', e);
-    return { success: false, message: e.message || '连接测试失败' };
-  }
+  }, REMOVE_DEBOUNCE_MS);
 }

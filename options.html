@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <!-- 与 popup.html 保持一致：手机浏览器上按设备宽度排版（桌面忽略）。本页没有定宽，只补声明。 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>极简书签同步</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+            color: #222;
+            background: #f9fafb;
+            padding: 24px;
+            max-width: 640px;
+            margin: 0 auto;
+        }
+        h1 {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        h1 img { width: 24px; height: 24px; }
+        #supportBtn {
+            margin-left: auto;
+            font-size: 12px;
+            color: #ef4444;
+            text-decoration: none;
+            padding: 4px 12px;
+            border-radius: 999px;
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            transition: all 0.15s;
+            font-weight: 500;
+            white-space: nowrap;
+        }
+        #supportBtn:hover {
+            background: #fee2e2;
+            border-color: #fca5a5;
+            color: #dc2626;
+        }
+
+        .card {
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+        .card-title {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            color: #374151;
+        }
+
+        /* 账户信息 */
+        .account-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+        .account-item {
+            padding: 4px 0;
+        }
+        .account-label {
+            font-size: 11px;
+            color: #9ca3af;
+        }
+        .account-value {
+            font-size: 13px;
+            color: #374151;
+            font-weight: 500;
+            word-break: break-all;
+        }
+
+        /* 同步概览 */
+        .overview-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;   /* 标签与右侧内容之间留固定间隙，别让它们贴到一起 */
+            padding: 10px 0;
+            border-bottom: 1px solid #f3f4f6;
+        }
+        .overview-row:last-child { border-bottom: none; }
+        .overview-label {
+            font-size: 12px;
+            color: #6b7280;
+            /* 右侧是长说明时，本标签会被挤到最小内容宽度（中文就是一个字宽）⇒ 竖排成
+               「下/载/重/建」。标签自己不许被压缩，长文本自己去折行。 */
+            flex-shrink: 0;
+            white-space: nowrap;
+        }
+        .overview-value {
+            font-size: 13px;
+            font-weight: 500;
+            color: #111827;
+            min-width: 0;   /* 让右侧长文本在窄屏里正常折行，而不是反过来顶宽整行 */
+        }
+        .overview-value.ok { color: #10b981; }
+        .overview-value.warn { color: #f59e0b; }
+        .overview-value.err { color: #ef4444; }
+
+        /* 最近操作 + 查看日志 */
+        .last-action {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 0;
+        }
+        .last-action .overview-label {
+            flex-shrink: 0;
+        }
+        .last-action-info {
+            flex: 1;
+            font-size: 12px;
+            color: #4b5563;
+            text-align: right;
+        }
+        .last-action-info .action-name { font-weight: 500; }
+        .last-action-info .action-result { margin-left: 4px; }
+        .last-action-info .action-result.ok { color: #10b981; }
+        .last-action-info .action-result.err { color: #ef4444; }
+        .last-action-info .action-time { color: #9ca3af; margin-left: 4px; font-size: 11px; }
+        .view-all-btn {
+            font-size: 11px;
+            color: #2563eb;
+            cursor: pointer;
+            border: none;
+            background: none;
+            padding: 4px 8px;
+            border-radius: 4px;
+            flex-shrink: 0;
+        }
+        .view-all-btn:hover { background: #eff6ff; }
+
+        /* 日志展开区域 */
+        .log-expand {
+            display: none;
+            padding: 8px 0;
+            border-top: 1px solid #f3f4f6;
+            max-height: 240px;
+            overflow-y: auto;
+        }
+        .log-expand.show { display: block; }
+        .log-header {
+            display: grid;
+            grid-template-columns: 2fr 1.5fr 1.5fr 1.5fr 1.5fr;
+            padding: 6px 0;
+            font-size: 11px;
+            color: #9ca3af;
+            border-bottom: 1px solid #f3f4f6;
+        }
+        .log-item {
+            display: grid;
+            grid-template-columns: 2fr 1.5fr 1.5fr 1.5fr 1.5fr;
+            padding: 7px 0;
+            border-bottom: 1px solid #f3f4f6;
+            font-size: 12px;
+            color: #4b5563;
+        }
+        .log-item:last-child { border-bottom: none; }
+        .log-action { font-weight: 500; color: #374151; }
+        .log-trigger { color: #6b7280; }
+        .log-time { color: #9ca3af; }
+        .log-count { color: #374151; }
+        .log-change { color: #6b7280; min-width: 0; overflow: hidden; display: inline-flex; align-items: center; gap: 4px; }
+        .log-err-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+        .log-change.ok { color: #10b981; }
+        .log-change.err { color: #ef4444; }
+        .log-change.warn { color: #b45309; }
+        .log-item.lvl-err .log-action { color: #ef4444; }
+        .log-item.lvl-warn .log-action { color: #b45309; }
+        .copy-btn {
+            display: inline-block; vertical-align: -1px; margin-left: 5px;
+            color: #9ca3af; cursor: pointer; flex-shrink: 0;
+        }
+        .copy-btn:hover { color: #3b82f6; }
+        .copy-btn.copied { color: #10b981; }
+        #copyToast {
+            position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%);
+            background: #111827; color: #fff; font-size: 12px; padding: 8px 16px;
+            border-radius: 8px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 9999;
+        }
+        #copyToast.show { opacity: .92; }
+        .log-empty { color: #9ca3af; font-style: italic; padding: 8px 0; text-align: center; font-size: 12px; }
+
+        /* 浏览器支持 */
+        .browser-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 0;
+            border-bottom: 1px solid #f3f4f6;
+            gap: 8px;
+        }
+        .browser-item:last-child { border-bottom: none; }
+        .browser-info {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .browser-icon {
+            width: 28px;
+            height: 28px;
+            border-radius: 6px;
+            background: #f3f4f6;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            font-weight: 600;
+            color: #6b7280;
+        }
+        .browser-name { font-size: 13px; font-weight: 500; color: #374151; }
+        .browser-desc { font-size: 11px; color: #9ca3af; }
+
+        /* 开关带内嵌文字 */
+        .switch {
+            position: relative;
+            width: 64px;
+            height: 26px;
+            background: #d1d5db;
+            border-radius: 999px;
+            cursor: pointer;
+            transition: background 0.2s;
+            flex-shrink: 0;
+            user-select: none;
+        }
+        .switch.on { background: #10b981; }
+        .switch.disabled { cursor: default; opacity: 0.7; }
+        .switch::before {
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 10px;
+            font-weight: 500;
+            color: #fff;
+            line-height: 1;
+        }
+        .switch::before {
+            content: attr(data-off);
+            left: 26px;
+        }
+        .switch.on::before {
+            content: attr(data-on);
+            left: 8px;
+        }
+        .switch::after {
+            content: '';
+            position: absolute;
+            top: 3px;
+            left: 3px;
+            width: 20px;
+            height: 20px;
+            background: #fff;
+            border-radius: 50%;
+            transition: left 0.2s;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+        }
+        .switch.on::after { left: 41px; }
+
+        /* 子配置面板 */
+        .sub-settings {
+            margin-top: 4px;
+            margin-bottom: 8px;
+            padding: 10px 14px;
+            background: #f9fafb;
+            border-radius: 8px;
+            border: 1px solid #e5e7eb;
+            display: none;
+        }
+        .sub-settings.show { display: block; }
+        .sub-setting-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid #f3f4f6;
+        }
+        .sub-setting-row:last-child { border-bottom: none; }
+        .sub-setting-label { font-size: 12px; color: #4b5563; }
+        .sub-setting-desc { font-size: 11px; color: #9ca3af; }
+
+        .file-tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            background: #f3f4f6;
+            color: #6b7280;
+        }
+        .file-tag.on { background: #d1fae5; color: #065f46; }
+        .file-tag .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #d1d5db;
+        }
+        .file-tag.on .dot { background: #10b981; }
+
+        /* 备份与迁移 */
+        .backup-row { display: flex; gap: 10px; flex-wrap: wrap; }
+        .backup-hint {
+            margin-top: 10px;
+            font-size: 11px;
+            line-height: 1.5;
+            color: #b45309;
+            background: #fffbeb;
+            border: 1px solid #fcd34d;
+            border-radius: 6px;
+            padding: 7px 9px;
+        }
+        .backup-result {
+            margin-top: 8px;
+            font-size: 12px;
+            line-height: 1.5;
+            word-break: break-word;
+        }
+        .backup-result.ok { color: #047857; }
+        .backup-result.err { color: #b91c1c; }
+
+        /* 备份与迁移的按钮：之前 options.html 里根本没有 .btn 规则 ⇒ 落到浏览器原生按钮外观，
+           灰底凸边跟卡片主题完全不像。这里与弹窗（popup.html）用同一套令牌：白底 + #d1d5db 描边 +
+           6px 圆角 + 13px/500 字重，主按钮用全局强调色 #2563eb。 */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-family: inherit;
+            font-size: 13px;
+            font-weight: 500;
+            line-height: 1.2;
+            color: #374151;
+            background: #fff;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            padding: 8px 12px;
+            cursor: pointer;
+            transition: background 0.15s, border-color 0.15s, color 0.15s;
+        }
+        .btn:hover { background: #f9fafb; border-color: #9ca3af; }
+        .btn:active { background: #f3f4f6; }
+        .btn:focus-visible { outline: 2px solid #93c5fd; outline-offset: 2px; }
+        .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+        .btn svg { width: 14px; height: 14px; flex-shrink: 0; }
+        .btn-primary {
+            color: #fff;
+            background: #2563eb;
+            border-color: #2563eb;
+        }
+        .btn-primary:hover { background: #1d4ed8; border-color: #1d4ed8; }
+        .btn-primary:active { background: #1e40af; border-color: #1e40af; }
+
+        /* 密码显示/隐藏 */
+        .password-wrap {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .password-value {
+            font-size: 13px;
+            color: #374151;
+            font-weight: 500;
+            font-family: monospace;
+            letter-spacing: 2px;
+        }
+        .password-toggle-inline {
+            font-size: 13px;
+            color: #6b7280;
+            background: none;
+            border: none;
+            cursor: pointer;
+            padding: 2px 4px;
+            border-radius: 4px;
+            line-height: 1;
+            transition: background 0.15s, color 0.15s;
+        }
+        .password-toggle-inline:hover { background: #f3f4f6; color: #111827; }
+        .folder-display {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .folder-path {
+            font-size: 11px;
+            color: #374151;
+            max-width: 220px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .folder-edit-btn {
+            font-size: 10px;
+            color: #2563eb;
+            background: none;
+            border: none;
+            padding: 1px 4px;
+            cursor: pointer;
+            line-height: 1.4;
+            flex-shrink: 0;
+        }
+        .folder-edit-btn:hover { text-decoration: underline; }
+        .folder-edit-btn.save { color: #10b981; }
+        .folder-edit-btn.save:hover { text-decoration: underline; }
+        .folder-edit-btn:disabled,
+        .folder-edit-btn.disabled { color: #9ca3af; cursor: not-allowed; text-decoration: none; }
+        .folder-input {
+            width: 120px;
+            padding: 2px 6px;
+            font-size: 11px;
+            border: 1px solid #e5e7eb;
+            border-radius: 4px;
+            color: #374151;
+            outline: none;
+            transition: border-color 0.15s;
+            display: none;
+        }
+        .folder-input:focus { border-color: #10b981; }
+
+        /* 文件夹选择下拉 */
+        .folder-select {
+            position: relative;
+            display: none;
+        }
+        .folder-select select {
+            font-size: 11px;
+            padding: 2px 6px;
+            border: 1px solid #e5e7eb;
+            border-radius: 4px;
+            color: #374151;
+            background: #fff;
+            outline: none;
+            max-width: 140px;
+        }
+        .folder-select select:focus { border-color: #10b981; }
+        .folder-select.show { display: inline-block; }
+
+        .footer {
+            margin-top: 24px;
+            font-size: 11px;
+            color: #9ca3af;
+            text-align: center;
+        }
+        .card.disabled {
+            opacity: 0.45;
+            pointer-events: none;
+            user-select: none;
+        }
+        .row-disabled {
+            opacity: 0.4;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <h1>
+        <img src="icons/icon-48.png" alt="">极简书签同步
+        <a href="https://jagshen.github.io/Mini-bookmark-sync/support.html" target="_blank" id="supportBtn" title="支持作者 ☕">支持作者</a>
+    </h1>
+
+    <!-- 账户信息 -->
+    <div class="card">
+        <div class="card-title">账户信息</div>
+        <div class="account-grid">
+            <div class="account-item">
+                <div class="account-label">WebDAV 地址</div>
+                <div class="account-value" id="webdavType">--</div>
+            </div>
+            <div class="account-item">
+                <div class="account-label">账号</div>
+                <div class="account-value" id="accountInfo">--</div>
+            </div>
+            <div class="account-item">
+                <div class="account-label">应用密码</div>
+                <div class="account-value">
+                    <div class="password-wrap">
+                        <span id="appPassword" class="password-value">********</span>
+                        <button id="toggleAppPasswordBtn" class="password-toggle-inline" title="显示密码">👁</button>
+                    </div>
+                </div>
+            </div>
+            <div class="account-item">
+                <div class="account-label">设备 ID</div>
+                <div class="account-value" id="deviceId" style="font-size:11px;">--</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 同步概览 -->
+    <div class="card">
+        <div class="card-title">同步概览</div>
+        <div class="overview-row" id="connRow">
+            <span class="overview-label">连接状态</span>
+            <span class="overview-value" id="connStatus">检测中...</span>
+            <button class="view-all-btn" id="grantPermBtn" style="display:none;margin-left:8px;">授权域名访问</button>
+        </div>
+        <div class="overview-row">
+            <span class="overview-label">本地书签数</span>
+            <span class="overview-value" id="localCount">--</span>
+        </div>
+        <div class="overview-row" id="autoSyncRow">
+            <span class="overview-label">自动同步</span>
+            <span class="overview-value" id="autoSync">--</span>
+        </div>
+        <!-- 下载写入位置：某些移动端宿主（如雨见/Gecko fork）的根节点是扁平的，
+             没有「书签栏/其他书签/移动书签」三个分区，按标题匹配必然失败。
+             留「自动」时按分区→扁平根识别；识别不出来就在这里手选一个位置。 -->
+        <div class="overview-row" id="targetRow" style="flex-direction:column;align-items:stretch;gap:6px;">
+            <span style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+                <span class="overview-label">下载写入位置</span>
+                <select id="targetSelect" style="max-width:230px;padding:2px 4px;font-size:12px;border:1px solid #d1d5db;border-radius:6px;background:#fff;">
+                    <option value="">自动</option>
+                </select>
+            </span>
+            <!-- 说明独占整行：挤在右侧窄列里会变成一坨右对齐的灰字，读起来累 -->
+            <span id="targetHint" style="font-size:11px;color:#9ca3af;line-height:1.4;"></span>
+        </div>
+        <!-- 下载前清空本地：破坏性动作，默认关闭。扁平根宿主上这是清理
+             「同名容器层层嵌套」的确定性手段（先清空再按云端重建）。 -->
+        <div class="overview-row" id="clearRow" style="flex-direction:column;align-items:stretch;gap:6px;">
+            <span style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+                <span class="overview-label">下载重建</span>
+                <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                    <input type="checkbox" id="clearCheckbox">
+                    下载前先清空本地书签
+                </label>
+            </span>
+            <span id="clearHint" style="font-size:11px;color:#9ca3af;line-height:1.4;">关闭时按增量同步（默认）：云端新增的导入本机，云端删掉的也从本机删掉，本机独有的保留。开启则先清空本地再按云端重建——手机上手动加的、还没同步到云端的书签会丢。</span>
+        </div>
+        <div class="last-action" id="lastActionRow">
+            <span class="overview-label">操作日志</span>
+            <div class="last-action-info" id="lastActionInfo">暂无记录</div>
+            <button class="view-all-btn" id="viewAllLogs">查看全部</button>
+            <button class="view-all-btn" id="clearLogsBtn" title="清除日志" style="font-size:12px;padding:2px 4px;">🗑</button>
+        </div>
+        <div class="log-expand" id="logExpand"></div>
+
+        <!-- 一键诊断：把「后台是否在跑 / 宿主给了哪些能力 / 书签接口能不能真读」逐项摊开。
+             移动端宿主（Gecko fork 等）差异极大，没有这份报告就只能靠猜。 -->
+        <div style="margin-top:10px;display:flex;align-items:center;gap:8px;">
+            <button class="view-all-btn" id="diagBtn">运行后台诊断</button>
+            <span style="font-size:11px;color:#9ca3af;">排查同步问题时点它，把结果截图</span>
+        </div>
+        <pre id="diagOut" style="display:none;margin-top:8px;padding:10px;background:#f9fafb;border:1px solid #e5e7eb;
+             border-radius:8px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto;"></pre>
+    </div>
+
+    <!-- 浏览器支持 -->
+    <div class="card" id="browserCard" style="display:none;">
+        <div class="card-title">浏览器支持</div>
+
+        <div class="sub-setting-label" style="color:#9ca3af;margin-bottom:8px;">移动端</div>
+        <div class="browser-item">
+            <div class="browser-info">
+                <div class="browser-name">Via 浏览器 (Android)</div>
+            </div>
+            <div class="switch" id="viaSwitch" data-on="已启用" data-off="未启用"></div>
+        </div>
+        <div class="sub-settings show" id="viaSettings">
+            <div class="sub-setting-row">
+                <div>
+                    <div class="sub-setting-label">云端所在文件夹</div>
+                </div>
+                <div class="folder-display" id="viaFolderWrap">
+                    <span class="folder-path" id="viaFolderPath">--</span>
+                    <div class="folder-select" id="viaFolderSelect"><select id="viaFolderOptions"></select></div>
+                    <button class="folder-edit-btn" id="viaFolderBtn">修改</button>
+                </div>
+            </div>
+            <div class="sub-setting-row">
+                <div>
+                    <div class="sub-setting-label">云端文件状态</div>
+                </div>
+                <span class="file-tag" id="viaFileTag"><span class="dot"></span>检测中</span>
+            </div>
+        </div>
+        <div class="browser-item">
+            <div class="browser-info">
+                <div class="browser-name">Berry (HarmonyOS)</div>
+            </div>
+            <div class="switch" id="berrySwitch" data-on="已启用" data-off="未启用"></div>
+        </div>
+        <div class="sub-settings show" id="berrySettings">
+            <div class="sub-setting-row">
+                <div>
+                    <div class="sub-setting-label">云端所在文件夹</div>
+                </div>
+                <div class="folder-display" id="berryFolderWrap">
+                    <span class="folder-path" id="berryFolderPath">--</span>
+                    <div class="folder-select" id="berryFolderSelect"><select id="berryFolderOptions"></select></div>
+                    <button class="folder-edit-btn" id="berryFolderBtn">修改</button>
+                </div>
+            </div>
+            <div class="sub-setting-row">
+                <div>
+                    <div class="sub-setting-label">云端文件状态</div>
+                </div>
+                <span class="file-tag" id="berryFileTag"><span class="dot"></span>检测中</span>
+            </div>
+        </div>
+        <div class="browser-item">
+            <div class="browser-info">
+                <div class="browser-name">Aira 浏览器 (HarmonyOS)</div>
+            </div>
+            <div class="switch" id="airaSwitch" data-on="已启用" data-off="未启用"></div>
+        </div>
+        <div class="sub-settings show" id="airaSettings">
+            <div class="sub-setting-row">
+                <div>
+                    <div class="sub-setting-label">云端书签文件夹</div>
+                </div>
+                <div class="folder-display" id="airaFolderWrap">
+                    <span class="folder-path" id="airaFolderPath">--</span>
+                </div>
+            </div>
+            <div class="sub-setting-row">
+                <div>
+                    <div class="sub-setting-label">书签文件状态</div>
+                </div>
+                <span class="file-tag" id="airaFileTag"><span class="dot"></span>检测中</span>
+            </div>
+            <div class="sub-setting-row">
+                <div>
+                    <div class="sub-setting-label">云端主页文件夹</div>
+                </div>
+                <div class="folder-display" id="airaPersFolderWrap">
+                    <span class="folder-path" id="airaPersFolderPath">--</span>
+                </div>
+            </div>
+            <div class="sub-setting-row">
+                <div>
+                    <div class="sub-setting-label">主页文件状态</div>
+                </div>
+                <span class="file-tag" id="airaPersTag"><span class="dot"></span>检测中</span>
+            </div>
+        </div>
+
+        <div class="sub-setting-label" style="color:#9ca3af;margin:12px 0 8px;">桌面端</div>
+        <div class="browser-item">
+            <div class="browser-info">
+                <div class="browser-name">Chrome / Edge (Windows/Mac)</div>
+            </div>
+            <div class="switch" id="desktopSwitch" data-on="已自动" data-off="未自动"></div>
+        </div>
+        <div class="sub-settings show" id="desktopSettings">
+            <div class="sub-setting-row">
+                <div>
+                    <div class="sub-setting-label">云端所在文件夹</div>
+                </div>
+                <div class="folder-display" id="chromeFolderWrap">
+                    <span class="folder-path" id="chromeFolder">--</span>
+                    <div class="folder-select" id="chromeFolderSelect"><select id="chromeFolderOptions"></select></div>
+                    <button class="folder-edit-btn" id="chromeFolderBtn">修改</button>
+                </div>
+            </div>
+            <div class="sub-setting-row">
+                <div>
+                    <div class="sub-setting-label">云端文件状态</div>
+                </div>
+                <span class="file-tag" id="cloudStatus"><span class="dot"></span>检测中</span>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ===== 备份与迁移 ===== -->
+    <!-- 独立成卡：原来它挂在「浏览器支持」卡里面，而那张卡「未配置」时是 display:none
+         ⇒ 新设备上最需要「导入配置」的时候反而看不到按钮（导入本来就该在配置之前就能用）。 -->
+    <div class="card" id="backupCard">
+        <div class="card-title">备份与迁移</div>
+        <div class="sub-setting-desc" style="margin-bottom:10px;">
+            导出配置到文件，换浏览器/换电脑时导入即可，不用重新填一遍。
+            只搬配置：不含书签数据，也不含设备身份（每台设备必须有自己独立的身份，否则删除记录会互相错乱）。
+        </div>
+        <div class="backup-row">
+            <button class="btn btn-primary" id="exportConfigBtn" type="button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v10.5m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+                导出配置
+            </button>
+            <button class="btn" id="importConfigBtn" type="button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21V10.5m0 0 4 4m-4-4-4 4M4 7V5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2"/></svg>
+                导入配置
+            </button>
+            <input type="file" id="importConfigFile" accept=".json,application/json" style="display:none">
+        </div>
+        <div class="backup-hint" id="backupHint">
+            ⚠️ 导出的文件里含 WebDAV 明文密码，请像对待密码一样保管，不要发到公开地方。
+        </div>
+        <div class="backup-result" id="backupResult" style="display:none;"></div>
+    </div>
+
+    <div id="copyToast">已复制错误详情</div>
+    <div class="footer">极简书签同步 · 让书签同步变得简单</div>
+
+    <script src="lib/constants.js"></script>
+    <script src="lib/utils.js"></script>
+    <script src="options.js"></script>
+</body>
+</html>

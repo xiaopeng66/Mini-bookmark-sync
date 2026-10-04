@@ -1,3 +1,12 @@
+# 依赖与系统文件
 node_modules/
 .DS_Store
+
+# 日志与 Python 缓存
 *.log
+__pycache__/
+*.pyc
+
+# 构建产物（出包与暂存目录，不入库；签名私钥 build/*.pem 也在这里）
+dist/
+build/

@@ -1,35 +1,34 @@
 {
-  "manifest_version": 3,
-  "name": "极简书签同步",
-  "version": "1.0.0",
-  "description": "简单好用的书签同步工具，小巧、干净无广告。",
-  "permissions": [
-    "bookmarks",
-    "storage",
-    "alarms"
-  ],
-  "optional_host_permissions": [
-    "*://*/*"
-  ],
-  "background": {
-    "service_worker": "background.js"
-  },
-  "action": {
-    "default_popup": "popup.html",
-    "default_title": "极简书签同步"
-  },
-  "icons": {
-    "16": "icons/icon-16.png",
-    "48": "icons/icon-48.png",
-    "128": "icons/icon-128.png"
-  },
-  "web_accessible_resources": [
-    {
-      "resources": ["images/nb.svg", "images/wechat.png", "icons/icon.png"],
-      "matches": ["<all_urls>"]
-    }
-  ],
-  "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'none';"
-  }
+   "action": {
+      "default_icon": {
+         "16": "icons/status-unset-16.png",
+         "32": "icons/status-unset-32.png"
+      },
+      "default_popup": "popup.html",
+      "default_title": "极简书签同步"
+   },
+   "background": {
+      "service_worker": "background.js"
+   },
+   "content_security_policy": {
+      "extension_pages": "script-src 'self'; object-src 'none';"
+   },
+   "description": "简单好用的书签同步工具，小巧、干净无广告。",
+   "icons": {
+      "128": "icons/icon-128.png",
+      "16": "icons/icon-16.png",
+      "48": "icons/icon-48.png"
+   },
+   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAq6XerGVaFRFJ+MCH3rpqA/wvSm8gvVWzCCCTQ3S40KQKbTejHWt1om7ZZLu1xQ4+A1N2Gb4qG41Y2fwN5h621hSEedMvpmfMlpn3v+CW4DZBNaNlksGKYEiPCHsrJTWm9B6la2Dje3SvDXxHH9ckoF/YYLbrofklhlD6yefmOevd7+kMGDzPDxg+NZvXloPd0TYoe0yrXjo69HBrMN9N0Q1BariJixF2xLfkgPcsZXhq71xgetd45BX7V8x22jHd6WDOdNCLzNeSnjTNeNdrxhSfIlP0OpE3jJSiBVYbBfXTCwXz/6FPYIDPqZZHb7PJJ4NKviXQdHFNmTGQGMmg8QIDAQAB",
+   "manifest_version": 3,
+   "name": "极简书签同步",
+   "optional_host_permissions": [ "*://*/*" ],
+   "options_page": "options.html",
+   "permissions": [ "bookmarks", "storage", "alarms" ],
+   "update_url": "https://edge.microsoft.com/extensionwebstorebase/v1/crx",
+   "version": "2.0.0",
+   "web_accessible_resources": [ {
+      "matches": [ "\u003Call_urls>" ],
+      "resources": [ "images/nb.svg", "icons/icon.png" ]
+   } ]
 }

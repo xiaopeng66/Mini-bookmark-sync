@@ -2,16 +2,28 @@
 <html>
 <head>
     <meta charset="utf-8">
+    <!-- 手机浏览器（Android Gecko fork）要把弹窗面板当设备宽度来排版，缺这一行就只能靠用户手动缩放。
+         AdGuard / 篡改猴的 popup 都带这一行；桌面浏览器忽略它，不影响桌面弹窗尺寸。 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>极简书签同步</title>
     <style>
         * { box-sizing: border-box; }
         body {
+            /* 桌面 Chromium/Edge/Firefox 的弹窗窗口尺寸由内容宽度决定，所以这里必须给一个确定宽度 */
             width: 320px;
             margin: 0;
             padding: 12px;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
             color: #222;
             background: #fff;
+        }
+        /* 手机浏览器宿主（可拓/雨见这类 Android Gecko fork）：弹窗面板宽度 = 设备宽度，
+           写死 320px 会只占左边一条、右侧留一大片空白。popup.js 判定到 Android 宿主时
+           会给 <html> 挂 .host-mobile，只有那时才铺满。
+           注意：不要把 100vw 无条件写在 body 上——那样会把桌面弹窗一起撑变形（早年踩过的坑）。 */
+        html.host-mobile body {
+            width: 100%;
+            max-width: none;
         }
 
         /* ===== 主页视图 ===== */
@@ -142,6 +154,8 @@
         .info-box.never { color: #6b7280; border-color: #e5e7eb; background: #f9fafb; }
         .info-box.warn { color: #b45309; border-color: #fcd34d; background: #fffbeb; }
 
+        /* ===== 最近操作日志面板已移除，报错仅在选项页操作日志展示 ===== */
+
         .action-row {
             display: flex;
             justify-content: space-between;
@@ -162,7 +176,7 @@
             gap: 4px;
         }
         .btn:hover { background: #f9fafb; }
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn:disabled { cursor: not-allowed; }
         .btn-primary {
             background: #2563eb;
             color: #fff;
@@ -174,6 +188,15 @@
             height: 32px;
             padding: 0;
             justify-content: center;
+            /* 图标严格居中：原来里面是 ⬇/⬆/⟳ 文字字形，位置由字体基线决定，
+               箭头看起来又小又偏。改成 SVG 后由 flex 居中。 */
+            align-items: center;
+            line-height: 1;
+        }
+        .icon-btn svg {
+            width: 16px;
+            height: 16px;
+            display: block;   /* 行内元素会留基线间隙，配合 flex 才算真居中 */
         }
         .right-group { display: flex; gap: 6px; }
 
@@ -190,6 +213,7 @@
         }
         .status-bar.err .status-text { color: #ef4444; }
         .status-bar.ok .status-text { color: #10b981; }
+        .status-bar.warn .status-text { color: #b45309; }
         .status-text {
             flex: 1;
             min-width: 0;
@@ -211,6 +235,9 @@
             line-height: 1.4;
             padding-left: 28px; /* 与状态文字对齐 */
         }
+        /* 同步成功那一行：跟状态栏一起变绿，手机上「成了没有」一眼能看明白 */
+        .progress-line.ok { color: #047857; }
+        .progress-line.err { color: #b91c1c; }
 
         /* 支持按钮 */
         .sponsor-wrap {
@@ -364,7 +391,7 @@
             transition: background 0.15s;
         }
         .icon-danger:hover { background: #fef2f2; }
-        /* 删除配置（强危险）按钮：实红底、白字，明显区别于"清空表单" */
+        /* 清空配置（强危险）按钮：实红底、白字，明显区别于"清空表单" */
         .icon-danger-strong {
             border: 1px solid #dc2626;
             background: #ef4444;
@@ -476,6 +503,7 @@
             padding: 18px 18px 14px;
             transform: translateY(6px) scale(0.98);
             transition: transform 0.18s ease;
+            position: relative;
         }
         .modal-overlay.show .modal-box { transform: translateY(0) scale(1); }
         .modal-icon {
@@ -541,6 +569,25 @@
             border-color: #dc2626;
         }
         .modal-btn-danger:hover { background: #dc2626; }
+        .modal-close {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            width: 24px;
+            height: 24px;
+            border: none;
+            background: transparent;
+            color: #9ca3af;
+            font-size: 18px;
+            line-height: 24px;
+            text-align: center;
+            cursor: pointer;
+            border-radius: 4px;
+            padding: 0;
+            display: none;
+        }
+        .modal-close:hover { background: #f3f4f6; color: #6b7280; }
+        .modal-close.show { display: block; }
     </style>
 </head>
 <body>
@@ -554,7 +601,7 @@
 
         <div id="homeCard" class="card">
             <div class="card-head">
-                <span>极简书签同步｜支持Berry</span>
+                <span>极简书签同步<span id="supportTag"></span></span>
                 <span id="connBadge" class="auto-switch off" title="点击切换自动同步" role="switch" aria-checked="false">
                     <span class="switch-label"></span>
                     <span class="switch-track"><span class="switch-thumb"></span></span>
@@ -575,9 +622,9 @@
             <div class="action-row">
                 <button id="openConfigBtn" class="btn" title="设置">⚙️ 设置</button>
                 <div class="right-group">
-                    <button id="downloadBtn" class="btn icon-btn" title="从云端下载">⬇</button>
-                    <button id="uploadBtn" class="btn icon-btn" title="上传到云端">⬆</button>
-                    <button id="syncBtn" class="btn icon-btn btn-primary" title="两端合并同步">⟳</button>
+                    <button id="downloadBtn" class="btn icon-btn" title="从云端下载（增量：云端新增的导入本机，云端已删除的也从本机删掉）"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4.5v10"/><path d="M7.5 10 12 14.5 16.5 10"/><path d="M5 19h14"/></svg></button>
+                    <button id="uploadBtn" class="btn icon-btn" title="上传到云端（本机为准；云端已删除的会先从本机删掉）"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19.5v-10"/><path d="M7.5 14 12 9.5 16.5 14"/><path d="M5 5h14"/></svg></button>
+                    <button id="syncBtn" class="btn icon-btn btn-primary" title="两端合并同步（增量增删，推荐）"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 9.5h11"/><path d="M14.5 6.5 17.5 9.5 14.5 12.5"/><path d="M17.5 14.5h-11"/><path d="M9.5 11.5 6.5 14.5 9.5 17.5"/></svg></button>
                 </div>
             </div>
 
@@ -586,13 +633,13 @@
                     <img class="sponsor-icon" src="images/nb.svg" alt="支持">
                 </div>
                 <span id="status" class="status-text">就绪</span>
-                <span id="autoSyncTag" class="auto-sync-tag off">未启用自动同步(右上角启用)</span>
+                <span id="autoSyncTag" class="auto-sync-tag off">自动同步未启用(右上角启用)</span>
             </div>
 
             <div id="progressLine" class="progress-line hide">进度：—</div>
 
             <div id="sponsorArea" class="sponsor-area">
-                <div id="sponsorText" class="sponsor-text">💖 喜欢这个工具？支持我继续改进<br><a href="https://jagshen.github.io/Mini-bookmark-sync/support.html" target="_blank" style="color:#f59e0b;text-decoration:underline;">请我喝咖啡 →</a></div>
+                <div id="sponsorText" class="sponsor-text">💖 喜欢这个工具？支持作者继续改进<br><a href="https://jagshen.github.io/Mini-bookmark-sync/support.html" target="_blank" style="color:#f59e0b;text-decoration:underline;">支持作者 →</a></div>
             </div>
         </div>
 
@@ -606,23 +653,24 @@
         <div class="config-head">
             <button id="backBtn" class="btn" title="返回">←</button>
             <h3>极简配置</h3>
-            <button id="deleteConfigBtn" class="icon-danger-strong" title="删除配置，谨慎操作">✕</button>
+            <button id="deleteConfigBtn" class="icon-danger-strong hide" title="清空极简配置，请谨慎操作">✕</button>
             <button id="clearConfigBtn" class="icon-danger" title="仅清空表单">🗑</button>
         </div>
 
-        <label>WebDAV 地址:</label>
+        <label>WebDAV 地址</label>
         <input type="text" id="webdav_url" placeholder="https://example.com/dav/">
-        <label>用户名:</label>
+        <div class="security-hint hide" id="insecureUrlHint">⚠️ 该地址用的是明文 <b>http</b>，账号和密码会以明文经过网络传输（且文件内容也不加密）。建议改用 https 地址。</div>
+        <label>用户名</label>
         <input type="text" id="webdav_user">
-        <label>应用密码:</label>
+        <label>应用密码</label>
         <div class="password-wrap">
             <input type="password" id="webdav_password">
             <button type="button" id="togglePasswordBtn" class="password-toggle" title="显示密码" aria-label="显示密码" aria-pressed="false">👁</button>
         </div>
         <div class="security-hint">⚠️ 密码仅存储在本地浏览器，不会上传至第三方服务器</div>
-        <label>云端文件路径 <span style="color:#f59e0b;font-weight:400;font-size:11px;">（多端同步需保持路径一致）</span>:</label>
+        <label>云端同步文件夹 <span style="color:#f59e0b;font-weight:400;font-size:11px;">（多端同步请在「更多配置」里调整）</span></label>
         <input type="text" id="webdav_path" placeholder="/minibookmark">
-        <div class="field-hint" id="pathHint">输入文件夹路径即可，如 /minibookmark；不指定文件名则默认 bookmarks.json</div>
+        <div class="field-hint" id="pathHint">输入文件夹路径即可，如 /minibookmark</div>
 
         <hr>
 
@@ -632,14 +680,14 @@
         </div>
 
         <div id="syncOptions" class="hide">
-            <label>同步类型:</label>
+            <label>同步类型</label>
             <select id="syncTypeSelect">
                 <option value="merge" selected>合并书签（两端合并）</option>
                 <option value="upload">上传书签（本地覆盖云端）</option>
                 <option value="download">下载书签（云端覆盖本地）</option>
             </select>
 
-            <label>自动同步间隔（分钟）:</label>
+            <label>自动同步间隔（分钟）</label>
             <select id="intervalSelect">
                 <option value="15">15 分钟</option>
                 <option value="30" selected>30 分钟</option>
@@ -653,12 +701,13 @@
             <button id="saveBtn" class="btn btn-primary">保存</button>
         </div>
 
-        <div id="configStatus" class="status-bar"></div>
+        <div id="configStatus" class="status-bar"><span id="configStatusText"></span><a href="#" id="openOptionsLink" style="color:#2563eb;text-decoration:none;font-size:11px;margin-left:auto;">更多配置</a></div>
     </div>
 
     <!-- ===== 通用确认模态框 ===== -->
     <div id="confirmModal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="confirmTitle" aria-hidden="true">
         <div class="modal-box">
+            <button id="confirmCloseBtn" class="modal-close" type="button" aria-label="关闭">&times;</button>
             <div id="confirmIcon" class="modal-icon">!</div>
             <div id="confirmTitle" class="modal-title">确认操作</div>
             <div id="confirmBody" class="modal-body"></div>
@@ -669,6 +718,8 @@
         </div>
     </div>
 
+    <script src="lib/constants.js"></script>
+    <script src="lib/utils.js"></script>
     <script src="popup.js"></script>
 </body>
 </html>
