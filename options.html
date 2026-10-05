@@ -138,6 +138,33 @@
         }
         .view-all-btn:hover { background: #eff6ff; }
 
+        /* 设置页里的动作按钮，外形与插件主页（popup）的 .btn 同一套：
+           白底、1px 灰边、圆角 6、hover 浅灰 —— 两页看起来才是一套东西。 */
+        .btn-mini {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            border: 1px solid #d1d5db;
+            background: #fff;
+            color: #374151;
+            border-radius: 6px;
+            padding: 5px 10px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .btn-mini:hover:not(:disabled) { background: #f9fafb; }
+        .btn-mini:disabled { color: #9ca3af; background: #f9fafb; cursor: not-allowed; }
+        .diag-row {
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .diag-hint { font-size: 11px; color: #9ca3af; }
+        .diag-hint.err { color: #ef4444; }
+        .diag-hint.ok { color: #16a34a; }
+
         /* 日志展开区域 */
         .log-expand {
             display: none;
@@ -543,10 +570,12 @@
         <div class="log-expand" id="logExpand"></div>
 
         <!-- 一键诊断：把「后台是否在跑 / 宿主给了哪些能力 / 书签接口能不能真读」逐项摊开。
-             移动端宿主（Gecko fork 等）差异极大，没有这份报告就只能靠猜。 -->
-        <div style="margin-top:10px;display:flex;align-items:center;gap:8px;">
-            <button class="view-all-btn" id="diagBtn">运行后台诊断</button>
-            <span style="font-size:11px;color:#9ca3af;">排查同步问题时点它，把结果截图</span>
+             移动端宿主（Gecko fork 等）差异极大，没有这份报告就只能靠猜。
+             报告是长 JSON，手机上手选复制很费劲 ⇒ 旁边放一键「复制报告」。 -->
+        <div class="diag-row">
+            <button class="btn-mini" id="diagBtn">运行后台诊断</button>
+            <button class="btn-mini" id="diagCopyBtn" title="把整份报告复制到剪贴板" disabled>复制报告</button>
+            <span class="diag-hint" id="diagHint">排查同步问题时点它，把报告复制发出去</span>
         </div>
         <pre id="diagOut" style="display:none;margin-top:8px;padding:10px;background:#f9fafb;border:1px solid #e5e7eb;
              border-radius:8px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto;"></pre>

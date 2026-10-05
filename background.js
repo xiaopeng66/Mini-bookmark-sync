@@ -41,6 +41,22 @@ const ACTION_API = (typeof chrome !== 'undefined') ? (chrome.action || chrome.br
 // 这种情况必须让设置页显示「不可用」，而不是伪装成「0 条」——否则排查时分不清
 // 「浏览器没给 API」和「书签真的是空的」。
 const HAS_BOOKMARKS_API = (typeof chrome !== 'undefined') && !!chrome.bookmarks && typeof chrome.bookmarks.getTree === 'function';
+// 定时器 API 是否可用：同样是「宿主可能没给」的接口。没有它自动同步就只剩手动一条路，
+// 必须如实报给用户（诊断报告里能看到），而不是静默地什么都不做。
+// ★ 只要求【真正必需】的两项：create（挂定时器）与 onAlarm.addListener（收到到点通知）。
+//   clear/get 属于「有更好、没有也不影响主功能」，各自 best-effort，不能因为缺它就把
+//   整个自动同步判死（手机上「有 alarms 对象但实现不全」比「完全没有」更常见）。
+const HAS_ALARMS_API = (typeof chrome !== 'undefined') && !!chrome.alarms &&
+  typeof chrome.alarms.create === 'function' &&
+  !!chrome.alarms.onAlarm && typeof chrome.alarms.onAlarm.addListener === 'function';
+// 定时器最后一次校准的结果（诊断报告直接读它）：手机端「自动同步到底有没有挂上」看这里。
+// 额外记账：定时器到底响过没有（fireCount）、最后一次补跑为什么没跑（lastCatchUp.reason）——
+// 手机端 console 读不到，这两项是唯一能区分「没挂上」与「挂上了但没响」的证据。
+var _autoAlarm = {
+  reason: 'not-checked', wanted: null, apiAvailable: HAS_ALARMS_API,
+  exists: null, periodInMinutes: null, action: 'not-checked', at: null,
+  fireCount: 0, lastFireAt: null, catchUpCount: 0, lastCatchUp: null, lastError: null
+};
 
 // ====== Step 1.5: 统一全局日志（散落的 console 自动走 MiniSync.logger，并持久化最近错误）======
 if (MiniSync.logger && MiniSync.logger.install) MiniSync.logger.install();
@@ -292,21 +308,49 @@ chrome.storage.onChanged.addListener((changes, area) => {
 updateActionIcon();
 
 // ====== 自动同步定时器 ======
-chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (!alarm || alarm.name !== SYNC_ALARM) return;
-  const status = await MiniSync.storage.getSyncStatus();
-  if (status.status === SYNCING) {
-    return;
+// ⚠️ alarms API 必须整段守卫：宿主不给这个 API 时 chrome.alarms 是 undefined，
+//    裸注册 onAlarm 会在【加载期】抛异常，后面 onMessage 处理器就注册不上 ——
+//    表现和「后台没运行」一模一样（本文件顶部书签监听踩过同一个坑）。
+//    定时器本体在主流程之外，由 ensureAutoSyncAlarm() 按需重建，见文件下方。
+if (HAS_ALARMS_API) {
+  chrome.alarms.onAlarm.addListener(async (alarm) => {
+    if (!alarm || alarm.name !== SYNC_ALARM) return;
+    _autoAlarm = Object.assign({}, _autoAlarm, {
+      fireCount: (_autoAlarm.fireCount || 0) + 1,
+      lastFireAt: Date.now(),
+      lastFireName: alarm.name
+    });
+    await persistAutoSyncReport();
+    await runAutoSyncSafely({ from: 'alarm' });
+  });
+}
+
+// ★ 每次后台被唤醒（MV3 service worker 启动 / MV2 后台页加载 / 浏览器启动）都校准一次定时器。
+//   为什么必须在【顶层】做：chrome.alarms 不跨浏览器会话保留（MDN），手机端 Gecko 系宿主
+//   每次重启浏览器都会丢掉定时器；只在 onInstalled / 保存配置时建的话，手机端自动同步
+//   在重启后就永久失效（桌面 Chromium 自己会保留 alarms，所以一直看不出问题）。
+//   ensure（而不是 force）⇒ 定时器健在且间隔没变时不动它，绝不重置倒计时。
+//
+// ⚠️ 校准与补跑必须是【两个独立的失败域】：宿主给了一个「能创建但会抛错」的 alarms 时，
+//    校准失败若把补跑一起带走，自动同步就彻底没有了 —— 而补跑恰恰是这种宿主上唯一的
+//    自动同步路径。用户手机上就是这么「装了新版还是不自动同步」的。
+(async () => {
+  try {
+    await ensureAutoSyncAlarm('boot');
+  } catch (e) {
+    _autoAlarm = Object.assign({}, _autoAlarm, { lastError: 'ensure: ' + ((e && e.message) || String(e)) });
+    console.warn('[MiniSync] 启动校准自动同步定时器失败:', e && e.message);
   }
   try {
-    const result = await runAutoSync();
-    if (result && result.success === false) {
-      console.warn('[MiniSync] 自动同步未完成:', result.message || result.code || '未知原因');
-    }
+    // 浏览器关着的那段时间没人能跑自动同步：唤醒时把错过的那一次补上（宿主没有
+    // alarms API、或 alarms 不响时，这也是唯一能让自动同步动起来的路径）。
+    await catchUpMissedAutoSync();
   } catch (e) {
-    console.error('[MiniSync] 自动同步失败:', e.message);
+    _autoAlarm = Object.assign({}, _autoAlarm, { lastError: 'catch-up: ' + ((e && e.message) || String(e)) });
+    console.warn('[MiniSync] 启动补跑自动同步失败:', e && e.message);
   }
-});
+  await persistAutoSyncReport();
+})();
 
 // 启动崩溃恢复：本地书签为空且存在备份时自动恢复
 chrome.runtime.onStartup.addListener(async () => {
@@ -314,6 +358,18 @@ chrome.runtime.onStartup.addListener(async () => {
     await startupRecovery();
   } catch (e) {
     console.error('[MiniSync] 启动恢复检查失败:', e.message);
+  }
+  // 浏览器启动是新会话：定时器必须在这里补建一次（顶层那次可能早于 storage 就绪）
+  try {
+    await ensureAutoSyncAlarm('startup');
+  } catch (e) {
+    console.warn('[MiniSync] 启动重建自动同步定时器失败:', e.message);
+  }
+  // 同样独立失败域：补跑不依赖定时器有没有挂上
+  try {
+    await catchUpMissedAutoSync();
+  } catch (e) {
+    console.warn('[MiniSync] 启动补跑自动同步失败:', e.message);
   }
 });
 
@@ -612,6 +668,10 @@ function onRuntimeMessage(message, sender, sendResponse) {
           },
           hasBookmarksApi: HAS_BOOKMARKS_API,
           bookmarkCount,               // ★ 书签接口能不能真读，这里带原始报错
+          // ★ 自动同步定时器实况：手机端「明明开了自动同步却从不自动跑」看这一项就能定性
+          //   （exists=false / apiAvailable=false 都能直接读出来，不必再猜）。
+          autoAlarm: await describeAutoAlarm(),
+          autoSyncNextAt: (await MiniSync.storage.getLocal(['auto_sync_next_at'])).auto_sync_next_at || null,
           webdavUrl: cfg.webdav_url || '',
           syncEnabled: !!cfg.sync_enabled,
           permissionQuery: perm,       // 权限接口可用性（不可用会带超时原文）
@@ -883,6 +943,14 @@ try {
       msgLedgerReplays: _msgLedgerReplays,
       msgLedgerSize: _msgLedger.size,
       hasOnMessageListener: !!(chrome.runtime && chrome.runtime.onMessage),
+      // ★ 自动同步实况：用户手机日志里消息通道是半死的（ping/diagnose 全「返回空」），
+      //   但这一节是页面用 getBackgroundPage() 直接读的，照样能看见 —— 所以定时器的
+      //   能力面、有没有响过、上次补跑为什么没跑，都必须挂在这里。
+      autoSync: {
+        hasAlarmsApi: HAS_ALARMS_API,
+        alarmsSurface: describeAlarmsSurface(),
+        state: _autoAlarm
+      },
       errors: _bgErrors.slice(-20)
     };
   };
@@ -940,19 +1008,282 @@ function handleAsyncResponse(sendResponse, asyncFn) {
 // 自动同步与启动恢复
 
 /**
- * 根据配置创建/清除自动同步 alarm
+ * 只读地描述定时器现状（诊断用；不改任何状态）。
+ * 「想要的」（配置）与「实际有的」（宿主）分开报，用户一眼能看出是配置没开还是定时器没挂上。
  */
-async function setupAutoSyncAlarm() {
+async function describeAutoAlarm() {
   const r = await MiniSync.storage.getLocal(['sync_enabled', 'sync_interval', 'webdav_url']);
-  const enabled = !!r.sync_enabled;
+  const interval = MiniSync.utils.clampSyncInterval(r.sync_interval);
+  const a = HAS_ALARMS_API ? await alarmGet(SYNC_ALARM) : null;
+  return {
+    apiAvailable: HAS_ALARMS_API,
+    alarmsSurface: describeAlarmsSurface(),
+    wanted: !!(r.sync_enabled && r.webdav_url),
+    syncEnabled: !!r.sync_enabled,
+    hasUrl: !!r.webdav_url,
+    interval: interval,
+    exists: !!a,
+    periodInMinutes: a ? a.periodInMinutes : null,
+    last: _autoAlarm            // 最近一次校准的结论（action=created/kept/recreated/cleared/idle/error/no-alarms-api）
+  };
+}
+
+/**
+ * 宿主到底给了 alarms 的哪几项能力（手机 fork 常有「对象在、方法缺」的半实现）。
+ * 只读探测，不调用任何会改状态的方法。
+ * @returns {{create:boolean, clear:boolean, get:boolean, onAlarm:boolean, getAll:boolean}|null}
+ */
+function describeAlarmsSurface() {
+  if (typeof chrome === 'undefined' || !chrome.alarms) return null;
+  const f = (o, k) => !!(o && typeof o[k] === 'function');
+  return {
+    create: f(chrome.alarms, 'create'),
+    clear: f(chrome.alarms, 'clear'),
+    get: f(chrome.alarms, 'get'),
+    getAll: f(chrome.alarms, 'getAll'),
+    onAlarm: !!(chrome.alarms.onAlarm && typeof chrome.alarms.onAlarm.addListener === 'function')
+  };
+}
+
+/**
+ * 读一个 alarm 的现状。宿主差异全在这里吃掉：
+ *   · MV3 / 新版宿主 → chrome.alarms.get 返回 Promise；
+ *   · 旧式回调宿主 → 走回调；
+ *   · 两样都不给 → 短超时后按「不知道」返回，绝不把后台挂死。
+ * @returns {Promise<{periodInMinutes:number}|null>}
+ */
+function alarmGet(name) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (a) => { if (!settled) { settled = true; resolve(a || null); } };
+    try {
+      if (!HAS_ALARMS_API || typeof chrome.alarms.get !== 'function') return done(null);
+      const maybe = chrome.alarms.get(name, (a) => { void chrome.runtime.lastError; done(a); });
+      if (maybe && typeof maybe.then === 'function') maybe.then(done, () => done(null));
+      setTimeout(() => done(null), 1000);
+    } catch (_) {
+      done(null);
+    }
+  });
+}
+
+/**
+ * 清一个 alarm。与 alarmGet 一样把宿主差异吃掉：没有 clear 就当没这回事，
+ * 只是「下次校准会再 create 一次」——绝不能因为缺 clear 就把自动同步判死。
+ * @returns {Promise<boolean>} 是否真的清掉了
+ */
+async function alarmClear(name) {
+  try {
+    if (typeof chrome === 'undefined' || !chrome.alarms || typeof chrome.alarms.clear !== 'function') return false;
+    const maybe = chrome.alarms.clear(name, () => { void chrome.runtime.lastError; });
+    if (maybe && typeof maybe.then === 'function') await maybe;
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * 校准自动同步定时器：把「配置想要的」与「宿主现在的」对齐。
+ * 本函数【绝不抛异常】（宿主的 alarms 调用可能直接抛），出错记进 _autoAlarm.lastError。
+ * @param {string} reason         触发来源（boot / startup / install / config-change / diagnose），只进诊断
+ * @param {boolean} [opts.force]  true = 无条件重建（配置刚改过，新间隔要立刻生效）；
+ *                                false = 只在缺失/间隔不符时重建 —— **定时器健在时绝不动它**，
+ *                                否则每次后台唤醒都会把倒计时重置，间隔设 30 分钟却永远等不到。
+ * @returns {Promise<{wanted:boolean, exists:boolean, periodInMinutes:number|null, action:string}>}
+ */
+async function ensureAutoSyncAlarm(reason, opts) {
+  const force = !!(opts && opts.force);
+  const r = await MiniSync.storage.getLocal(['sync_enabled', 'sync_interval', 'webdav_url']);
+  const wanted = !!(r.sync_enabled && r.webdav_url);
   // ★ 必须夹取：这个值可以由导入的备份文件/被手工改过的 storage 直通这里，
   //   负数会让 chrome.alarms.create 抛错（自动同步静默失效），极小值会被夹到 1 分钟高频轮询。
   const interval = MiniSync.utils.clampSyncInterval(r.sync_interval);
-  const configured = !!r.webdav_url;
-  await chrome.alarms.clear(SYNC_ALARM);
-  if (enabled && configured) {
-    await chrome.alarms.create(SYNC_ALARM, { periodInMinutes: interval });
+
+  let action = 'no-alarms-api';
+  let exists = false;
+  let periodInMinutes = null;
+  let opError = null;
+
+  if (HAS_ALARMS_API) {
+    const current = await alarmGet(SYNC_ALARM);
+    exists = !!current;
+    periodInMinutes = current ? current.periodInMinutes : null;
+    const mismatch = !exists || !(Math.abs((periodInMinutes || 0) - interval) < 0.01);
+    try {
+      if (!wanted) {
+        if (exists) {
+          await alarmClear(SYNC_ALARM);
+          exists = false;
+          periodInMinutes = null;
+          action = 'cleared';
+        } else {
+          action = 'idle';          // 本来就没有，无需动作（也不必去 clear：白记一笔「已清除」会误导排查）
+        }
+      } else if (force || mismatch) {
+        action = exists ? 'recreated' : 'created';
+        if (exists) await alarmClear(SYNC_ALARM);
+        await chrome.alarms.create(SYNC_ALARM, { periodInMinutes: interval });
+        exists = true;
+        periodInMinutes = interval;
+      } else {
+        action = 'kept';            // 健在且间隔一致：绝不动它，免得把倒计时重置
+      }
+    } catch (e) {
+      // ★ 绝不把异常抛给调用方：宿主可能给了个「调用就抛」的 alarms（手机 fork 上有），
+      //   抛出去会让启动流程在补跑之前中断 —— 那才是真正把自动同步弄没的那个环节。
+      //   这里如实记下来，功能上退化成「只剩补跑」，但不会连补跑一起丢。
+      opError = (e && e.message) || String(e);
+      action = 'error';
+      console.warn('[MiniSync] 校准自动同步定时器出错（退化为仅补跑）:', opError);
+    }
   }
+
+  _autoAlarm = {
+    reason: reason || 'unknown',
+    wanted: wanted,
+    apiAvailable: HAS_ALARMS_API,
+    exists: exists,
+    periodInMinutes: periodInMinutes,
+    action: action,
+    at: Date.now(),
+    fireCount: _autoAlarm.fireCount || 0,
+    lastFireAt: _autoAlarm.lastFireAt || null,
+    catchUpCount: _autoAlarm.catchUpCount || 0,
+    lastCatchUp: _autoAlarm.lastCatchUp || null,
+    lastError: opError || _autoAlarm.lastError || null
+  };
+  return _autoAlarm;
+}
+
+/**
+ * 把自动同步的实况落盘（`auto_sync_report`），供设置页直接读 storage 展示。
+ *
+ * 为什么不能只靠 diagnose 消息：手机端宿主会把消息响应丢掉（用户这份日志里
+ * `ping` / `diagnose` 全是「返回空」），而 storage 读取是好的 —— 把实况放进 storage，
+ * 诊断报告才能在「消息通道半死」的宿主上照样看得见。
+ */
+async function persistAutoSyncReport() {
+  try {
+    const r = await MiniSync.storage.getLocal(['sync_enabled', 'webdav_url', 'sync_interval', 'last_sync_at', 'auto_sync_next_at']);
+    await MiniSync.storage.setLocal({
+      auto_sync_report: {
+        at: Date.now(),
+        syncEnabled: !!r.sync_enabled,
+        hasUrl: !!r.webdav_url,
+        interval: MiniSync.utils.clampSyncInterval(r.sync_interval),
+        lastSyncAt: r.last_sync_at || null,
+        nextAt: r.auto_sync_next_at || null,
+        alarm: _autoAlarm
+      }
+    });
+  } catch (_) { /* 诊断不该拖垮后台 */ }
+}
+
+/**
+ * 根据配置创建/清除自动同步 alarm。
+ * 原语义是「无条件重建」（配置刚改过，必须立刻按新间隔跑），保留为 setupAutoSyncAlarm。
+ */
+async function setupAutoSyncAlarm() {
+  return ensureAutoSyncAlarm('config-change', { force: true });
+}
+
+/**
+ * 跑一次自动同步，带状态短路与错误兜底（alarm 事件与「错过补跑」共用同一份，
+ * 避免两条路各写一遍）。
+ *
+ * ★ 页面内互斥（2026-10-05）：同一份后台里绝不允许两轮自动同步同时进行。
+ *   背景是用户手机上真实发生的一幕：浏览器启动时【顶层启动段】与 onStartup 都会
+ *   触发补跑，两趟都读到「已到点」，一起冲进同步锁 —— 输的那趟自旋 8 秒后拿到
+ *   SYNC_BUSY，往日志里写下「自动同步未完成: 同步进行中，请稍候」。用户看到的
+ *   是「同步失败报错」，其实同步跑成了，只是被自己的第二趟撞了一下。
+ *   锁挡得住并发，但挡不住这种自撞：这里在更外层先合流，第二趟直接搭第一趟的车。
+ * @param {{from:'alarm'|'catch-up'}} [opts] 触发来源，只进日志与下次时间台账
+ */
+let _autoSyncInFlight = null;
+function runAutoSyncSafely(opts) {
+  if (_autoSyncInFlight) return _autoSyncInFlight;
+  const p = _doRunAutoSyncSafely(opts)
+    .then((r) => { _autoSyncInFlight = null; return r; },
+      (e) => { _autoSyncInFlight = null; throw e; });
+  _autoSyncInFlight = p;
+  return p;
+}
+
+async function _doRunAutoSyncSafely(opts) {
+  try {
+    const status = await MiniSync.storage.getSyncStatus();
+    if (status.status === SYNCING) return;   // 上一轮还在跑，本轮跳过（不并发写云端）
+    const result = await runAutoSync();
+    // 记下次该跑的时间：关着的窗口由 catchUpMissedAutoSync 补，开着的时候由 alarm 到点跑
+    const cfg = await MiniSync.storage.getLocal(['sync_interval']);
+    const interval = MiniSync.utils.clampSyncInterval(cfg.sync_interval);
+    await MiniSync.storage.setLocal({ auto_sync_next_at: Date.now() + interval * 60000 });
+    if (result && result.success === false) {
+      // SYNC_BUSY = 别处（手动点击 / 本轮乱序的另一趟）正在同步，是正常并发而不是失败：
+      // 报成「未完成」只会让人以为坏了。真正的失败照旧告警。
+      if (result.code === 'SYNC_BUSY' || result.busy) {
+        console.log('[MiniSync] 自动同步已有一轮在跑，本轮跳过（正常并发，不是失败）');
+      } else {
+        console.warn('[MiniSync] 自动同步未完成:', result.message || result.code || '未知原因');
+      }
+    }
+  } catch (e) {
+    console.error('[MiniSync] 自动同步失败:', e.message);
+  }
+}
+
+/**
+ * 把「浏览器关着时错过的那一次」补上。
+ * 背景：alarm 只在浏览器开着的时候才会响；手机端用户往往一天才开一次浏览器，
+ * 靠 alarm 根本等不到那一轮。这里在后台每次唤醒时核对一次「本该跑的时间」，
+ * 到点就补跑一轮。宿主连 alarms API 都没有时，这更是唯一的自动同步路径。
+ *
+ * 不猜的时刻：没有任何「上次同步 / 下次该跑」台账时（例如刚升级上来）什么都不做，
+ * 等第一轮 alarm 自己把台账建立起来，绝不因为升级装完就突然同步一次。
+ * @returns {Promise<{ran:boolean, dueAt?:number, reason?:string}>}
+ */
+let _catchUpInFlight = null;
+async function catchUpMissedAutoSync() {
+  // ★ 同一份后台里只允许一趟补跑判定：浏览器启动时【顶层启动段】与 onStartup 会同时
+  //   进来，两趟都在「把下次时间推到未来」之前就读到同一个旧台账 —— 那道写入屏障挡不住
+  //   这种并发（都先读、后写），于是两趟一起冲同步锁，输的那趟 8 秒后报「同步进行中，
+  //   请稍候」。这里按在途合并合流：第二趟直接复用第一趟的结论。
+  if (_catchUpInFlight) return _catchUpInFlight;
+  const p = _doCatchUpMissedAutoSync()
+    .then((r) => { _catchUpInFlight = null; return r; },
+      (e) => { _catchUpInFlight = null; throw e; });
+  _catchUpInFlight = p;
+  return p;
+}
+
+async function _doCatchUpMissedAutoSync() {
+  const r = await MiniSync.storage.getLocal([
+    'sync_enabled', 'webdav_url', 'sync_interval', 'auto_sync_next_at', 'last_sync_at'
+  ]);
+  // 每次判定都记账：「没跑」的理由（未开启 / 没台账 / 还没到点）必须留在诊断里 ——
+  // 手机端 console 读不到，这是唯一能区分「没挂上」和「挂上了但不用跑」的证据。
+  const note = (ran, reason, extra) => {
+    _autoAlarm = Object.assign({}, _autoAlarm, {
+      catchUpCount: (_autoAlarm.catchUpCount || 0) + (ran ? 1 : 0),
+      lastCatchUp: Object.assign({ at: Date.now(), ran: !!ran, reason: reason || null }, extra || {})
+    });
+    return Object.assign({ ran: !!ran, reason: reason || undefined }, extra || {});
+  };
+  if (!(r.sync_enabled && r.webdav_url)) {
+    return note(false, '未开启或未配置', { syncEnabled: !!r.sync_enabled, hasUrl: !!r.webdav_url });
+  }
+  const intervalMs = MiniSync.utils.clampSyncInterval(r.sync_interval) * 60000;
+  // 台账缺失时用「上次同步 + 一个间隔」推算；连上次同步都没有就不猜
+  const dueAt = r.auto_sync_next_at || (r.last_sync_at ? r.last_sync_at + intervalMs : null);
+  if (!dueAt) return note(false, '没有可推算的台账', { lastSyncAt: r.last_sync_at || null });
+  if (Date.now() < dueAt) return note(false, '还没到点', { dueAt: dueAt });
+  // ★ 先把下次时间推到未来，再真跑：并发的第二次唤醒（顶层 + onStartup 可能同时进来）
+  //   看到的是未来时间，不会把同一轮跑两遍。
+  await MiniSync.storage.setLocal({ auto_sync_next_at: Date.now() + intervalMs });
+  note(true, '到点补跑', { dueAt: dueAt });
+  await runAutoSyncSafely({ from: 'catch-up' });
+  return { ran: true, dueAt: dueAt };
 }
 
 /**

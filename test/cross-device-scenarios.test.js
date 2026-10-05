@@ -1930,3 +1930,129 @@ describe('改名与删除的全链路一致性（就地改名 / 删除不被复�
     expect(cloudData.bookmarks.filter((n) => n.url === 'https://new.example').length).toBe(0);
   });
 });
+
+
+// ========== 同步的代价：顺序已经对上时，一个 move 都不许再发 ==========
+//
+// 背景（2026-10-05，用户手机「装了新版反而很卡」的真凶）：
+// 落盘后的「按 _index 重排」原先无条件对每个落盘节点 move 一次 —— 245 书签 + 43 文件夹
+// 的库每轮 288 次 move，而手机上每次 move 都要落库并通知书签界面。自动同步修好之前
+// 手机从不自动跑（那才是当时的 bug），所以没人觉得卡；修好之后每 30 分钟一轮，
+// 加上「删一个书签就防抖合并一次」，卡就成了常态。
+// 这里把「代价」本身钉成断言：顺序没变的轮次，书签写操作必须是 0。
+describe('同步代价：顺序已一致时不得再动书签（手机卡顿的根因）', () => {
+  // 复刻用户手机的形态与量级：根下只有一个容器（雨见形态），容器里 N 个文件夹挂书签
+  function makePhoneDevice(name, folderCount, perFolder) {
+    const dev = makeDevice(name, []);
+    const container = flattenDevice(dev, '根目录');
+    for (let f = 0; f < folderCount; f++) {
+      // ⚠️ 容器 id 是 flattenDevice 给的 'F0'，这里的文件夹 id 必须换前缀，否则撞号
+      const folder = { id: 'D' + f, title: '文件夹' + f, parentId: container.id, children: [] };
+      container.children.push(folder);
+      for (let i = 0; i < perFolder; i++) {
+        folder.children.push({
+          id: `D${f}-B${i}`, title: `书签${f}-${i}`,
+          url: `https://example.com/${f}/${i}`, parentId: folder.id, dateAdded: DA + i
+        });
+      }
+    }
+    reindexDev(dev);
+    countBookmarkCalls(dev);
+    return dev;
+  }
+
+  // 给设备的书签 API 记账（同一台只包一次），同步一轮的「代价」就是这里的数字
+  function countBookmarkCalls(dev) {
+    if (dev.calls) return dev;
+    dev.calls = { create: 0, move: 0, remove: 0, removeTree: 0 };
+    const api = dev.chromeObj.bookmarks;
+    for (const k of Object.keys(dev.calls)) {
+      const fn = api[k];
+      api[k] = function () { dev.calls[k]++; return fn.apply(this, arguments); };
+    }
+    return dev;
+  }
+  function resetCalls(dev) { for (const k of Object.keys(dev.calls)) dev.calls[k] = 0; }
+
+  // 找「装着这批文件夹的那个容器」（跨形态通用：手机上它是「根目录」，桌面上它是镜像层）
+  function containerOf(dev) {
+    let hit = null;
+    (function walk(n) {
+      if (hit || !n) return;
+      if ((n.children || []).some(c => /^文件夹\d$/.test((c && c.title) || ''))) { hit = n; return; }
+      (n.children || []).forEach(walk);
+    })(dev.tree);
+    return hit;
+  }
+
+  test('手机形态：第二轮（无变化）合并的书签写操作必须是 0 次，且树形状是固定点', async () => {
+    const PH = makePhoneDevice('COST-PHONE', 6, 4);   // 24 书签 + 6 文件夹 + 1 容器
+    useDevice('COST-PHONE');
+    expect((await M.orchestrator.uploadBookmarks({})).success).toBe(true);
+
+    const D = countBookmarkCalls(makeDevice('COST-DESK', []));
+    useDevice('COST-DESK');
+    await M.orchestrator.downloadBookmarks({});
+    // 下载台账也要带代价数字：手机端 console 读不到，台账缺字段 = 卡了也看不见
+    expect(typeof D.store.last_write_report.movesAttempted).toBe('number');
+    expect(typeof D.store.last_write_report.movesSkippedParents).toBe('number');
+
+    // 两端各跑两轮：第一轮把状态推到稳态，第二轮必须完全静默
+    for (const name of ['COST-PHONE', 'COST-DESK']) {
+      useDevice(name);
+      const dev = devices[name];
+      expect((await M.mergeStrategy.mergeSync({})).success).toBe(true);
+      const shapeBefore = treeShape(dev);
+      const orderBefore = containerOf(dev).children.map(c => c.title);
+      resetCalls(dev);
+      const m = await M.mergeStrategy.mergeSync({});
+      expect(m.success).toBe(true);
+      expect(dev.calls, name + ' 第二轮不该再动书签').toEqual({ create: 0, move: 0, remove: 0, removeTree: 0 });
+      expect(treeShape(dev), name + ' 第二轮树形状必须是固定点').toEqual(shapeBefore);
+      // 顺序敏感：treeShape 是排过序的，抓不到「每轮都被重排一遍」这种漂移
+      expect(containerOf(dev).children.map(c => c.title), name + ' 第二轮顺序不许漂移')
+        .toEqual(orderBefore);
+      // 手机端 console 读不到：「本轮 move 几次」必须落进台账，否则卡了也看不见
+      const led = dev.store.last_write_report;
+      expect(led.movesAttempted, name + ' 台账要如实记下本轮 move 次数').toBe(0);
+      expect(led.movesSkippedParents, name + ' 台账要记下顺序已对上、被跳过的父文件夹数').toBeGreaterThan(0);
+    }
+  });
+
+  test('云端顺序确实更新 ⇒ 必须按云端顺序重排到位（省下的 move 不许省错）', async () => {
+    const PH = makePhoneDevice('COST2-PHONE', 3, 3);
+    useDevice('COST2-PHONE');
+    await M.orchestrator.uploadBookmarks({});
+
+    const D = countBookmarkCalls(makeDevice('COST2-DESK', []));
+    useDevice('COST2-DESK');
+    await M.orchestrator.downloadBookmarks({});
+    await M.mergeStrategy.mergeSync({});
+
+    // 桌面端把容器里第一个文件夹排到最后 ⇒ 云端顺序变了
+    const deskContainer = containerOf(D);
+    expect(deskContainer).toBeTruthy();
+    const firstFolder = deskContainer.children.find(c => /^文件夹\d$/.test(c.title || ''));
+    await new Promise((res) => D.chromeObj.bookmarks.move(String(firstFolder.id), { parentId: deskContainer.id, index: 1e9 }, res));
+    expect(containerOf(D).children.slice(-1)[0].id).toBe(String(firstFolder.id));   // 前置：桌面确实挪动了
+    await M.mergeStrategy.mergeSync({});
+
+    const cloudOrder = M.xbel.xbelToJson(cloud.get(CLOUD_FILE).content)
+      .bookmarks.filter(b => b.isFolder && /^文件夹\d$/.test(b.title || '')).map(b => b.title);
+    expect(cloudOrder.slice(-1)[0]).toBe('文件夹0');            // 前置：云端顺序确实是挪过的
+    // 让「云端比本机上次见到的更新」成立（真实时钟下这由 mtime 决定；
+    // 测试装置的 cloudClock 只有千级，够不到 ORDER_TOLERANCE=2000 的判定门槛）
+    const cur = cloud.get(CLOUD_FILE);
+    cloud.set(CLOUD_FILE, { content: cur.content, lastModified: 1e9 });
+
+    useDevice('COST2-PHONE');
+    resetCalls(PH);
+    const m3 = await M.mergeStrategy.mergeSync({});
+    expect(m3.success).toBe(true);
+    // 顺序真变了 ⇒ 必须动过书签（绝不许「一律跳过」把顺序同步悄悄关掉）
+    expect(PH.calls.move).toBeGreaterThan(0);
+    expect(PH.store.last_write_report.movesAttempted).toBeGreaterThan(0);   // 台账不许粉饰成 0
+    const phoneOrder = containerOf(PH).children.map(c => c.title).filter(t => /^文件夹\d$/.test(t || ''));
+    expect(phoneOrder).toEqual(cloudOrder);
+  });
+});

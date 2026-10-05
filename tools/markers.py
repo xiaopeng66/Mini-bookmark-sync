@@ -47,6 +47,35 @@ MARKERS = {
         'MSG_LEDGER_MAX',
         'clampSyncInterval',
         '__msgId',
+        # 手机端「从不自动同步」的修复（定时器跨会话重建 + 错过补跑 + 实况诊断）
+        'ensureAutoSyncAlarm',
+        'catchUpMissedAutoSync',
+        'runAutoSyncSafely',
+        'describeAutoAlarm',
+        'autoAlarm',
+        'auto_sync_next_at',
+        'HAS_ALARMS_API',
+        'if (HAS_ALARMS_API) {',
+        # 守卫必须覆盖 onAlarm：只查 create 就够的话，部分实现的宿主上顶层同步注册
+        # onAlarm 会在加载期抛异常，后台整段死掉（与「后台没运行」同一形态）。
+        'typeof chrome.alarms.onAlarm.addListener ===',
+        # 手机端「装了新版还是不自动同步」——校准与补跑拆成独立失败域，
+        # 并把实况落盘（消息通道半死的宿主上，storage 是唯一看得见的证据）。
+        'persistAutoSyncReport',
+        'auto_sync_report',
+        'describeAlarmsSurface',
+        'alarmsSurface',
+        'alarmClear',
+        'fireCount',
+        'catchUpCount',
+        'lastCatchUp',
+        '没有可推算的台账',
+        # 启动时【两条补跑路径同 tick 进来】读到同一份旧台账、各判一次 ⇒ 自撞同步锁
+        # （用户 15:10 那句「自动同步未完成: 同步进行中，请稍候」）。按在途合流成一次判定；
+        # 真被并发挡住（SYNC_BUSY）是正常并发，不许再当失败告警。
+        '_catchUpInFlight',
+        '_autoSyncInFlight',
+        '自动同步已有一轮在跑，本轮跳过',
     ],
     'lib/utils.js': [
         'PERMISSION_API_UNAVAILABLE',
@@ -95,6 +124,18 @@ MARKERS = {
         'redactUrlForLog',
         'clampSyncInterval',
         'SYNC_INTERVAL_MIN',
+        # 弹窗状态栏的「先画一帧」策略（弹窗本身没有测试环境，逻辑放这里并有单测）
+        'pickConnStatus',
+        'connCacheFromResult',
+        'CONN_CACHE_MAX_AGE_MS',
+        'CONN_CACHE_KEY',
+        'raceHardTimeout',
+        # 诊断报告里报 alarms 的【方法面】+ 直接读自动同步台账
+        # （只看 typeof chrome.alarms 会被「对象在、方法缺」的半实现骗过）
+        'alarmsCreate',
+        'alarmsClear',
+        'alarmsOnAlarm',
+        'autoSyncReport',
     ],
     'options.js': [
         'describeBookmarkCount',
@@ -114,6 +155,11 @@ MARKERS = {
         'cachedProbe',
         'utils.escapeHtml',
         '本机还没有可导出的配置',
+        # 「复制报告」——现代 clipboard 通道 + textarea/execCommand 回退（手机宿主上最稳）
+        'diagCopyBtn',
+        'diagHint',
+        'copyPlainText',
+        '复制失败：请长按上面的报告手动选择复制',
     ],
     'options.html': [
         'diagOut',
@@ -129,7 +175,12 @@ MARKERS = {
         'name="viewport" content="width=device-width',
         'id="backupCard"',
         '.btn-primary {',
+        'flex-shrink: 0;\n            white-space: nowrap',
         '云端删掉的也从本机删掉',
+        # 诊断区「运行后台诊断 + 复制报告」两个按钮，外形与插件主页的 .btn 同一套
+        'diagCopyBtn',
+        '.btn-mini {',
+        '复制报告',
     ],
     'popup.js': [
         'requestHostPermission',
@@ -147,6 +198,13 @@ MARKERS = {
         'createCoalescedProbe',
         'statusProbeKey',
         'ENDPOINT_MIRROR_KEYS',
+        # 打开面板先画一帧（不再每次干等一趟 WebDAV 的「正在检查配置...」）
+        'pickConnStatus',
+        'connCacheFromResult',
+        'renderBusySync',
+        # ⚠️ 必须是这个【改名后】的本地常量：叫 CONN_CACHE_KEY 会和 lib/utils.js 的顶层
+        #    const 重名 ⇒ popup.js 整页脚本解析失败（滑块显示关闭且点不动）。
+        'CONN_CACHE_STORAGE_KEY',
     ],
     'core/sync-orchestrator.js': [
         'last_write_report',
@@ -170,6 +228,9 @@ MARKERS = {
         'deletions.tombstones',
         '已同时从本机删掉',
         '按云端的删除记录删掉本机',
+        # 本轮重排的真实代价落进台账（手机 console 读不到，台账是唯一证据）
+        'movesAttempted',
+        'movesSkippedParents',
     ],
     'core/sync-merge.js': [
         "via: 'merge'",
@@ -193,6 +254,9 @@ MARKERS = {
         '顺序没落到位',
         'mergeViaData(finalMergedData.bookmarks, tombstoneKeys)',
         'mergeViaData(mergedFlatList, tombstoneKeys2)',
+        # 本轮重排的真实代价落进台账（手机 console 读不到，台账是唯一证据）
+        'movesAttempted',
+        'movesSkippedParents',
     ],
     'lib/import.js': [
         'byBucket',
@@ -216,6 +280,13 @@ MARKERS = {
         'homeShellRemoved',
         'cloudHasHomeContent',
         'readHomeBridgeInUse',
+        # 顺序重排的代价 —— 顺序本来就一致的父文件夹一个 move 都不发
+        # （手机端 245 书签的无变化合并每轮原本要发 288 次 move，卡就卡在这里）。
+        'liveOrder',
+        'movesAttempted',
+        'movesSkippedParents',
+        '重排前读取当前顺序失败',
+        '顺序已一致跳过的文件夹',
     ],
     'lib/merge.js': [
         'zoneRoot',
@@ -266,6 +337,17 @@ MARKERS = {
         '!>⬇<',
         '!>⬆<',
         '!>⟳<',
+        # 配置视图顶栏三个按钮（返回/清空配置/清空表单）与主页图标按钮同款
+        # —— 同一 .btn + .icon-btn 基类 + 内联 SVG；旧的「字符字形 + 自成一体的 .icon-danger」不再出现。
+        '.btn.icon-btn.danger {',
+        '.btn.icon-btn.danger-strong {',
+        'M18.5 11H6',
+        'aria-label="返回"',
+        '!>←<',
+        '!>🗑<',
+        '!>✕<',
+        '!.icon-danger {',
+        '!.icon-danger-strong {',
     ],
     'lib/webdav.js': [
         'redactUrlForLog',

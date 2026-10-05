@@ -16,7 +16,7 @@ const { loadSource } = require('./load-source');
 loadSource();
 const U = global.MiniSync.utils;
 
-function makeChrome({ bookmarks, sendMessage, store, getBackgroundPage } = {}) {
+function makeChrome({ bookmarks, sendMessage, store, getBackgroundPage, alarms } = {}) {
   const storage = Object.assign({}, store);
   global.chrome = {
     runtime: {
@@ -42,7 +42,7 @@ function makeChrome({ bookmarks, sendMessage, store, getBackgroundPage } = {}) {
         set: (o, cb) => { Object.assign(storage, o); cb && cb(); }
       }
     },
-    alarms: undefined,
+    alarms,
     action: undefined,
     browserAction: undefined
   };
@@ -729,3 +729,170 @@ describe('下载写入位置：候选项与说明', () => {
   });
 });
 
+// 用户手机上的体验缺陷：每次点开插件面板都「一直显示正在检查配置...」。
+// 真因是一次 checkConfig = 后台真连 WebDAV 的一整趟往返（内层 15s / 外层 20s 超时），
+// 而弹窗每次打开都是新页面，页面内那份 30 秒探测缓存跟着页面一起销毁 ⇒ 每次都要干等一趟网络。
+// 修法：把上次的【肯定】结论落盘，打开时立刻画出来；探测照跑，只是从「挡住界面」变成「静默刷新」。
+describe('弹窗状态栏：打开时先画一帧，别让用户干等一趟 WebDAV', () => {
+  const KEY = 'https://dav.example/dav/|u|/minibookmark';
+  const now = 1_700_000_000_000;
+
+  test('有可用的上次结论 ⇒ 立刻显示「配置已就绪」，不再显示「正在检查配置」', () => {
+    const s = U.pickConnStatus({ key: KEY, ok: true, at: now - 60_000 }, KEY, now);
+    expect(s.text).toBe('配置已就绪');
+    expect(s.level).toBe('ok');
+    expect(s.fromCache).toBe(true);
+  });
+
+  test('没有结论 / 配置改过（key 不符）/ 结论过期 ⇒ 老老实实显示「正在检查配置」', () => {
+    expect(U.pickConnStatus(undefined, KEY, now).text).toBe('正在检查配置...');
+    expect(U.pickConnStatus({ key: 'e/1', ok: true, at: now }, KEY, now).text).toBe('正在检查配置...');
+    const expired = { key: KEY, ok: true, at: now - (U.CONN_CACHE_MAX_AGE_MS + 1) };
+    expect(U.pickConnStatus(expired, KEY, now).text).toBe('正在检查配置...');
+  });
+
+  test('否定结论绝不落盘（免得把一次网络抖动固化成 30 分钟的「配置未就绪」）', () => {
+    expect(U.connCacheFromResult({ ok: false }, KEY, now)).toBeNull();
+    expect(U.connCacheFromResult({ ok: false, code: 'NEED_PERMISSION' }, KEY, now)).toBeNull();
+  });
+
+  test('无响应 / 同步进行中都不落盘（前者不是「连不上」，后者是瞬时态）', () => {
+    expect(U.connCacheFromResult(null, KEY, now)).toBeNull();
+    expect(U.connCacheFromResult(undefined, KEY, now)).toBeNull();
+    expect(U.connCacheFromResult({ ok: true, busy: true, action: 'merge' }, KEY, now)).toBeNull();
+  });
+
+  test('连上了才落盘，且带配置指纹与时间', () => {
+    const e = U.connCacheFromResult({ ok: true }, KEY, now);
+    expect(e).toEqual({ key: KEY, ok: true, at: now });
+    // 落盘的东西必须能被 pickConnStatus 用起来（两条路自己形成闭环）
+    expect(U.pickConnStatus(e, KEY, now + 1000).text).toBe('配置已就绪');
+  });
+
+  test('探测套硬超时：永不 settle 的响应也必须收场（不许永远停在「正在检查配置...」）', async () => {
+    vi.useFakeTimers();
+    try {
+      const never = new Promise(() => {});
+      const pending = U.raceHardTimeout(never, 25000);
+      await vi.advanceTimersByTimeAsync(25000);
+      expect(await pending).toMatchObject({ timedOut: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('硬超时不改变正常结果；抛错也如实收场而不是挂住', async () => {
+    expect(await U.raceHardTimeout(Promise.resolve({ ok: true }), 25000)).toEqual({ ok: true });
+    const rejected = await U.raceHardTimeout(Promise.reject(new Error('管道炸了')), 25000);
+    expect(rejected.timedOut).toBe(false);
+    expect(rejected.error).toContain('管道炸了');
+  });
+});
+
+
+
+// 手机端（可拓/雨见 这类 Gecko fork）实测：alarms 可能「对象在、方法缺」，
+// 而且消息通道是半死的（ping/diagnose 全「返回空」）。诊断报告必须能把这两件事
+// 分开说清楚 —— 否则用户只看到「装了新版还是不自动同步」，完全无从下手。
+describe('诊断：alarms 能力面 + 自动同步台账（不依赖消息通道）', () => {
+  test('宿主完全没有 alarms → 五项都报 undefined（不能只报「object/undefined」）', async () => {
+    makeChrome({ bookmarks: { getTree: (cb) => cb([]) }, sendMessage: () => Promise.resolve(undefined) });
+    const rep = await U.collectDiagnostics({ messageTimeoutMs: 100 });
+    expect(rep.apis.alarms).toBe('undefined');
+    expect(rep.apis.alarmsCreate).toBe('undefined');
+    expect(rep.apis.alarmsClear).toBe('undefined');
+    expect(rep.apis.alarmsOnAlarm).toBe('undefined');
+  });
+
+  test('光看 typeof chrome.alarms 会被半实现骗过 → 必须逐方法报', async () => {
+    // 宿主给了 create/clear 却没有 onAlarm：后台那边会按「给不了定时器」处理，
+    // 诊断页面若只说 typeof='object'，就会把人引向「API 在，那问题在别处」。
+    makeChrome({
+      bookmarks: { getTree: (cb) => cb([]) },
+      sendMessage: () => Promise.resolve(undefined),
+      alarms: { create() {}, clear() {} }
+    });
+    const rep = await U.collectDiagnostics({ messageTimeoutMs: 100 });
+    expect(rep.apis.alarms).toBe('object');
+    expect(rep.apis.alarmsCreate).toBe('function');
+    expect(rep.apis.alarmsClear).toBe('function');
+    expect(rep.apis.alarmsOnAlarm).toBe('undefined');
+  });
+
+  test('齐全的宿主 → onAlarm.addListener 也要报到（这是「响得了」的唯一凭据）', async () => {
+    makeChrome({
+      bookmarks: { getTree: (cb) => cb([]) },
+      sendMessage: () => Promise.resolve(undefined),
+      alarms: { create() {}, clear() {}, get() {}, getAll() {}, onAlarm: { addListener() {} } }
+    });
+    const rep = await U.collectDiagnostics({ messageTimeoutMs: 100 });
+    expect(rep.apis.alarmsOnAlarm).toBe('function');
+    expect(rep.apis.alarmsGet).toBe('function');
+    expect(rep.apis.alarmsGetAll).toBe('function');
+  });
+
+  test('没有自动同步台账 → 直接定性「后台从没跑到过那段代码」', async () => {
+    makeChrome({ bookmarks: { getTree: (cb) => cb([]) }, sendMessage: () => Promise.resolve(undefined) });
+    const rep = await U.collectDiagnostics({ messageTimeoutMs: 100 });
+    expect(rep.autoSyncReport.ok).toBe(true);
+    expect(rep.autoSyncReport.report).toBeNull();
+    expect(rep.autoSyncReport.note).toContain('从没跑到过');
+  });
+
+  test('有台账 → 一行说清：配置、间隔、校准结论、响过几次、写于多久前', async () => {
+    makeChrome({
+      bookmarks: { getTree: (cb) => cb([]) },
+      sendMessage: () => Promise.resolve(undefined),
+      store: {
+        auto_sync_report: {
+          at: Date.now() - 5000,
+          syncEnabled: true, hasUrl: true, interval: 30,
+          lastSyncAt: 1700000000000, nextAt: Date.now() + 600000,
+          alarm: {
+            reason: 'boot', wanted: true, apiAvailable: true, exists: true,
+            periodInMinutes: 30, action: 'created', at: Date.now() - 5000,
+            fireCount: 3, lastFireAt: 1700000000000, catchUpCount: 1,
+            lastCatchUp: { at: 1700000000000, ran: true, reason: '到点补跑' }, lastError: null
+          }
+        }
+      }
+    });
+    const rep = await U.collectDiagnostics({ messageTimeoutMs: 100 });
+    expect(rep.autoSyncReport.report.alarm.action).toBe('created');
+    expect(rep.autoSyncReport.note).toContain('alarm.action=created');
+    expect(rep.autoSyncReport.note).toContain('interval=30min');
+    expect(rep.autoSyncReport.note).toContain('触发过 3 次');
+    expect(rep.autoSyncReport.note).toContain('秒前');
+  });
+
+  test('从没触发过要明说「从未触发过」，与 fireCount=0 的沉默区分开', async () => {
+    makeChrome({
+      bookmarks: { getTree: (cb) => cb([]) },
+      sendMessage: () => Promise.resolve(undefined),
+      store: {
+        auto_sync_report: {
+          at: Date.now(), syncEnabled: true, hasUrl: true, interval: 30,
+          alarm: { action: 'created', exists: true, fireCount: 0 }
+        }
+      }
+    });
+    const rep = await U.collectDiagnostics({ messageTimeoutMs: 100 });
+    expect(rep.autoSyncReport.note).toContain('从未触发过');
+  });
+
+  test('校准报过错 → 台账里的原始报错必须带出来（不能只剩一个 action=error）', async () => {
+    makeChrome({
+      bookmarks: { getTree: (cb) => cb([]) },
+      sendMessage: () => Promise.resolve(undefined),
+      store: {
+        auto_sync_report: {
+          at: Date.now(), syncEnabled: true, hasUrl: true, interval: 30,
+          alarm: { action: 'error', exists: false, fireCount: 0, lastError: '宿主拒绝创建定时器' }
+        }
+      }
+    });
+    const rep = await U.collectDiagnostics({ messageTimeoutMs: 100 });
+    expect(rep.autoSyncReport.note).toContain('alarm.action=error');
+    expect(rep.autoSyncReport.note).toContain('宿主拒绝创建定时器');
+  });
+});

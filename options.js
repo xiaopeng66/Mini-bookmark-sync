@@ -436,11 +436,67 @@ let connUrlForGrant = '';
 
 // 「运行后台诊断」：页面侧自查 + 后台自述，合成一份可直接截图/复制的报告。
 // 关键：失败项必须带原始报错文本，不能只写「失败」。
+const diagHintDefault = '排查同步问题时点它，把报告复制发出去';
+
+// 一键复制：报告是长 JSON，手机上手选复制非常费劲。
+// 两条通道：① navigator.clipboard（桌面 Chromium 一定有；部分手机宿主没有/权限被拒）
+//          ② 临时 textarea + execCommand('copy')（不要求安全上下文，手机端最稳）
+async function copyPlainText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) { /* 落到 textarea 通道 */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '-2000px';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    if (ta.setSelectionRange) ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return !!ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+document.getElementById('diagCopyBtn')?.addEventListener('click', async () => {
+  const out = document.getElementById('diagOut');
+  const hint = document.getElementById('diagHint');
+  const btn = document.getElementById('diagCopyBtn');
+  // 没报告 / 正在诊断时按钮是 disabled 的（真浏览器不会派发 click），这里再拦一道：
+  // 不许把「正在诊断…」这种占位文本当报告拷走。
+  if (btn && btn.disabled) return;
+  const text = (out && out.textContent) || '';
+  if (!text.trim()) return;
+  const ok = await copyPlainText(text);
+  if (hint) {
+    hint.className = 'diag-hint ' + (ok ? 'ok' : 'err');
+    hint.textContent = ok
+      ? '已复制（' + text.length + ' 字），直接粘贴即可'
+      : '复制失败：请长按上面的报告手动选择复制';
+    if (ok) {
+      setTimeout(() => { hint.className = 'diag-hint'; hint.textContent = diagHintDefault; }, 3000);
+    }
+  }
+});
+
 document.getElementById('diagBtn')?.addEventListener('click', async () => {
   const btn = document.getElementById('diagBtn');
+  const copyBtn = document.getElementById('diagCopyBtn');
+  const hint = document.getElementById('diagHint');
   const out = document.getElementById('diagOut');
   if (!btn || !out) return;
   btn.disabled = true;
+  if (copyBtn) copyBtn.disabled = true;      // 「正在诊断…」不是报告，别让复制按钮把它拷走
+  if (hint) { hint.className = 'diag-hint'; hint.textContent = diagHintDefault; }
   out.style.display = '';
   out.textContent = '正在诊断…（最长约 10 秒）';
   try {
@@ -451,6 +507,7 @@ document.getElementById('diagBtn')?.addEventListener('click', async () => {
     out.textContent = '诊断本身出错：' + ((e && e.message) || e);
   } finally {
     btn.disabled = false;
+    if (copyBtn) copyBtn.disabled = !out.textContent.trim();
   }
 });
 

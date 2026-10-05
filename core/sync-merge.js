@@ -703,7 +703,12 @@ async function doMergeSync(options) {
           rootId: (importResult && importResult.rootId) || null,
           rootChildTitles: (importResult && importResult.rootChildTitles) || [],
           landedSample: (importResult && importResult.landedSample) || [],
-          crossZoneSkipped: crossZoneDiag.skippedNoParent
+          crossZoneSkipped: crossZoneDiag.skippedNoParent,
+          // 重排阶段的真实代价：手机端 console 读不到，这两个数是唯一能看出「卡不卡」的证据。
+          // 顺序本来就一致时 movesAttempted 必须是 0（2026-10-05 手机卡顿的根因就是它不是 0）。
+          movesAttempted: (importResult && importResult.movesAttempted) || 0,
+          movesSkippedParents: (importResult && importResult.movesSkippedParents) || 0,
+          moveFailed: (importResult && importResult.moveFailed) || 0
         }
       });
     } catch (e) {

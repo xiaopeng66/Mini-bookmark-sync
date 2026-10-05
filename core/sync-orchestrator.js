@@ -453,7 +453,12 @@ async function doDownloadBookmarks(options) {
           wrapperSplicedRemote: remoteSpliced,
           rootId: result.rootId || null,
           rootChildTitles: result.rootChildTitles || [],
-          landedSample: result.landedSample || []
+          landedSample: result.landedSample || [],
+          // 重排阶段的真实代价（同 merge 台账）：手机端 console 读不到，
+          // 这两个数是唯一能看出「卡不卡」的证据。
+          movesAttempted: result.movesAttempted || 0,
+          movesSkippedParents: result.movesSkippedParents || 0,
+          moveFailed: result.moveFailed || 0
         }
       });
     } catch (e) {

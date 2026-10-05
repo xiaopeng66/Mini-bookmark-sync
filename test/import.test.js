@@ -92,6 +92,105 @@ function makeFakeBookmarks(initialRoot) {
   return { api, getRoot: () => root };
 }
 
+// 顺序重排的代价：位置已经对上就一个 move 都不发。
+// 背景（2026-10-05，用户「手机装了新版反而很卡」的真凶）：重排段原先无条件对每个落盘
+// 节点 move 一次 —— 245 书签 + 43 文件夹每轮 288 次 move，手机端每次都要落库并通知书签
+// 界面；自动同步修好之后每 30 分钟一轮，卡就成了常态。省 move 的前提是「不许省错」：
+// 数据顺序与本地不同时必须照旧重排到位。
+describe('顺序重排的代价：位置已对上不发 move，顺序真变必须落到位', () => {
+  beforeEach(() => {
+    MiniSync.berry = { mergeBerryData: async (l) => l };
+    MiniSync.via = { mergeViaData: async (l) => l };
+  });
+
+  // 给 fake 的书签接口记账
+  function countCalls(fake) {
+    const calls = { create: 0, move: 0, remove: 0, removeTree: 0 };
+    for (const k of Object.keys(calls)) {
+      const fn = fake.api[k];
+      fake.api[k] = function () { calls[k]++; return fn.apply(this, arguments); };
+    }
+    return calls;
+  }
+
+  function localBar(children) {
+    return makeFakeBookmarks({ id: '0', children: [{ id: '1', title: '书签栏', children }] });
+  }
+  function barTitles(fake) {
+    return fake.getRoot().children.find(c => c.id === '1').children.filter(Boolean).map(c => c.title);
+  }
+
+  test('数据顺序与本地一致 ⇒ 一个 move 都不发（245 书签的手机上这就是每轮 288 次 move 的去处）', async () => {
+    const ROOT_ID = global.ROOT_ID;
+    const fake = localBar([
+      { id: 'A', title: 'CloudA', url: 'http://a', children: [] },
+      { id: 'B', title: 'CloudB', url: 'http://b', children: [] },
+    ]);
+    const calls = countCalls(fake);
+    global.chrome = { runtime: {}, bookmarks: fake.api };   // getChromeTree 的回调要读 chrome.runtime.lastError
+
+    const r = await MiniSync.importer.importBookmarksFromData({
+      bookmarks: [
+        { id: 'nA', title: 'CloudA', url: 'http://a', isFolder: false, parentId: ROOT_ID, source: 'bar', _index: 0 },
+        { id: 'nB', title: 'CloudB', url: 'http://b', isFolder: false, parentId: ROOT_ID, source: 'bar', _index: 1 },
+      ],
+    }, { mode: DOWNLOAD_MODE, mergeMode: true, mergeIntoLocal: true });
+
+    expect(r.movesAttempted).toBe(0);
+    expect(calls.move).toBe(0);
+    expect(barTitles(fake)).toEqual(['CloudA', 'CloudB']);
+  });
+
+  test('数据顺序与本地不同 ⇒ 必须按数据顺序重排（省略 move 不许省错），且计入台账', async () => {
+    const ROOT_ID = global.ROOT_ID;
+    const fake = localBar([
+      { id: 'A', title: 'CloudA', url: 'http://a', children: [] },
+      { id: 'B', title: 'CloudB', url: 'http://b', children: [] },
+      { id: 'C', title: 'CloudC', url: 'http://c', children: [] },
+    ]);
+    const calls = countCalls(fake);
+    global.chrome = { runtime: {}, bookmarks: fake.api };   // getChromeTree 的回调要读 chrome.runtime.lastError
+
+    const r = await MiniSync.importer.importBookmarksFromData({
+      bookmarks: [
+        { id: 'nC', title: 'CloudC', url: 'http://c', isFolder: false, parentId: ROOT_ID, source: 'bar', _index: 0 },
+        { id: 'nA', title: 'CloudA', url: 'http://a', isFolder: false, parentId: ROOT_ID, source: 'bar', _index: 1 },
+        { id: 'nB', title: 'CloudB', url: 'http://b', isFolder: false, parentId: ROOT_ID, source: 'bar', _index: 2 },
+      ],
+    }, { mode: DOWNLOAD_MODE, mergeMode: true, mergeIntoLocal: true });
+
+    expect(r.movesAttempted).toBeGreaterThan(0);
+    expect(calls.move).toBeGreaterThan(0);
+    expect(barTitles(fake)).toEqual(['CloudC', 'CloudA', 'CloudB']);
+  });
+
+  test('重排前读不到当前顺序（宿主抽风）⇒ 退回全量重排，顺序照样落地', async () => {
+    const ROOT_ID = global.ROOT_ID;
+    const fake = localBar([
+      { id: 'A', title: 'CloudA', url: 'http://a', children: [] },
+      { id: 'B', title: 'CloudB', url: 'http://b', children: [] },
+    ]);
+    const calls = countCalls(fake);
+    global.chrome = { runtime: {}, bookmarks: fake.api };   // getChromeTree 的回调要读 chrome.runtime.lastError
+    // 只有重排前这一次读取会走这里（import 自己不读树）
+    const realGet = MiniSync.syncInput.getChromeTree;
+    MiniSync.syncInput.getChromeTree = () => Promise.reject(new Error('宿主抽风'));
+    try {
+      const r = await MiniSync.importer.importBookmarksFromData({
+        bookmarks: [
+          { id: 'nB', title: 'CloudB', url: 'http://b', isFolder: false, parentId: ROOT_ID, source: 'bar', _index: 0 },
+          { id: 'nA', title: 'CloudA', url: 'http://a', isFolder: false, parentId: ROOT_ID, source: 'bar', _index: 1 },
+        ],
+      }, { mode: DOWNLOAD_MODE, mergeMode: true, mergeIntoLocal: true });
+      // 读不到 ⇒ 不许「当成已对上」跳过：必须全量重排，顺序一样要对
+      expect(r.movesAttempted).toBeGreaterThan(0);
+      expect(barTitles(fake)).toEqual(['CloudB', 'CloudA']);
+    } finally {
+      MiniSync.syncInput.getChromeTree = realGet;
+    }
+  });
+});
+
 describe('importBookmarksFromData 顺序同步', () => {
   beforeEach(() => {
     // 桥接未在测试中加载，stub 为透传，避免 ReferenceError 中断（真实代码也已 try/catch）
@@ -166,6 +265,48 @@ describe('importBookmarksFromData 顺序同步', () => {
     expect(r.removedCount).toBe(1);
     // fake 的 remove 会在数组里留下空位（真 Chrome 不会），过滤后再断言
     expect(bar.children.filter(Boolean).map(c => c.title).sort()).toEqual(['CloudA', 'LocalOnly']);
+  });
+
+  test('合并 + 云端墓碑：命中墓碑的本地节点即便会被这一轮「复用」，也必须先删掉（删除先行）', async () => {
+    // 与上一条同一个入口，唯一区别：云端这一轮【又有一条同名同址】的节点会命中本地那条
+    // 被墓碑点名的节点（findExistingLocal / 全局 URL 兜底都会命中），于是写入阶段把它从
+    // 删除索引里 splice 出去 —— 挂在写入之后的兜底删除段就再也找不到它了。
+    // 结果：删除静默失效（台账报 0 项）、被删的旧 id 留在树上还会随写回重新上云。
+    // 所以墓碑驱动的删除必须在写入/复用阶段之前落地，且要如实计入 removedCount。
+    const ROOT_ID = global.ROOT_ID;
+    const fake = makeFakeBookmarks({
+      id: '0',
+      children: [
+        { id: '1', title: '书签栏', children: [
+          { id: 'L', title: 'LocalOnly', url: 'http://local', children: [] },
+          { id: 'A', title: 'CloudA', url: 'http://a', children: [] },
+          { id: 'D', title: 'Deleted', url: 'http://deleted', children: [] },
+        ]},
+      ],
+    });
+    global.chrome = { bookmarks: fake.api };
+
+    const pluginData = {
+      bookmarks: [
+        { id: 'nA', title: 'CloudA', url: 'http://a', isFolder: false, parentId: ROOT_ID, source: 'bar', _index: 0 },
+        { id: 'nD', title: 'Deleted', url: 'http://deleted', isFolder: false, parentId: ROOT_ID, source: 'bar', _index: 1 },
+      ],
+    };
+
+    const r = await MiniSync.importer.importBookmarksFromData(
+      pluginData,
+      { mode: DOWNLOAD_MODE, mergeMode: true, mergeIntoLocal: true, deletedIds: ['D'] }
+    );
+
+    const bar = fake.getRoot().children.find(c => c.id === '1');
+    const ids = bar.children.filter(Boolean).map(c => String(c.id));
+    // 删除必须真发生、并如实计数（消息/台账都读它）
+    expect(r.removedCount).toBe(1);
+    // 被墓碑点名的那个旧 id 不许留在树上（本 fake 的 create 不落树，所以「删掉 + 重新落盘」
+    // 表现为旧 id 消失；真实宿主上则是云端那一条以新 id 落盘）
+    expect(ids).not.toContain('D');
+    // 与墓碑无关的本地独有节点照旧保留（双向增量删减的语义不能被这条改动带偏）
+    expect(ids).toContain('L');
   });
 
   test('真正合并(isTrueMerge)：本地独有节点应保留，不被删除', async () => {

@@ -565,12 +565,34 @@ function statusProbeKey(r) {
   return [r.webdav_url, r.webdav_user, r.webdav_bookmark_path].join('|');
 }
 
-// 状态栏显示规则：未配置不显示；已配置则异步测试连接
+// 状态栏显示规则：未配置不显示；已配置则异步测试连接。
+// 「打开时先画一帧、探测结果静默刷新」的策略在 lib/utils.js（pickConnStatus /
+// connCacheFromResult），那里有单测 —— 弹窗本身没有测试环境，逻辑不留在这一层。
+// ⚠️ 名字必须与 lib/utils.js 的顶层 const 不同名：两个都是经典脚本、共享同一个全局
+//    词法作用域，重名会让 popup.js 整个解析失败（页面脚本全死、滑块点不动）。
+const CONN_CACHE_STORAGE_KEY = MiniSync.utils.CONN_CACHE_KEY;
+// 连通性探测的硬上限：后台自己 20s 收尾，这里给到 25s；超过就按「没拿到结论」收场
+const CONN_PROBE_HARD_MS = 25000;
+
+function renderConnResult(ok) {
+  if (ok) setStatus('配置已就绪', 'ok');
+  else { setStatus('配置未就绪'); renderProgressLine(null); }
+}
+
+// 同步任务进行中（二次打开/自动同步占用）：显示与手动点击一致的文案，三个按钮同样禁用，
+// 并启动轮询——任务结束后状态栏刷成完成信息、恢复按钮。
+function renderBusySync(action) {
+  const busyLabel = SYNC_ACTION_LABELS[action];
+  setStatus(busyLabel ? busyLabel.running : '同步进行中，请稍候...');
+  setSyncBtnBusy(action, true);
+  startStatusPolling(action);
+}
+
 async function updateHomeStatus() {
   if (homeView.classList.contains('hide')) return;
   const r = await chrome.storage.local.get([
     'webdav_url', 'webdav_user', 'webdav_password', 'webdav_bookmark_path',
-    'last_sync_count', 'ever_connected'
+    'last_sync_count', 'ever_connected', CONN_CACHE_STORAGE_KEY
   ]);
   const configured = !!(r.webdav_url && r.webdav_user && r.webdav_password);
   if (!configured) {
@@ -579,19 +601,26 @@ async function updateHomeStatus() {
     return;
   }
 
-  setStatus('正在检查配置...');
+  const probeKey = statusProbeKey(r);
+  const first = MiniSync.utils.pickConnStatus(r[CONN_CACHE_STORAGE_KEY], probeKey, Date.now());
+  setStatus(first.text, first.level || undefined);
   renderProgressLine(null);
 
-  // 通过 background 发请求检查连通性，避免 popup 触发 HTTP 认证弹窗
+  // 通过 background 发请求检查连通性，避免 popup 触发 HTTP 认证弹窗。
+  // ⚠️ 外面再套一层硬超时：宿主若返回一个永不 settle 的 promise，状态栏会永远停在
+  //    「正在检查配置...」（用户手机的原始症状）；超时按「没拿到结论」处理，不冒充连不上。
   let result = null;
   try {
-    result = await _statusProbe.run(statusProbeKey(r), () => chrome.runtime.sendMessage({
-      action: 'checkConfig',
-      webdavUrl: r.webdav_url,
-      webdavUser: r.webdav_user,
-      webdavPassword: r.webdav_password,
-      webdavPath: r.webdav_bookmark_path
-    }), (v) => !!(v && v.busy));
+    result = await _statusProbe.run(probeKey, () => MiniSync.utils.raceHardTimeout(
+      chrome.runtime.sendMessage({
+        action: 'checkConfig',
+        webdavUrl: r.webdav_url,
+        webdavUser: r.webdav_user,
+        webdavPassword: r.webdav_password,
+        webdavPath: r.webdav_bookmark_path
+      }),
+      CONN_PROBE_HARD_MS
+    ), (v) => !!(v && (v.busy || v.timedOut)));
   } catch (e) {
     // SW 未就绪等场景
     result = null;
@@ -601,17 +630,14 @@ async function updateHomeStatus() {
     // 只在真正变化时写：写同一个值也会触发 storage.onChanged，白跑一趟探测
     if (!r.ever_connected) await chrome.storage.local.set({ ever_connected: true });
   } else if (result && result.busy) {
-    // ★ 同步任务进行中（二次打开/自动同步占用）：显示与手动点击一致的文案，
-    //   三个按钮同样禁用（与点击进行中状态一致），并启动轮询——任务结束后
-    //   状态栏刷成完成信息、恢复按钮。
-    const busyLabel = SYNC_ACTION_LABELS[result.action];
-    setStatus(busyLabel ? busyLabel.running : '同步进行中，请稍候...');
-    setSyncBtnBusy(result.action, true);
-    startStatusPolling(result.action);
+    renderBusySync(result.action);
   } else {
     setStatus('配置未就绪');
     renderProgressLine(null);
   }
+  // 落盘「下次打开可以立刻画出来」的那份结论（否定结论与无响应都不落，见 utils 里的说明）
+  const entry = MiniSync.utils.connCacheFromResult(result, probeKey, Date.now());
+  if (entry) await chrome.storage.local.set({ [CONN_CACHE_STORAGE_KEY]: entry });
 }
 
 // 显示/隐藏操作记录行（level='ok'/'err' 时同色，手机上「成了没有」一眼可见）
@@ -974,6 +1000,7 @@ saveBtn.onclick = async () => {
   saveDone = true;
   // 用户刚改过配置：作废探测缓存，回主页时立刻重新测一次（30 秒缓存不该挡住刚改的配置）
   _statusProbe.invalidate();
+  await chrome.storage.local.remove(CONN_CACHE_STORAGE_KEY);   // 落盘那份「上次结论」同样作废
   setConfigStatus(
     permWarnLater ? ('已保存；域名授权未完成（' + permWarnLater + '）') : '已保存',
     permWarnLater ? 'status-bar' : 'status-bar ok'
