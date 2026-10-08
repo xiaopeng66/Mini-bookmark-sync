@@ -21,6 +21,9 @@ async function doUploadBookmarks(options) {
     await MiniSync.storage.setSyncStatus({ status: IDLE });
   }
 
+  let recoveryBucketId = null;
+  let backupReady = false;
+  let mainCommitted = false;
   try {
     await MiniSync.storage.setSyncStatus({ status: SYNCING, action: 'upload' });
 
@@ -54,29 +57,22 @@ async function doUploadBookmarks(options) {
 
     if (!config.url) throw new Error('请先配置 WebDAV 信息');
 
+    // Read body and ETag together; HEAD timestamps cannot protect a later PUT.
+    const remoteVersion = await MiniSync.webdav.getFileVersion(config.url, config.username, config.password, config.filename);
+    if (remoteVersion.exists && !MiniSync.webdav.isStrongETag(remoteVersion.etag)) throw new Error('云端缺少强 ETag，无法安全地上传覆盖');
+    if (remoteVersion.exists && !remoteVersion.content) throw new Error('云端文件为空，已拒绝覆盖');
+    if (remoteVersion.exists && !MiniSync.xbel.parseXbelFromString(remoteVersion.content)) throw new Error('XBEL 文件格式无效');
+
     // ===== 回迁：上传前云端冲突检测（非强制上传） =====
     // 云端文件 lastModified 比本地记录新 → 说明被其他设备修改过，需用户确认
-    if (!options.force) {
-      try {
-        const remoteInfo = await MiniSync.webdav.getFileInfo(config.url, config.username, config.password, config.filename);
-        if (remoteInfo.exists && remoteInfo.lastModified > 0) {
-          const stored = await MiniSync.storage.getLocal([STORAGE_KEYS.CLOUD_LAST_MODIFIED]);
-          const lastSeen = stored[STORAGE_KEYS.CLOUD_LAST_MODIFIED] || 0;
-          if (lastSeen > 0 && remoteInfo.lastModified > lastSeen) {
-            console.warn(`[sync] 检测到云端文件已被其他设备修改 (${endpointKey})`);
-            await MiniSync.storage.setSyncStatus({ status: IDLE });
-            return {
-              success: false,
-              code: 'CLOUD_CONFLICT',
-              message: '云端书签已被其他设备修改，请选择「仍然上传」覆盖，或先「下载同步」',
-              remoteModified: remoteInfo.lastModified,
-              endpointKey: endpointKey
-            };
-          }
-        }
-      } catch (e) {
-        // 冲突检测失败不阻断上传（网络抖动等场景保持兼容）
-        console.warn('[sync] 上传前冲突检测失败（忽略）:', e.message);
+    if (!options.force && remoteVersion.exists && remoteVersion.lastModified > 0) {
+      const stored = await MiniSync.storage.getLocal([STORAGE_KEYS.CLOUD_LAST_MODIFIED]);
+      const lastSeen = stored[STORAGE_KEYS.CLOUD_LAST_MODIFIED] || 0;
+      if (lastSeen > 0 && remoteVersion.lastModified > lastSeen) {
+        await MiniSync.storage.setSyncStatus({ status: IDLE });
+        return { success: false, code: 'CLOUD_CONFLICT',
+          message: '云端书签已被其他设备修改，请先下载并合并',
+          remoteModified: remoteVersion.lastModified, endpointKey };
       }
     }
 
@@ -86,21 +82,9 @@ async function doUploadBookmarks(options) {
     //   <flatRootContainer> 元数据。拿到名字后 chromeToXbel 才会把这层包装摊平再写回，
     //   否则云端永远带着包装（手机端每轮都得拆一次，云端文件反复变）。
     //   读失败不影响上传（按本机形态写，与旧行为一致）。
-    let remoteBookmarkCount = 0;
-    let remoteData = null;
-    try {
-      const remoteContent = await MiniSync.webdav.getFile(config.url, config.username, config.password, config.filename);
-      if (remoteContent) {
-        const rd = MiniSync.xbel.parseXbelFromString(remoteContent);
-        if (rd) {
-          remoteData = rd;
-          remoteBookmarkCount = (rd.bookmarks || []).filter(n => n.url).length;
-          if (rd.flatRootContainer) MiniSync.utils.setDeclaredFlatRootContainer(rd.flatRootContainer);
-        }
-      }
-    } catch (e) {
-      console.warn('[sync] 上传前读取云端声明失败（按本机形态写）:', e.message);
-    }
+    const remoteData = remoteVersion.exists ? MiniSync.xbel.parseXbelFromString(remoteVersion.content) : null;
+    const remoteBookmarkCount = remoteData ? (remoteData.bookmarks || []).filter(n => n.url).length : 0;
+    if (remoteData && remoteData.flatRootContainer) MiniSync.utils.setDeclaredFlatRootContainer(remoteData.flatRootContainer);
 
     // ★ 单同步桶：「同步文件夹」必须在**读过云端声明之后**才解析（顺序不能反）。
     //   桌面 Edge 是标准三区宿主，它认出「其他收藏夹/根目录」这层手机镜像就是自己的
@@ -111,6 +95,8 @@ async function doUploadBookmarks(options) {
       ? MiniSync.utils.getDeclaredFlatRootContainer() : '';
     const bucketInfo = await MiniSync.syncInput.resolveSyncBucketSetting();
     if (!bucketInfo.id) throw new Error('找不到同步文件夹（浏览器根下没有任何文件夹）');
+    await MiniSync.syncInput.ensureSyncRelationship(config, bucketInfo.id);
+    recoveryBucketId = bucketInfo.id;
     // 「上传」是「以本机为准覆盖云端」的动作。若云端声明的同步文件夹在本机不存在
     // （典型：手机建的容器还没同步到这台桌面），本次上传的覆盖范围会以本机探测到的
     // 文件夹为准 —— 如实说出来，用户才知道该先点「合并」。
@@ -133,12 +119,10 @@ async function doUploadBookmarks(options) {
     }
     // ② 消费「本地 ∪ 云端」墓碑：云端已删、而本机还留着的节点，先在本机删掉再上传。
     //    不删的话本机会把它们原样覆盖回云端 —— 用户的删除被反推成「复活」。
-    let deletions = { deletedCount: 0, tombstones: null };
-    try {
-      deletions = await MiniSync.syncInput.applyTombstoneDeletions(remoteData);
-    } catch (e) {
-      console.warn('[sync] 上传前应用云端删除失败（按本机状态上传）:', e.message);
-    }
+    // Deletions are destructive local writes: verify the backup before consuming tombstones.
+    if (!await MiniSync.syncInput.backupLocalTree()) throw new Error('本地备份失败，已停止上传以保护书签');
+    backupReady = true;
+    const deletions = await MiniSync.syncInput.applyTombstoneDeletions(remoteData);
     if (deletions.deletedCount > 0) {
       uploadNote += `（按云端的删除记录，已同时从本机删掉 ${deletions.deletedCount} 项）`;
     }
@@ -169,7 +153,9 @@ async function doUploadBookmarks(options) {
     };
 
     const xbelString = MiniSync.xbel.chromeToXbel(xbelTree, Object.assign({ syncBucketId: bucketInfo.id }, meta));
-    const putResult = await MiniSync.webdav.putFile(config.url, config.username, config.password, config.filename, xbelString);
+    const putResult = await MiniSync.webdav.putFile(config.url, config.username, config.password, config.filename, xbelString, undefined,
+      remoteVersion.exists ? { etag: remoteVersion.etag } : { missing: true });
+    mainCommitted = true;
     // 记录云端 lastModified，供下次上传冲突检测使用
     await MiniSync.storage.setLocal({ [STORAGE_KEYS.CLOUD_LAST_MODIFIED]: putResult.lastModified || Date.now() });
 
@@ -196,16 +182,18 @@ async function doUploadBookmarks(options) {
     //   personalization/favorites 的 home 区按桌面对齐——历史残留自动清除）。
     //   ⚠️ 端上尚未拉取到桌面的新增书签会在此覆盖中丢失
     //   ——想保留端上新增，请先点「合并」拉取，再上传。
+    let bridgeOutcome = { bridgeResults: {}, partial: false };
     try {
       const bridgeOpts = await MiniSync.storage.getLocal(['option_berry_enabled', 'option_via_enabled', 'option_aira_enabled']);
       const berryOn = bridgeOpts.option_berry_enabled === true;
       const viaOn = bridgeOpts.option_via_enabled === true;
       const airaOn = bridgeOpts.option_aira_enabled === true;
-      await MiniSync.bridgePatcher.patchBridges(
+      bridgeOutcome = await MiniSync.bridgePatcher.patchBridges(
         { berryList: flatList, viaList: flatList, airaList: flatList },
         { berryOn, viaOn, airaOn, airaRebuild: true, airaHomeAlign: true }
-      );
+      ) || bridgeOutcome;
     } catch (e) {
+      bridgeOutcome = { bridgeResults: { unknown: { status: 'failed', error: e.message } }, partial: true };
       console.warn('[sync] 桥接覆盖写回失败:', e.message);
     }
 
@@ -213,14 +201,18 @@ async function doUploadBookmarks(options) {
     await MiniSync.syncInput.recordLastSync(totalCount, bmCount);
 
     // 更新状态
-    await MiniSync.storage.setSyncStatus({ status: SUCCESS });
+    await MiniSync.storage.setSyncStatus({ status: bridgeOutcome.partial ? 'partial' : SUCCESS,
+      partial: !!bridgeOutcome.partial, bridgeResults: bridgeOutcome.bridgeResults,
+      error: bridgeOutcome.partial ? '主文件已上传，手机桥接部分失败' : '' });
 
     // 同步成功后刷新本地快照（供删除监听回溯被删节点 pathKey）
     await MiniSync.syncInput.saveLocalSnapshot();
     await MiniSync.syncInput.saveLocalTreeSnapshot();
     return {
       success: true,
-      message: '上传成功' + uploadNote,
+      partial: !!bridgeOutcome.partial,
+      bridgeResults: bridgeOutcome.bridgeResults || {},
+      message: (bridgeOutcome.partial ? '主文件已上传，手机桥接部分失败' : '上传成功') + uploadNote,
       endpointKey: endpointKey,
       count: totalCount,
       bookmarkCount: bmCount,
@@ -232,8 +224,13 @@ async function doUploadBookmarks(options) {
 
   } catch (error) {
     console.error('[sync] 上传失败:', error.message);
+    let recovery = null;
+    if (backupReady && !mainCommitted) {
+      try { recovery = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true, targetParentId: recoveryBucketId }); }
+      catch (e) { recovery = { ok: false, reason: e.message }; }
+    }
     await MiniSync.storage.setSyncStatus({ status: FAILED, error: error.message });
-    return { success: false, message: `上传失败: ${error.message}` };
+    return { success: false, message: `上传失败: ${error.message}`, recovery };
   }
 }
 
@@ -252,6 +249,10 @@ function downloadBookmarks(options) {
 
 async function doDownloadBookmarks(options) {
   options = options || {};
+  let recoveryBucketId = null;
+  let backupReady = false;
+  let localCommitted = false;
+  let restoreHome = false;
   // 拿到锁后状态仍是 SYNCING → 必为 SW 崩溃/重启残留，恢复为 IDLE
   const status = await MiniSync.storage.getSyncStatus();
   if (status.status === SYNCING) {
@@ -284,8 +285,10 @@ async function doDownloadBookmarks(options) {
 
     if (!config.url) throw new Error('请先配置 WebDAV 信息');
 
-    const content = await MiniSync.webdav.getFile(config.url, config.username, config.password, config.filename);
-    if (!content) throw new Error('云端文件为空或不存在');
+    const remoteVersion = await MiniSync.webdav.getFileVersion(config.url, config.username, config.password, config.filename);
+    const content = remoteVersion.content;
+    if (!remoteVersion.exists || !content) throw new Error('云端文件为空或不存在');
+    if (!MiniSync.webdav.isStrongETag(remoteVersion.etag)) throw new Error('云端缺少强 ETag，无法安全地下载');
 
     // XBEL XML → JSON 中间态
     // ★ 扁平根宿主（手机）在解析云端之前先声明自己的容器名：云端还带着旧版写下的包装
@@ -300,7 +303,7 @@ async function doDownloadBookmarks(options) {
     }
     const pluginData = MiniSync.xbel.parseXbelFromString(content);
     if (!pluginData) throw new Error('XBEL 文件格式无效');
-    if (!pluginData.bookmarks || pluginData.bookmarks.length === 0) throw new Error('云端书签数据为空');
+    if (!Array.isArray(pluginData.bookmarks)) throw new Error('云端书签数据无效');
 
     // ===== 回迁：下载采用「备份 → 增量覆盖」语义（兼容第三方同步器如 floccus）=====
     // 关键改动：不再 clearAllBookmarks() + 全量重建（会令本地节点 id 全部变更，
@@ -308,18 +311,19 @@ async function doDownloadBookmarks(options) {
     //   改为增量导入：复用本地已存在的同名/同 URL 节点 id，仅增删差异，保持本地 id 稳定。
     // 1. 备份当前本地书签（供失败回滚）
     const backupCount = await MiniSync.syncInput.backupLocalTree();
+    if (!backupCount) throw new Error('本地备份失败，已停止下载以保护书签');
+    backupReady = true;
+    const bucketInfo = await MiniSync.syncInput.resolveSyncBucketSetting();
+    if (!bucketInfo.id) throw new Error('找不到同步文件夹（浏览器根下没有任何文件夹）');
+    recoveryBucketId = bucketInfo.id;
+    await MiniSync.syncInput.ensureSyncRelationship(config, bucketInfo.id);
 
     // 1b. ===== 增量删减：下载也要减量，不是「只加不删」=====
     // 旧实现（mergeMode:false、不传 deletedIds）是纯加法：云端删掉的书签在本机永远留着。
     // 现按「本地 ∪ 云端」墓碑把本机确实已删的节点删掉——判据只有墓碑，不是「云端为准扫荡」：
     // 云端没有、也没有墓碑的节点是本机新增，一条都不动（用户自己的书签不许被下载清掉）。
     // 位置放在备份之后：真出异常时回滚能把它们一起带回来。
-    let downloadDeletions = { deletedCount: 0 };
-    try {
-      downloadDeletions = await MiniSync.syncInput.applyTombstoneDeletions(pluginData);
-    } catch (e) {
-      console.warn('[sync] 下载前应用云端删除失败（继续按增量导入）:', e.message);
-    }
+    const downloadDeletions = await MiniSync.syncInput.applyTombstoneDeletions(pluginData);
 
     // 2. 增量导入（B-P2: JSON 中间态 → 导入 Chrome，mergeIntoLocal 复用本地节点）
     let result;
@@ -339,6 +343,7 @@ async function doDownloadBookmarks(options) {
       targetParentId = info.id;
       const t = await MiniSync.storage.getLocal(['download_clear']);
       clearLocalFirst = !!(t && t.download_clear);
+      restoreHome = clearLocalFirst;
     } catch (e) {
       console.warn('[sync] 解析同步文件夹失败（继续按自动处理）:', e.message);
     }
@@ -351,7 +356,7 @@ async function doDownloadBookmarks(options) {
     } catch (e) {
       // 4a. 导入异常 → 从备份恢复
       console.error('[sync] 增量导入失败，尝试回滚:', e.message);
-      const restored = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true });
+      const restored = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true, targetParentId: bucketInfo.id, includeHome: restoreHome });
       await MiniSync.storage.setSyncStatus({ status: FAILED, error: e.message });
       return {
         success: false,
@@ -374,6 +379,14 @@ async function doDownloadBookmarks(options) {
     if (failedWrites > 0) {
       console.warn(`[sync] 下载导入有 ${failedWrites} 条写入失败（本地未被改动，云端数据不会丢）`);
     }
+    if (failedWrites > 0 || result.moveFailed > 0) {
+      const failureCount = failedWrites + (result.moveFailed || 0);
+      const restored = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true, targetParentId: bucketInfo.id, includeHome: restoreHome });
+      await MiniSync.storage.setSyncStatus({ status: FAILED, error: '下载写入未完整落地' });
+      return { success: false, partial: true, conflictCount: failureCount, conflicts: result.conflicts || [],
+        restored: restored.restored,
+        message: restored.ok ? `下载有 ${failureCount} 处未落地，已回滚本地` : `下载有 ${failureCount} 处未落地，回滚未完成` };
+    }
     // 修复动作要如实说给用户听（手机上 console 看不到）：
     //   wrapperUnwrapped>0 ⇒ 展开了几层「同名容器套容器」（嵌套垃圾的来源）
     //   clearedBefore>0   ⇒ 按用户勾选先清空了本地再重建（破坏性，必须说出来）
@@ -392,15 +405,8 @@ async function doDownloadBookmarks(options) {
 
     // 下载模式不操作 Berry/Via（只有上传覆盖、合并对齐才处理 Berry/Via）
 
-    // 记录云端 lastModified，供下次上传冲突检测使用
-    let cloudLastModified = Date.now();
-    try {
-      const info = await MiniSync.webdav.getFileInfo(config.url, config.username, config.password, config.filename);
-      if (info.exists && info.lastModified > 0) cloudLastModified = info.lastModified;
-    } catch (e) {
-      console.warn('[sync] 读取云端时间戳失败（忽略）:', e.message);
-    }
-    await MiniSync.storage.setLocal({ [STORAGE_KEYS.CLOUD_LAST_MODIFIED]: cloudLastModified });
+    // Only commit the downloaded body's version after complete local landing.
+    if (failedWrites === 0) await MiniSync.storage.setLocal({ [STORAGE_KEYS.CLOUD_LAST_MODIFIED]: remoteVersion.lastModified || 0 });
 
     // 统计：总数（书签+文件夹）供控制台日志，书签数供用户操作记录
     const cloudBookmarks = pluginData.bookmarks || [];
@@ -414,6 +420,7 @@ async function doDownloadBookmarks(options) {
 
     // 记录本次同步信息（popup 首页渲染用；count=纯书签数，与 result.bookmarkCount 同口径）
     await MiniSync.syncInput.recordLastSync(cloudTotal, cloudBmCount);
+    localCommitted = true;
 
     await MiniSync.storage.setSyncStatus({ status: SUCCESS });
 
@@ -484,8 +491,13 @@ async function doDownloadBookmarks(options) {
 
   } catch (error) {
     console.error('[sync] 下载失败:', error.message);
+    let recovery = null;
+    if (backupReady && recoveryBucketId && !localCommitted) {
+      try { recovery = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true, targetParentId: recoveryBucketId, includeHome: restoreHome }); }
+      catch (e) { recovery = { ok: false, reason: e.message }; }
+    }
     await MiniSync.storage.setSyncStatus({ status: FAILED, error: error.message });
-    return { success: false, message: `下载失败: ${error.message}` };
+    return { success: false, message: `下载失败: ${error.message}`, recovery };
   }
 }
 

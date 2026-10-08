@@ -295,9 +295,9 @@ function serializeToHtml(bookmarkList) {
 // 下载 Via 的 bookmarks.html
 async function downloadViaBookmarks() {
   const config = await getWebDAVConfig();
-  if (!config.url || !config.user || !config.password) return null;
+  if (!config.url || !config.user || !config.password) throw new Error('Via WebDAV 未配置');
   const viaPath = await getViaPath();
-  if (!viaPath) return null;
+  if (!viaPath) throw new Error('Via 路径未配置');
   const fullUrl = joinWebDAVUrl(config.url, viaPath + '/' + VIA_FILE);
   try {
     const response = await fetch(fullUrl, {
@@ -310,24 +310,20 @@ async function downloadViaBookmarks() {
       }
     });
     if (response.status === 404) return null;
-    if (!response.ok) {
-      console.warn(`[sync] 读取 Via 文件失败: ${response.status}`);
-      return null;
-    }
-    const html = await response.text();
-    return html;
+    if (!response.ok) throw new Error(`读取 Via 文件失败: ${response.status}`);
+    return await response.text();
   } catch (e) {
     console.warn('[sync] 读取 Via 文件异常:', e.message);
-    return null;
+    throw e;
   }
 }
 
 // 上传 HTML 到 WebDAV
 async function uploadViaHtml(html) {
   const config = await getWebDAVConfig();
-  if (!config.url || !config.user || !config.password) return;
+  if (!config.url || !config.user || !config.password) throw new Error('Via WebDAV 未配置');
   const viaPath = await getViaPath();
-  if (!viaPath) return;
+  if (!viaPath) throw new Error('Via 路径未配置');
   await ensureWebDAVDir(config.url, viaPath, config.user, config.password);
   const fullUrl = joinWebDAVUrl(config.url, viaPath + '/' + VIA_FILE);
   const response = await fetch(fullUrl, {
@@ -338,28 +334,38 @@ async function uploadViaHtml(html) {
     },
     body: html
   });
-  if (!response.ok) {
-    console.warn(`[sync] 写入 Via 文件失败: ${response.status}`);
-  }
+  if (!response.ok) throw new Error(`写入 Via 文件失败: ${response.status}`);
 }
 
 // ========== 桥接逻辑 ==========
 
 // 将合并结果写回 Via（HTML + favorites.txt）
 async function patchViaFile(mergedList) {
-  try {
-    const html = serializeToHtml(mergedList);
-    await uploadViaHtml(html);
-    const favTxt = serializeToFavoritesTxt(mergedList);
-    await uploadViaFavorites(favTxt);
-    console.log(`[sync] 📱 Via 回写完成: ${zoneSummary(mergedList)}`);
-  } catch (e) {
-    console.warn('[sync] 📱 Via 桥接：上传失败', e.message);
+  const results = {};
+  for (const [name, upload, serialize] of [
+    ['html', uploadViaHtml, serializeToHtml],
+    ['favorites', uploadViaFavorites, serializeToFavoritesTxt]
+  ]) {
+    try {
+      await upload(serialize(mergedList));
+      results[name] = { status: 'success' };
+    } catch (e) {
+      results[name] = { status: 'failed', error: e.message };
+      console.warn(`[sync] Via ${name} 写回失败:`, e.message);
+    }
   }
+  return results;
 }
 
 // 从 Via 读取变更并合并到当前列表（HTML + favorites.txt）
 async function mergeViaData(currentList, tombstoneKeys = null) {
+  const result = await mergeViaDataWithChanges(currentList, tombstoneKeys);
+  if (result.complete && result.snapshotUpdates) await chrome.storage.local.set(result.snapshotUpdates);
+  return result.list;
+}
+
+async function mergeViaDataWithChanges(currentList, tombstoneKeys = null) {
+  const changes = { list: currentList, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] };
   // 计数：供末尾「处理完成」日志展示差异构成（声明在函数级，块内赋值）
   let viaNewCount = 0, homeNewCount = 0;
   // ★ 收集所有"来自 Via 文件"的 pathKey（HTML + favorites），
@@ -370,11 +376,16 @@ async function mergeViaData(currentList, tombstoneKeys = null) {
   let html;
   try {
     html = await downloadViaBookmarks();
+    if (html === null) throw new Error('Via bookmarks.html 不存在');
+    if (typeof html !== 'string' || !/<DL\b[^>]*>/i.test(html) || !/<\/DL\s*>/i.test(html)) {
+      throw new Error('Via bookmarks.html 格式无效');
+    }
   } catch (e) {
-    html = null;
+    changes.complete = false;
+    changes.errors.push(e.message);
   }
 
-  if (html) {
+  if (changes.complete && html) {
     viaList = parseHtmlToBookmarks(html);
     if (viaList.length > 0) {
       const currentPKs = computePathKeys(currentList);
@@ -476,8 +487,23 @@ async function mergeViaData(currentList, tombstoneKeys = null) {
   }
 
   // ===== 2. 合并 favorites.txt（source='home'）=====
-  const txt = await downloadViaFavorites();
-  if (txt) {
+  let txt;
+  try {
+    txt = await downloadViaFavorites();
+    if (txt === null) throw new Error('Via favorites.txt 不存在');
+    if (typeof txt !== 'string') throw new Error('Via favorites.txt 格式无效');
+    for (const line of txt.split('\n').filter(value => value.trim())) {
+      const row = JSON.parse(line);
+      if (!row || typeof row !== 'object' || typeof row.url !== 'string' || !row.url.trim() ||
+          (row.title !== undefined && typeof row.title !== 'string') || !normalizeUrl(row.url)) {
+        throw new Error('Via favorites.txt 书签节点格式无效');
+      }
+    }
+  } catch (e) {
+    changes.complete = false;
+    changes.errors.push(e.message);
+  }
+  if (changes.complete && txt) {
     const homeList = parseFavoritesTxt(txt);
     if (homeList.length > 0) {
       // 确保 HOME_FOLDER_ID 容器节点存在（否则 pathKey 算不出来）
@@ -566,14 +592,10 @@ async function mergeViaData(currentList, tombstoneKeys = null) {
   const viaSnapshotData = (await chrome.storage.local.get(['via_pathkey_snapshot']))['via_pathkey_snapshot'] || [];
   const viaSnapshotSet = new Set(viaSnapshotData);
   let viaDeletedCount = 0;
-  if (viaSnapshotSet.size > 0) {
-    const beforeLen = currentList.length;
+  if (changes.complete && viaSnapshotSet.size > 0) {
     const filteredCurrent = currentList.filter(n => {
       const pk = allViaPKs.get(n.id);
       if (!pk) return true;
-      // pk 不在 Via 文件解析集合 → 非 Via 节点，不参与删除判定（避免误删本地独有节点）
-      if (!viaPKSet.has(pk)) return true;
-      // 条件：Via 快照中有（上次 Via 有这个节点）但现在 Via 来源节点中没有 → 疑似 Via 删了
       if (viaSnapshotSet.has(pk) && !viaPKSet.has(pk)) {
         // 改名/移动兜底：URL（书签）或标题（文件夹）仍存在于对方 → 只是路径变了，不是真删
         if (!n.isFolder && n.url) {
@@ -582,6 +604,8 @@ async function mergeViaData(currentList, tombstoneKeys = null) {
         }
         if (n.isFolder && n.title && viaFolderTitles.has(n.title)) return true;
         viaDeletedCount++;
+        changes.deletedIds.push(n.id);
+        changes.deletedPathKeys.push(pk);
         return false;
       }
       return true;
@@ -592,12 +616,13 @@ async function mergeViaData(currentList, tombstoneKeys = null) {
   }
 
   // 保存 Via pathKey 快照（用于下次检测 Via 删除）
-  await chrome.storage.local.set({ 'via_pathkey_snapshot': [...viaPKSet] });
+  if (changes.complete) changes.snapshotUpdates = { via_pathkey_snapshot: [...viaPKSet] };
 
   // Via 新增节点（来自 html/favorites 解析）无 _index → 补到同父已有节点之后
   MiniSync.utils.fillMissingSiblingIndex(currentList);
   console.log(`[sync] 📱 Via 处理完成: ${zoneSummary(currentList)}`);
-  return currentList;
+  changes.list = currentList;
+  return changes;
 }
 
 // ========== favorites.txt 读写（Berry 主页）==========
@@ -663,9 +688,9 @@ function serializeToFavoritesTxt(bookmarkList) {
 // 下载 favorites.txt
 async function downloadViaFavorites() {
   const config = await getWebDAVConfig();
-  if (!config.url || !config.user || !config.password) return null;
+  if (!config.url || !config.user || !config.password) throw new Error('Via WebDAV 未配置');
   const viaPath = await getViaPath();
-  if (!viaPath) return null;
+  if (!viaPath) throw new Error('Via 路径未配置');
   const fullUrl = joinWebDAVUrl(config.url, viaPath + '/' + VIA_FAVORITES_FILE);
   try {
     const response = await fetch(fullUrl, {
@@ -678,24 +703,20 @@ async function downloadViaFavorites() {
       }
     });
     if (response.status === 404) return null;
-    if (!response.ok) {
-      console.warn(`[sync] 读取 Via favorites.txt 失败: ${response.status}`);
-      return null;
-    }
-    const txt = await response.text();
-    return txt;
+    if (!response.ok) throw new Error(`读取 Via favorites.txt 失败: ${response.status}`);
+    return await response.text();
   } catch (e) {
     console.warn('[sync] 读取 Via favorites.txt 异常:', e.message);
-    return null;
+    throw e;
   }
 }
 
 // 上传 favorites.txt 到 WebDAV
 async function uploadViaFavorites(txt) {
   const config = await getWebDAVConfig();
-  if (!config.url || !config.user || !config.password) return;
+  if (!config.url || !config.user || !config.password) throw new Error('Via WebDAV 未配置');
   const viaPath = await getViaPath();
-  if (!viaPath) return;
+  if (!viaPath) throw new Error('Via 路径未配置');
   await ensureWebDAVDir(config.url, viaPath, config.user, config.password);
   const fullUrl = joinWebDAVUrl(config.url, viaPath + '/' + VIA_FAVORITES_FILE);
   const response = await fetch(fullUrl, {
@@ -706,13 +727,12 @@ async function uploadViaFavorites(txt) {
     },
     body: txt
   });
-  if (!response.ok) {
-    console.warn(`[sync] 写入 Via favorites.txt 失败: ${response.status}`);
-  }
+  if (!response.ok) throw new Error(`写入 Via favorites.txt 失败: ${response.status}`);
 }
 
 // 挂载到 MiniSync，供 sync-orchestrator 在合并阶段调用
 MiniSync.via = {
   mergeViaData,
+  mergeViaDataWithChanges,
   patchViaFile
 };

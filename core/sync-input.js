@@ -73,9 +73,9 @@ async function clearAllBookmarks() {
 async function backupLocalTree(tree) {
   try {
     if (!tree) tree = await getChromeTree();
-    await new Promise((resolve) => {
-      chrome.storage.local.set({ local_bookmark_backup: tree }, resolve);
-    });
+    await MiniSync.storage.setLocal({ local_bookmark_backup: tree });
+    const saved = await getLocalBackup();
+    if (!Array.isArray(saved) || JSON.stringify(saved) !== JSON.stringify(tree)) throw new Error('备份校验失败');
     return true;
   } catch (e) {
     console.warn('[orchestrator] 备份本地书签失败:', e.message);
@@ -85,36 +85,146 @@ async function backupLocalTree(tree) {
 
 // 读取本地备份（chrome.storage.local: 'local_bookmark_backup'）
 async function getLocalBackup() {
-  return new Promise((resolve) => {
-    chrome.storage.local.get(['local_bookmark_backup'], (res) => {
-      resolve(res.local_bookmark_backup || null);
-    });
-  });
+  const data = await MiniSync.storage.getLocal(['local_bookmark_backup']);
+  return Array.isArray(data.local_bookmark_backup) ? data.local_bookmark_backup : null;
 }
 
-// 回滚：用本地备份覆盖当前书签（先清空再导入）
-// options.replaceCurrent=true 时为「替换式恢复」：先清空当前书签内容再导入备份，
-// 真正回到快照状态。缺省为叠加导入（现有书签保留）——供用户主动恢复按钮使用，
-// 叠加虽可能重复但绝不丢当前数据；而同步失败回滚必须用替换式，否则会在
-// 半成品状态上叠加，制造大量重复书签。
+// 回滚：在同步桶内先重建备份，成功后才删除原内容；创建失败时保留原内容。
+// 缺省为叠加导入（现有书签保留），供用户主动恢复按钮使用。
+// 同步失败回滚用替换式，避免在半成品状态上叠加大量重复书签。
 async function restoreLocalBackup(options) {
+  options = options || {};
   const backup = await getLocalBackup();
-  if (!backup) return { ok: false, reason: 'no_backup' };
-
-  if (options && options.replaceCurrent) {
-    try {
-      await _clearAllBookmarkContents();
-    } catch (e) {
-      console.warn('[sync] 回滚前清空当前书签失败（降级为叠加导入）:', e.message);
+  if (!backup) return { ok: false, restored: 0, conflicts: [], reason: 'no_backup' };
+  const root = backup[0];
+  const current = (await getChromeTree())[0];
+  const bucketId = String(options.targetParentId || (MiniSync.utils.getSyncBucketId && MiniSync.utils.getSyncBucketId()) || '');
+  function find(node, id) {
+    if (String(node.id) === id) return node;
+    for (const child of node.children || []) { const match = find(child, id); if (match) return match; }
+    return null;
+  }
+  const savedBucket = root && find(root, bucketId);
+  const currentBucket = current && find(current, bucketId);
+  if (!savedBucket || !currentBucket || currentBucket.url) {
+    return { ok: false, restored: 0, conflicts: [], reason: 'bucket_not_found' };
+  }
+  const targets = [{ saved: savedBucket, current: currentBucket }];
+  if (options.includeHome) {
+    const homeTitles = FOLDER_TITLES.berryHome.map(title => String(title).toLowerCase());
+    function findHome(node) {
+      if (!node || node.url) return null;
+      if (homeTitles.includes(String(node.title || '').toLowerCase())) return node;
+      for (const child of node.children || []) { const home = findHome(child); if (home) return home; }
+      return null;
+    }
+    const savedHome = findHome(root);
+    const currentHome = savedHome && find(current, String(savedHome.id));
+    function contains(node, id) { return !!find(node, String(id)); }
+    if (savedHome && currentHome && !contains(savedBucket, savedHome.id) && !contains(currentBucket, currentHome.id)) {
+      targets.push({ saved: savedHome, current: currentHome });
     }
   }
-
-  // 用 import 引擎把备份写回
-  const result = await MiniSync.importer.importBookmarksFromData(
-    { bookmarks: _treeToFlatList(backup), tombstones: [] },
-    { mode: 'full', skipBerryBridge: true, skipViaBridge: true }
-  );
-  return { ok: true, result };
+  let restored = 0;
+  const conflicts = [];
+  const call = (method, ...args) => new Promise((resolve, reject) => {
+    chrome.bookmarks[method](...args, value => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(value);
+    });
+  });
+  async function recreate(node, parentId, index) {
+    const info = { parentId, index, title: node.title || '' };
+    if (node.url) info.url = node.url;
+    const created = await call('create', info);
+    restored++;
+    for (const [i, child] of (node.children || []).entries()) await recreate(child, String(created.id), i);
+  }
+  if (options.replaceCurrent) {
+    // Reuse surviving backup IDs. Staging a second copy then removing the original
+    // duplicates nodes whenever the original is subject to a persistent remove failure.
+    const surviving = new Map();
+    function indexNodes(node, map) {
+      map.set(String(node.id), node);
+      for (const child of node.children || []) indexNodes(child, map);
+    }
+    for (const target of targets) indexNodes(target.current, surviving);
+    const planned = [];
+    const stagedRoots = [];
+    const stagedIds = new Set();
+    const desiredIds = new Set(targets.map(target => String(target.current.id)));
+    async function stage(node, parentId, index) {
+      let live = surviving.get(String(node.id));
+      if (!live || !!live.url !== !!node.url) {
+        const info = { parentId, title: node.title || '' };
+        if (node.url) info.url = node.url;
+        live = await call('create', info);
+        if (!stagedIds.has(parentId)) stagedRoots.push({ id: String(live.id), url: !!node.url });
+        stagedIds.add(String(live.id));
+      }
+      const id = String(live.id);
+      desiredIds.add(id);
+      planned.push({ node, id, parentId, index });
+      restored++;
+      for (const [i, child] of (node.children || []).entries()) await stage(child, id, i);
+    }
+    try {
+      // No original is changed or removed until every required create succeeds.
+      for (const target of targets) {
+        for (const [i, child] of (target.saved.children || []).entries()) {
+          await stage(child, String(target.current.id), i);
+        }
+      }
+    } catch (e) {
+      conflicts.push({ error: e.message });
+      for (const staged of stagedRoots.reverse()) {
+        try { await call(staged.url ? 'remove' : 'removeTree', staged.id); }
+        catch (cleanupError) { conflicts.push({ id: staged.id, error: cleanupError.message }); }
+      }
+      return { ok: false, restored, conflicts, reason: e.message };
+    }
+    try {
+      const liveNodes = new Map();
+      indexNodes((await getChromeTree())[0], liveNodes);
+      for (const entry of planned) {
+        const live = liveNodes.get(entry.id);
+        const changes = {};
+        if ((live.title || '') !== (entry.node.title || '')) changes.title = entry.node.title || '';
+        if (entry.node.url && live.url !== entry.node.url) changes.url = entry.node.url;
+        if (Object.keys(changes).length) {
+          await call('update', entry.id, changes);
+          Object.assign(live, changes);
+        }
+        const parent = liveNodes.get(entry.parentId);
+        if (String(live.parentId) !== entry.parentId || String((parent.children || [])[entry.index]?.id) !== entry.id) {
+          await call('move', entry.id, { parentId: entry.parentId, index: entry.index });
+          const oldParent = liveNodes.get(String(live.parentId));
+          if (oldParent) oldParent.children = (oldParent.children || []).filter(child => String(child.id) !== entry.id);
+          parent.children = parent.children || [];
+          parent.children.splice(entry.index, 0, live);
+          live.parentId = entry.parentId;
+        }
+      }
+      async function removeExtras(parent) {
+        for (const child of parent.children || []) {
+          if (desiredIds.has(String(child.id))) await removeExtras(child);
+          else await call(child.url ? 'remove' : 'removeTree', String(child.id));
+        }
+      }
+      for (const target of targets) await removeExtras(liveNodes.get(String(target.current.id)));
+      return { ok: true, restored, conflicts, result: { importedCount: restored, conflicts } };
+    } catch (e) {
+      conflicts.push({ error: e.message });
+      return { ok: false, restored, conflicts, reason: e.message };
+    }
+  }
+  for (const [i, child] of (savedBucket.children || []).entries()) {
+    const existing = (currentBucket.children || []).find(n => n.title === child.title && n.url === child.url);
+    if (existing) continue;
+    try { await recreate(child, bucketId, i); }
+    catch (e) { conflicts.push({ title: child.title, error: e.message }); }
+  }
+  return { ok: conflicts.length === 0, restored, conflicts, result: { importedCount: restored, conflicts } };
 }
 
 // 清空三个系统根容器的内容。
@@ -173,6 +283,33 @@ function _treeToFlatList(tree) {
   return list;
 }
 
+// Identity is origin/account/file/local bucket; legacy unbound state is never inherited.
+async function ensureSyncRelationship(config, bucketId) {
+  const url = new URL(config.url);
+  const file = MiniSync.utils.joinWebDAVUrl(config.url, config.filename || DEFAULT_FILENAME);
+  const key = JSON.stringify([url.origin.toLowerCase(), String(config.username || ''), file, String(bucketId || '')]);
+  const data = await MiniSync.storage.getLocal(['sync_relationship_key', 'sync_relationship_states', STORAGE_KEYS.TOMBSTONES, STORAGE_KEYS.SNAPSHOTS, STORAGE_KEYS.CLOUD_LAST_MODIFIED]);
+  if (data.sync_relationship_key === key) return { changed: false, key };
+  const states = data.sync_relationship_states || {};
+  if (data.sync_relationship_key) {
+    states[data.sync_relationship_key] = {
+      tombstones: data[STORAGE_KEYS.TOMBSTONES] || [],
+      snapshots: data[STORAGE_KEYS.SNAPSHOTS] || {},
+      cloudLastModified: data[STORAGE_KEYS.CLOUD_LAST_MODIFIED] || 0
+    };
+  }
+  const next = states[key] || { tombstones: [], snapshots: {}, cloudLastModified: 0 };
+  await MiniSync.storage.setLocal({
+    sync_relationship_key: key, sync_relationship_states: states,
+    [STORAGE_KEYS.TOMBSTONES]: next.tombstones,
+    [STORAGE_KEYS.SNAPSHOTS]: next.snapshots,
+    [STORAGE_KEYS.CLOUD_LAST_MODIFIED]: next.cloudLastModified,
+    berry_pathkey_snapshot: [], via_pathkey_snapshot: [],
+    aira_pathkey_snapshot: [], aira_home_pathkey_snapshot: []
+  });
+  return { changed: true, key };
+}
+
 // 记录最近一次成功同步的时间戳 + 数量
 // mode=含文件夹的总数（历史字段 last_sync_mode），count=纯书签数（last_sync_count，
 // popup 轮询/在场两条路径统一用它展示，保证「挪走 popup 再开」与在场显示数量一致）
@@ -228,6 +365,7 @@ async function resolveSyncBucketSetting() {
       console.warn('[sync] 固化同步文件夹设置失败（本次仍按探测结果处理）:', e.message);
     }
   }
+  if (bucket) await MiniSync.storage.bindSyncStatusBucket(bucket.id);
   return {
     saved,
     bucket,
@@ -415,16 +553,26 @@ async function applyTombstoneDeletions(remoteData) {
   });
 
   const deletedIds = [];
+  const failedIds = [];
   for (const id of topIds) {
     const node = byId.get(String(id));
     try {
-      if (node && node.url) await chrome.bookmarks.remove(String(id));
-      else await chrome.bookmarks.removeTree(String(id));
+      await new Promise((resolve, reject) => {
+        chrome.bookmarks[node && node.url ? 'remove' : 'removeTree'](String(id), () => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else resolve();
+        });
+      });
       deletedIds.push(id);
     } catch (e) {
-      // 真实宿主在树已被外部改动时会抛「找不到节点」——不值得惊动用户
+      failedIds.push(id);
       console.warn(`[sync] 删除本地已删节点失败 "${(node && node.title) || id}": ${e.message}`);
     }
+  }
+  if (failedIds.length) {
+    const error = new Error(`${failedIds.length} 条本地书签删除失败`);
+    error.failedIds = failedIds;
+    throw error;
   }
 
   await MiniSync.storage.setLocal({ [STORAGE_KEYS.TOMBSTONES]: view.tombstones });
@@ -444,6 +592,7 @@ return {
   backupLocalTree,
   getLocalBackup,
   restoreLocalBackup,
+  ensureSyncRelationship,
   recordLastSync,
   resolveSyncBucketSetting,
   saveLocalSnapshot,

@@ -34,6 +34,16 @@ function buildMergeMessage(failedWrites, conflictSamples, crossZoneDiag, importR
   return notes.length > 0 ? `合并成功${tail}` : '合并成功';
 }
 
+function bookmarkWrite(method, ...args) {
+  return new Promise((resolve, reject) => {
+    chrome.bookmarks[method](...args, result => {
+      const error = chrome.runtime.lastError;
+      if (error) reject(new Error(error.message || String(error)));
+      else resolve(result);
+    });
+  });
+}
+
 function mergeSync(options) {
   // ★ 互斥队列：同 sync-orchestrator.js 的 upload/download（排队而非打断，
   //   避免「自动合并进行中 → 手动/下一次 alarm 强设 IDLE 后并发跑」互相覆盖云端数据）
@@ -88,8 +98,11 @@ async function doMergeSync(options) {
 
     if (!config.url) throw new Error('请先配置 WebDAV 信息');
 
-    const remoteContent = await MiniSync.webdav.getFile(config.url, config.username, config.password, config.filename);
-    const remoteData = remoteContent ? MiniSync.xbel.parseXbelFromString(remoteContent) : null;
+    const remoteVersion = await MiniSync.webdav.getFileVersion(config.url, config.username, config.password, config.filename);
+    const remoteContent = remoteVersion.content;
+    const remoteData = remoteContent !== null ? MiniSync.xbel.parseXbelFromString(remoteContent) : null;
+    if (remoteVersion.exists && !remoteData) throw new Error('XBEL 文件格式无效');
+    if (remoteVersion.exists && !MiniSync.webdav.isStrongETag(remoteVersion.etag)) throw new Error('云端缺少强 ETag，无法安全地合并写入');
 
     // ★ 云端已解析（parseXbelFromString 写入了它声明的容器名）之后才解析「同步文件夹」：
     //   桌面 Edge 只能靠那个声明认出「其他收藏夹/根目录」这层镜像就是自己的桶，
@@ -100,27 +113,12 @@ async function doMergeSync(options) {
       console.warn('[sync] 解析同步文件夹失败:', e.message);
     }
 
-    // 读取本机记录的「上次同步时云端文件的修改时间」。
-    // 同时用 WebDAV getFileInfo 获取服务器当前文件时间，与 CLOUD_LAST_MODIFIED 同一口径。
-    // 不直接用 XBEL metadata 里的 lastModified，因为它写入时用的是本机 Date.now()，和
-    // WebDAV 服务器 Last-Modified 头可能差几百毫秒，导致顺序冲突判断误判。
+    await MiniSync.syncInput.ensureSyncRelationship(config, mergeBucketInfo.id);
+    // The version belongs to the same GET body, never to a later HEAD.
+    const remoteLastModified = remoteVersion.lastModified || 0;
     const lastSeenData = await MiniSync.storage.getLocal([STORAGE_KEYS.CLOUD_LAST_MODIFIED]);
-    const localLastSeen = (lastSeenData && lastSeenData[STORAGE_KEYS.CLOUD_LAST_MODIFIED]) || 0;
-    // 顺序冲突判断容差：仅为吸收「putFile 返回的 lastModified 与后续 getFileInfo 的
-    // mtime」之间的秒级格式化偏差（同一文件的 mtime 本身不会变）。此前设 60s，导致
-    // 「一端合并回写后，另一端在 1 分钟内合并」时真实的云端新顺序被误判为「云端未更新」
-    // 而不覆盖（实测 51s 内必现），顺序传播失效。2s 足够吸收格式化偏差。
+    const localLastSeen = lastSeenData[STORAGE_KEYS.CLOUD_LAST_MODIFIED] || 0;
     const ORDER_TOLERANCE = 2000;
-    let remoteLastModified = 0;
-    try {
-      const fileInfo = await MiniSync.webdav.getFileInfo(config.url, config.username, config.password, config.filename);
-      remoteLastModified = (fileInfo && fileInfo.lastModified) || 0;
-    } catch (e) {
-      // 获取失败时保持 0（表示拿不到云端时间，保守保留本地顺序，不覆盖）。
-      // 注：不可用 XBEL metadata 里的 lastModified 退路——那是本机 Date.now() 写入的，
-      // 与 WebDAV 服务器时间口径不一致，会导致顺序冲突判断误判（详见 415 行注释）。
-      console.warn('[sync] 获取云端文件信息失败，顺序冲突将保守保留本地:', e.message);
-    }
 
     // C2 前置：快照差异检测（V1.0.3 的 locallyDeletedKeys 兜底机制）
     // 即使 onRemoved 监听因扩展重载/批量删除未触发，也能通过「上次快照 vs 当前本地树」
@@ -154,7 +152,7 @@ async function doMergeSync(options) {
     // 注意：云端写回必须放在落盘重排之后执行，否则会用重排前的旧本地顺序覆盖云端，
     // 把对端刚同步上来的新顺序抹掉（表现为「顺序又变回之前」）。
     let mergedTree = await MiniSync.syncInput.getChromeTree();
-    const needWriteBack = mergeResult.remoteUpdated;
+    let needWriteBack = mergeResult.requiresWriteBack || mergeResult.needWriteBack || mergeResult.remoteUpdated;
 
     // ===== 落盘（智能覆盖，与下载分支一致）：合并结果通过 xbelToJson 转成嵌套三区结构，
     //        用 DOWNLOAD_MODE + mergeIntoLocal 增量导入 + 删除本地独有，
@@ -169,8 +167,14 @@ async function doMergeSync(options) {
     // 落盘结果（importBookmarksFromData 的返回值），供最终统计展示实际增删。
     // 必须声明在 try 外：import 调用点在 try 内深层块，而 return 在 try/catch 之后读取它。
     let importResult = null;
+    let backupReady = false;
+    let mainCommitted = false;
+    let bridgeOutcome = { bridgeResults: {}, partial: false };
+    const bridgeReadFailures = [];
+    const bridgeSnapshotUpdates = {};
     try {
-      await MiniSync.syncInput.backupLocalTree();
+      backupReady = await MiniSync.syncInput.backupLocalTree();
+      if (!backupReady) throw new Error('本地备份失败，已停止合并以保护书签');
 
       // ===== 顺序冲突判断 =====
       // 仅有顺序变化（无新增/删除）时，唯一差异是节点 _index。此时需判断哪端顺序更新：
@@ -203,12 +207,7 @@ async function doMergeSync(options) {
         if (mergeResult.renameLocalNodes && mergeResult.renameLocalNodes.length > 0) {
           for (const rn of mergeResult.renameLocalNodes) {
             if (!rn || rn.id === undefined || rn.id === null) continue;
-            try {
-              // 直接改真实 chrome 节点：保 id、保子树，后续 re-read 自然带上新标题
-              chrome.bookmarks.update(String(rn.id), { title: rn.title || '' }, () => void chrome.runtime.lastError);
-            } catch (e) {
-              console.warn(`[sync] 本端改名失败 "${rn.title}" (${rn.id}): ${e.message}`);
-            }
+            await bookmarkWrite('update', String(rn.id), { title: rn.title || '' });
           }
         }
 
@@ -228,7 +227,7 @@ async function doMergeSync(options) {
           }
           const mPKs = MiniSync.xbelPath.computeJsonPathKeys(MiniSync.merger.chromeTreeToList(mergedTree));
           const updateSet = new Set(mergeResult.contentUpdatedIds.map(id => String(id)));
-          (function applyContentUpdate(node) {
+          await (async function applyContentUpdate(node) {
             if (!node) return;
             if (updateSet.has(String(node.id))) {
               const pk = mPKs.get(String(node.id));
@@ -239,12 +238,10 @@ async function doMergeSync(options) {
                 // ★ 同步更新真实 chrome 节点：import 的复用逻辑按 url+标题匹配，
                 //   标题被改的节点永远匹配不上（落到全局 URL 复用也不改标题），
                 //   不在此处直接 update，内容变更无法落盘（实测复现）。
-                try {
-                  chrome.bookmarks.update(String(node.id), { title: node.title }, () => void chrome.runtime.lastError);
-                } catch (_) { /* mock/异常环境忽略 */ }
+                await bookmarkWrite('update', String(node.id), { title: node.title });
               }
             }
-            if (node.children) for (const child of node.children) applyContentUpdate(child);
+            if (node.children) for (const child of node.children) await applyContentUpdate(child);
           })(mergedTree[0]);
         }
 
@@ -313,7 +310,7 @@ async function doMergeSync(options) {
               continue;
             }
             try {
-              await chrome.bookmarks.move(String(nodeId), { parentId: String(newParentId) });
+              await bookmarkWrite('move', String(nodeId), { parentId: String(newParentId) });
             } catch (e) {
               // move 失败不再降级删除（旧实现在这里 removeTree 再靠落盘重建，一旦重建
               // 失败就永久丢失）。保持原位，如实记诊断。
@@ -479,34 +476,39 @@ async function doMergeSync(options) {
         const viaOn = bridgeOpts.option_via_enabled === true;
         const airaOn = bridgeOpts.option_aira_enabled === true;
         let finalMergedData = mergedData;
-        // 桥接合并【必须传墓碑】。
-        // 桥接函数内部 tombstoneKeys 只用于「过滤桥接端新增节点」（命中墓碑的不注入），
-        // 从不删除本地节点——所以传墓碑是安全的。
-        // 若不传，用户在 Edge 删除的文件夹只要还在 Aira/Berry/Via 文件里，
-        // 就会被桥接重新注入落盘数据，表现为「删了又回来」。
-        if (berryOn) {
+        const bridgeDeletedIds = new Set();
+        const bridgeDeletedKeys = new Set();
+        async function readBridge(enabled, name, read, list) {
+          if (!enabled) return list;
           try {
-            finalMergedData = { ...finalMergedData, bookmarks: await MiniSync.berry.mergeBerryData(finalMergedData.bookmarks, false, tombstoneKeys) };
+            const changes = await read(list);
+            if (!changes || changes.complete !== true || !Array.isArray(changes.list)) {
+              bridgeReadFailures.push(`${name}: ${((changes && changes.errors) || ['读取不完整']).join('；')}`);
+              return list;
+            }
+            Object.assign(bridgeSnapshotUpdates, changes.snapshotUpdates || {});
+            for (const id of changes.deletedIds || []) bridgeDeletedIds.add(String(id));
+            for (const key of changes.deletedPathKeys || []) bridgeDeletedKeys.add(key);
+            return changes.list;
           } catch (e) {
-            console.warn('[sync] Berry 读入失败，跳过:', e.message);
+            bridgeReadFailures.push(`${name}: ${e.message}`);
+            return list;
           }
         }
-        if (viaOn) {
-          try {
-            const viaResult = await MiniSync.via.mergeViaData(finalMergedData.bookmarks, tombstoneKeys);
-            if (viaResult) finalMergedData = { ...finalMergedData, bookmarks: viaResult };
-          } catch (e) {
-            console.warn('[sync] Via 读入失败，跳过:', e.message);
-          }
-        }
-        if (airaOn) {
-          try {
-            // ★ 传拷贝：mergeAiraData 内部会向列表追加 home 节点，
-            //   若与 viaList 共享引用会把 Aira 数据污染进 Via 回写
-            finalMergedData = { ...finalMergedData, bookmarks: await MiniSync.aira.mergeAiraData([...(finalMergedData.bookmarks || [])], false, tombstoneKeys) };
-          } catch (e) {
-            console.warn('[sync] Aira 读入失败，跳过:', e.message);
-          }
+        finalMergedData = { ...finalMergedData, bookmarks: await readBridge(berryOn, 'Berry',
+          list => MiniSync.berry.mergeBerryDataWithChanges(list, false, tombstoneKeys), finalMergedData.bookmarks) };
+        finalMergedData = { ...finalMergedData, bookmarks: await readBridge(viaOn, 'Via',
+          list => MiniSync.via.mergeViaDataWithChanges(list, tombstoneKeys), finalMergedData.bookmarks) };
+        finalMergedData = { ...finalMergedData, bookmarks: await readBridge(airaOn, 'Aira',
+          list => MiniSync.aira.mergeAiraDataWithChanges([...list], false, tombstoneKeys), finalMergedData.bookmarks) };
+        if (bridgeDeletedIds.size || bridgeDeletedKeys.size) {
+          needWriteBack = true;
+          const keys = MiniSync.xbelPath.computeJsonPathKeys(finalMergedData.bookmarks);
+          finalMergedData.bookmarks = finalMergedData.bookmarks.filter(n =>
+            !bridgeDeletedIds.has(String(n.id)) && !bridgeDeletedKeys.has(keys.get(n.id)));
+          const currentTs = (await MiniSync.storage.getLocal([STORAGE_KEYS.TOMBSTONES]))[STORAGE_KEYS.TOMBSTONES] || [];
+          const updatedTs = MiniSync.tombstone.mergeTombstones(currentTs, bridgeDeletedKeys, null, await MiniSync.storage.getDeviceId());
+          await MiniSync.storage.setLocal({ [STORAGE_KEYS.TOMBSTONES]: updatedTs });
         }
 
         // 顺序说明：mergedData 的 _index 已由上方「顺序同步修复」按云端新旧决定
@@ -525,9 +527,18 @@ async function doMergeSync(options) {
           //   ① 重复注入（Berry处理完成日志出现多次，数量在 172/189/174 间摇摆）
           //   ② import 内部的 mergeBerryData 未传墓碑 → 已删节点复活
           //   ③ 每遍都覆盖 berry_pathkey_snapshot → 删除检测口径漂移
-          { mode: DOWNLOAD_MODE, mergeIntoLocal: true, mergeMode: true, deletedIds: mergeResult.localDeletedIds || [], skipBerryBridge: true, skipViaBridge: true,
-            targetParentId: mergeTargetId }
+          { mode: DOWNLOAD_MODE, mergeIntoLocal: true, mergeMode: true,
+            deletedIds: [...new Set([...(mergeResult.localDeletedIds || []), ...bridgeDeletedIds])],
+            skipBerryBridge: true, skipViaBridge: true, targetParentId: mergeTargetId }
         );
+
+        if (importResult && ((importResult.conflicts && importResult.conflicts.length) || importResult.moveFailed > 0 || crossZoneDiag.failed > 0)) {
+          const failures = (importResult.conflicts || []).length + (importResult.moveFailed || 0) + crossZoneDiag.failed;
+          const error = new Error(`${failures} 处本地写入或移动未完成，云端保持不变`);
+          error.conflicts = importResult.conflicts || [];
+          error.failureCount = failures;
+          throw error;
+        }
 
         // ===== 收养节点迁移 =====
         // 场景：A 把文件夹 C6 改名为 8888，B 在 C6 下新增了"新书签"。
@@ -567,18 +578,29 @@ async function doMergeSync(options) {
             for (const [id, pk] of pkMap) {
               if (pk === targetParentPk) { targetParentId = id; break; }
             }
-            if (!targetParentId) continue;
+            if (!targetParentId) {
+              crossZoneDiag.failed++;
+              crossZoneDiag.details.push({ adoptedId: adopted.id, error: '收养节点目标文件夹不存在' });
+              continue;
+            }
             // 用 Chrome API 移动/创建节点到新父下
             try {
               if (adopted.isFolder) {
-                await chrome.bookmarks.create({ parentId: targetParentId, title: adopted.title || '' });
+                await bookmarkWrite('create', { parentId: targetParentId, title: adopted.title || '' });
               } else if (adopted.url) {
-                await chrome.bookmarks.create({ parentId: targetParentId, title: adopted.title || '', url: adopted.url });
+                await bookmarkWrite('create', { parentId: targetParentId, title: adopted.title || '', url: adopted.url });
               }
             } catch (e) {
+              crossZoneDiag.failed++;
+              crossZoneDiag.details.push({ adoptedId: adopted.id, error: e.message });
               console.warn(`[sync] 收养节点迁移失败 "${adopted.title}": ${e.message}`);
             }
           }
+        }
+        if (crossZoneDiag.failed > 0) {
+          const error = new Error(`${crossZoneDiag.failed} 处本地移动或创建未完成，云端保持不变`);
+          error.failureCount = crossZoneDiag.failed;
+          throw error;
         }
 
         // C3（延后执行）：落盘重排之后，用「融合后的本地树」写回云端。
@@ -590,9 +612,8 @@ async function doMergeSync(options) {
           //   只写本机墓碑 = 把云端带来的墓碑整份冲掉，其他端从此再也学不到这次删除
           //   （实测：手机删的书签，桌面同步一轮后云端墓碑变 []，第三台设备复活它）。
           const localTs = await MiniSync.storage.getLocal(['sync_tombstones']);
-          const mergedTombstones = Array.isArray(mergeResult.tombstones)
-            ? mergeResult.tombstones
-            : (localTs.sync_tombstones || []);
+          const mergedTombstones = MiniSync.tombstone.mergeTombstoneSources(
+            Array.isArray(mergeResult.tombstones) ? mergeResult.tombstones : [], localTs.sync_tombstones || []);
           const snapshots = await MiniSync.storage.getLocal(['sync_snapshots']);
           const endpoints = await MiniSync.storage.getLocal(['sync_endpoints']);
           const myEndpoints = endpoints.sync_endpoints || {};
@@ -608,10 +629,17 @@ async function doMergeSync(options) {
             flatRootContainer: MiniSync.utils.getDeclaredFlatRootContainer() || undefined
           };
           const xbelString = MiniSync.xbel.chromeToXbel(finalTree, Object.assign({ syncBucketId: mergeBucketInfo.id }, meta));
-          const putResult = await MiniSync.webdav.putFile(config.url, config.username, config.password, config.filename, xbelString);
+          const putResult = await MiniSync.webdav.putFile(config.url, config.username, config.password, config.filename, xbelString, undefined,
+            remoteVersion.exists ? { etag: remoteVersion.etag } : { missing: true });
+          mainCommitted = true;
           // 用 WebDAV 服务器返回的 lastModified 更新本机记录，与上传/下载分支口径一致。
           const cloudTs = (putResult && typeof putResult.lastModified === 'number') ? putResult.lastModified : writeTs;
           await MiniSync.storage.setLocal({ [STORAGE_KEYS.CLOUD_LAST_MODIFIED]: cloudTs });
+        }
+        // Adapter reads only propose snapshots. Commit them after local import and
+        // the conditional main-file write, so a failed attempt can detect deletions again.
+        if (Object.keys(bridgeSnapshotUpdates).length) {
+          await MiniSync.storage.setLocal(bridgeSnapshotUpdates);
         }
       }
 
@@ -627,22 +655,24 @@ async function doMergeSync(options) {
         const berryOn2 = bridgeOpts2.option_berry_enabled === true;
         const viaOn2 = bridgeOpts2.option_via_enabled === true;
         const airaOn2 = bridgeOpts2.option_aira_enabled === true;
-        // 同样传墓碑：防止已删节点残留桥接文件，下次合并再次注入复活
-        const tsRaw2 = (await MiniSync.storage.getLocal([STORAGE_KEYS.TOMBSTONES]))[STORAGE_KEYS.TOMBSTONES] || [];
-        const tombstoneKeys2 = MiniSync.tombstone.extractKeys(tsRaw2);
-        const berryList = berryOn2
-          ? (await MiniSync.berry.mergeBerryData(mergedFlatList, false, tombstoneKeys2).catch(e => { console.warn('[sync] 合并时 Berry 读入失败，跳过:', e.message); return mergedFlatList; }))
-          : mergedFlatList;
-        const viaList = viaOn2
-          ? (await MiniSync.via.mergeViaData(mergedFlatList, tombstoneKeys2).catch(e => { console.warn('[sync] 合并时 Via 读入失败，跳过:', e.message); return mergedFlatList; }) || mergedFlatList)
-          : mergedFlatList;
-        const airaList = airaOn2
-          ? (await MiniSync.aira.mergeAiraData([...mergedFlatList], false, tombstoneKeys2).catch(e => { console.warn('[sync] 合并时 Aira 读入失败，跳过:', e.message); return mergedFlatList; }))
-          : mergedFlatList;
-        await MiniSync.bridgePatcher.patchBridges(
-          { berryList, viaList, airaList },
-          { berryOn: berryOn2, viaOn: viaOn2, airaOn: airaOn2 }
-        );
+        // Bridge read output is already incorporated before import. Patching the landed tree
+        // avoids a second read that could mutate adapter deletion snapshots or reintroduce nodes.
+        try {
+          bridgeOutcome = await MiniSync.bridgePatcher.patchBridges(
+            { berryList: mergedFlatList, viaList: mergedFlatList, airaList: mergedFlatList },
+            { berryOn: berryOn2, viaOn: viaOn2, airaOn: airaOn2 }
+          ) || bridgeOutcome;
+        } catch (e) {
+          bridgeOutcome = { bridgeResults: { unknown: { status: 'failed', error: e.message } }, partial: true };
+          console.warn('[sync] 主文件已提交，手机桥接写回失败:', e.message);
+        }
+        if (bridgeReadFailures.length) {
+          bridgeOutcome.partial = true;
+          for (const error of bridgeReadFailures) {
+            const name = error.split(':', 1)[0].toLowerCase();
+            bridgeOutcome.bridgeResults[name] = { status: 'failed', error };
+          }
+        }
       }
 
       // 统计：排除根容器，与上传/下载口径一致
@@ -651,8 +681,18 @@ async function doMergeSync(options) {
       mergedBookmarkCount = mrgDataList.filter(n => n.url).length;
       mergedFolderCount = mrgDataList.filter(n => !n.url).length;
     } catch (e) {
-      console.error('[sync] 合并后落盘失败，回滚备份:', e.message);
-      try { await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true }); } catch (re) { console.error('[sync] 回滚失败:', re.message); }
+      console.error('[sync] 合并后落盘失败:', e.message);
+      if (backupReady && !mainCommitted) {
+        try {
+          const recovery = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true, targetParentId: mergeBucketInfo.id });
+          if (!recovery.ok) console.error('[sync] 回滚未完成:', recovery.reason || recovery.conflicts);
+        } catch (re) { console.error('[sync] 回滚失败:', re.message); }
+      }
+      if (e.failureCount || e.conflicts) {
+        await MiniSync.storage.setSyncStatus({ status: FAILED, error: e.message });
+        return { success: false, partial: true, message: e.message,
+          conflictCount: e.failureCount || e.conflicts.length, conflicts: e.conflicts || [] };
+      }
       throw e;
     }
 
@@ -665,7 +705,9 @@ async function doMergeSync(options) {
       // 日志已迁移到 sync-actions.js 统一写入
     }
 
-    await MiniSync.storage.setSyncStatus({ status: SUCCESS });
+    await MiniSync.storage.setSyncStatus({ status: bridgeOutcome.partial ? 'partial' : SUCCESS,
+      partial: !!bridgeOutcome.partial, bridgeResults: bridgeOutcome.bridgeResults,
+      error: bridgeOutcome.partial ? '主文件已同步，手机桥接部分失败' : '' });
 
     // 同步成功后刷新本地快照（供删除监听回溯被删节点 pathKey）
     await MiniSync.syncInput.saveLocalSnapshot();
@@ -716,7 +758,9 @@ async function doMergeSync(options) {
     }
     return {
       success: true,
-      message: buildMergeMessage(failedWrites, conflictSamples, crossZoneDiag, importResult, remoteSpliced),
+      partial: !!bridgeOutcome.partial,
+      bridgeResults: bridgeOutcome.bridgeResults || {},
+      message: bridgeOutcome.partial ? buildMergeMessage(failedWrites, conflictSamples, crossZoneDiag, importResult, remoteSpliced) + '（主文件已同步，手机桥接部分失败）' : buildMergeMessage(failedWrites, conflictSamples, crossZoneDiag, importResult, remoteSpliced),
       stats: stats,
       importedCount: importResult ? importResult.importedCount : 0,
       removedCount: importResult ? importResult.removedCount : 0,

@@ -9,26 +9,30 @@ function getBerryList(berryData) {
   return null;
 }
 
+function validateBerryList(list) {
+  if (!Array.isArray(list)) throw new Error('Berry 文件格式无效');
+  const ids = new Set();
+  for (const node of list) {
+    if (!node || typeof node.id !== 'string' || !node.id || ids.has(node.id) ||
+        typeof node.title !== 'string' || typeof node.parentId !== 'string' ||
+        typeof node.isFolder !== 'boolean' || (!node.isFolder && typeof node.url !== 'string')) {
+      throw new Error('Berry 书签节点格式无效');
+    }
+    ids.add(node.id);
+  }
+}
+
 // ========== Berry 桥接：将变更 patch 进 bookmarks.json ==========
 // 以 Berry 数据为基底，只做节点增删，保留 Berry 的 favicon/color/customIcon
 // 关键：新增节点的 parentId 需要从 Chrome id 映射到 Berry id（通过 pathKey 桥接）
 async function patchBerryFile(mergedList) {
-  let berryData;
-  try {
-    berryData = await downloadBerryBookmarks();
-  } catch (e) {
-    console.warn('[sync] 🍓 Berry 桥接：下载失败，跳过', e.message);
-    return;
-  }
+  const berryData = await downloadBerryBookmarks();
   if (berryData && !getBerryList(berryData)) {
-    console.warn('[sync] 🍓 Berry 文件格式无法识别（无 data/bookmarks 数组），本轮按合并结果重建');
+    throw new Error('Berry 文件格式无法识别（无 data/bookmarks 数组）');
   }
-  // 文件不存在（或格式无法识别）时按空列表处理，走下方统一写回路径。
-  // ★ 不能在这里另起一段「创建新文件」的简化逻辑：早期该分支把 home 节点
-  //   （__home_folder__ 容器及其子节点）整批过滤掉，导致首次同步时桌面主页书签
-  //   永远写不进 Berry（要等第二轮走正常写回才补上）。home 现在是一等公民，
-  //   必须与正常写回完全同口径。
+  // 缺失文件才按空列表创建；损坏文件不能被空集合覆盖。
   const berryList = getBerryList(berryData) || [];
+  validateBerryList(berryList);
 
   // 建立 Berry 的 pathKey → 节点映射
   const berryPathKeys = computePathKeys(berryList);
@@ -168,25 +172,42 @@ async function patchBerryFile(mergedList) {
     timestamp: Date.now(),
     data: finalBerryList
   };
-  try {
-    await uploadBerryBookmarks(updatedBerryData);
-    console.log(`[sync] 🍓 Berry 回写完成: ${zoneSummary(finalBerryList)}`);
-  } catch (e) {
-    console.warn('[sync] 🍓 Berry 桥接：上传失败', e.message);
-  }
+  await uploadBerryBookmarks(updatedBerryData);
+  console.log(`[sync] 🍓 Berry 回写完成: ${zoneSummary(finalBerryList)}`);
+  return { status: 'success' };
 }
 
 // 从 Berry 文件读取变更并合并：继承图标 + 合并新增节点 + 决定顺序
 async function mergeBerryData(currentList, preferLocalOrder = false, tombstoneKeys = null) {
+  const result = await mergeBerryDataWithChanges(currentList, preferLocalOrder, tombstoneKeys);
+  if (result.complete && result.snapshotUpdates) await chrome.storage.local.set(result.snapshotUpdates);
+  return result.list;
+}
+
+async function mergeBerryDataWithChanges(currentList, preferLocalOrder = false, tombstoneKeys = null) {
   let berryData;
   try {
     berryData = await downloadBerryBookmarks();
   } catch (e) {
-    return currentList;
+    return { list: currentList, deletedIds: [], deletedPathKeys: [], complete: false, errors: [e.message] };
   }
+  if (berryData === null) return { list: currentList, deletedIds: [], deletedPathKeys: [], complete: false, errors: ['Berry 文件不存在'] };
   const berryList = getBerryList(berryData);
-  if (!berryList || berryList.length === 0) {
-    return currentList;
+  if (!berryList) return { list: currentList, deletedIds: [], deletedPathKeys: [], complete: false, errors: ['Berry 文件格式无效'] };
+  try { validateBerryList(berryList); } catch (e) {
+    return { list: currentList, deletedIds: [], deletedPathKeys: [], complete: false, errors: [e.message] };
+  }
+  const changes = { list: currentList, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] };
+  if (berryList.length === 0) {
+    const previous = (await chrome.storage.local.get(['berry_pathkey_snapshot'])).berry_pathkey_snapshot || [];
+    const paths = computePathKeys(currentList);
+    for (const n of currentList) {
+      const pk = paths.get(n.id);
+      if (pk && previous.includes(pk)) { changes.deletedIds.push(n.id); changes.deletedPathKeys.push(pk); }
+    }
+    changes.list = currentList.filter(n => !changes.deletedIds.includes(n.id));
+    changes.snapshotUpdates = { berry_pathkey_snapshot: [] };
+    return changes;
   }
 
   // 补 source：旧版可能没有，按 parentId 推断
@@ -299,6 +320,8 @@ async function mergeBerryData(currentList, preferLocalOrder = false, tombstoneKe
         }
         if (n.isFolder && n.title && berryFolderTitles.has(n.title)) return true;
         berryDeletedCount++;
+        changes.deletedIds.push(n.id);
+        changes.deletedPathKeys.push(pk);
         return false;
       }
       return true;
@@ -309,7 +332,7 @@ async function mergeBerryData(currentList, preferLocalOrder = false, tombstoneKe
   }
 
   // 保存 Berry pathKey 快照（用于下次检测删除）
-  await chrome.storage.local.set({ 'berry_pathkey_snapshot': [...berryPKSet] });
+  changes.snapshotUpdates = { berry_pathkey_snapshot: [...berryPKSet] };
 
   // 4. （已移除）原「Berry 主页权威过滤」：将不在 Berry 文件中的桌面 home 节点从合并列表移除。
   // 删除原因：Berry 的 bookmarks.json 本身不含 home 节点（主页数据在手机端自管），
@@ -344,7 +367,7 @@ async function mergeBerryData(currentList, preferLocalOrder = false, tombstoneKe
     const usedPKs = new Set();
     for (const bn of berryList) {
       const bpk = berryPathKeys.get(bn.id);
-      if (!bpk) continue;
+      if (!bpk || (tombstoneKeys && tombstoneKeys.has(bpk))) continue;
       // 找当前列表中对应的节点（已继承图标）
       const localNode = enrichedCurrent.find(n => currentPKs.get(n.id) === bpk);
       if (localNode) {
@@ -368,7 +391,7 @@ async function mergeBerryData(currentList, preferLocalOrder = false, tombstoneKe
     // Chrome 独有的追加末尾
     for (const n of enrichedCurrent) {
       const pk = currentPKs.get(n.id);
-      if (pk && !usedPKs.has(pk)) {
+      if (pk && !usedPKs.has(pk) && !(tombstoneKeys && tombstoneKeys.has(pk))) {
         result.push(n);
       }
     }
@@ -384,7 +407,8 @@ async function mergeBerryData(currentList, preferLocalOrder = false, tombstoneKe
       sibCounter.set(key, idx + 1);
     }
     console.log(`[sync] 🍓 Berry 处理完成: ${zoneSummary(result)}`);
-    return result;
+    changes.list = result;
+    return changes;
   } else {
     // Chrome 顺序：当前列表 + Berry 新增追加末尾
     const mappedBerryNew = berryNew.map(mapBerryParentId);
@@ -393,12 +417,14 @@ async function mergeBerryData(currentList, preferLocalOrder = false, tombstoneKe
     // 会把它们挪到同父最前）。已有节点的 _index 保持（本地序或云端覆盖序）。
     MiniSync.utils.fillMissingSiblingIndex(result);
     console.log(`[sync] 🍓 Berry 处理完成: ${zoneSummary(result)}`);
-    return result;
+    changes.list = result;
+    return changes;
   }
 }
 
 // 挂载到 MiniSync，供 sync-orchestrator 在合并阶段调用
 MiniSync.berry = {
   mergeBerryData,
+  mergeBerryDataWithChanges,
   patchBerryFile
 };

@@ -134,7 +134,8 @@ def check_markers(read_text):
     problems = []
     for rel, marks in MARKERS.items():
         try:
-            body = read_text(rel)
+            # Archive decoding preserves CRLF; text-mode staging reads normalize it.
+            body = read_text(rel).replace('\r\n', '\n')
         except Exception:
             problems.append('缺文件 %s' % rel)
             continue

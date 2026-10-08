@@ -164,7 +164,7 @@ chrome.runtime.onInstalled.addListener((details) => {
 //    chrome.bookmarks.onRemoved 是 undefined，裸调用会在【加载期】抛异常，
 //    导致后面的 onMessage 处理器注册不上 —— 表现是设置页「后台未响应」、
 //    弹窗按钮全无反应，比单纯「不能用」更难排查。
-if (HAS_BOOKMARKS_API && chrome.bookmarks.onRemoved && chrome.bookmarks.onMoved) {
+if (HAS_BOOKMARKS_API && chrome.bookmarks.onRemoved) {
 
 // 书签删除监听：将本地删除写入墓碑，使删除能传播到云端
 chrome.bookmarks.onRemoved.addListener((id, removeInfo) => {
@@ -173,6 +173,9 @@ chrome.bookmarks.onRemoved.addListener((id, removeInfo) => {
   );
 });
 
+}
+
+if (HAS_BOOKMARKS_API && chrome.bookmarks.onMoved) {
 // 书签移动监听：移动（同/跨文件夹）会使相关墓碑失效，及时清除防止误删。
 // 背景：① 部分浏览器（实测 Edge）对移动操作也会派发 onRemoved，「挪动的书签」
 //   被写入墓碑后，下一轮合并会按墓碑把它删除（表现为「挪动后书签消失」）；
@@ -188,19 +191,27 @@ chrome.bookmarks.onMoved.addListener((id, moveInfo) => {
     const snapData = await MiniSync.storage.getLocal([STORAGE_KEYS.SNAPSHOTS]);
     const prevTree = (snapData[STORAGE_KEYS.SNAPSHOTS] && snapData[STORAGE_KEYS.SNAPSHOTS].localTree) || [];
     const prevPKMap = prevTree.length > 0 ? MiniSync.xbelPath.computeJsonPathKeys(prevTree) : new Map();
-    const subIds = new Set();
-    (function collect(n) {
-      if (n) { subIds.add(String(n.id)); (n.children || []).forEach(collect); }
-    })(moveInfo && moveInfo.node);
+    const currentTree = await MiniSync.syncInput.getChromeTree();
+    const newTree = MiniSync.merger.chromeTreeToList(currentTree);
+    const subIds = new Set([String(id)]);
+    for (const list of [prevTree, newTree]) {
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const node of list) {
+          if (subIds.has(String(node.parentId)) && !subIds.has(String(node.id))) {
+            subIds.add(String(node.id));
+            changed = true;
+          }
+        }
+      }
+    }
     const affected = new Set();
     for (const [nid, pk] of prevPKMap) {
       if (subIds.has(String(nid))) affected.add(pk);
     }
 
-    // 2. 刷新快照到移动后，取该子树的新 pathKey（新位置历史上如有墓碑一并清除）
-    await MiniSync.orchestrator.saveLocalSnapshot();
-    const newData = await MiniSync.storage.getLocal([STORAGE_KEYS.SNAPSHOTS]);
-    const newTree = (newData[STORAGE_KEYS.SNAPSHOTS] && newData[STORAGE_KEYS.SNAPSHOTS].localTree) || [];
+    // 只观察移动后路径，不提交尚未成功同步的基线。
     if (newTree.length > 0) {
       const newPKMap = MiniSync.xbelPath.computeJsonPathKeys(newTree);
       for (const [nid, pk] of newPKMap) {
@@ -634,13 +645,13 @@ function onRuntimeMessage(message, sender, sendResponse) {
         try {
           bookmarkCount = { ok: true, count: await countLocalBookmarks() };
         } catch (e) {
-          bookmarkCount = { ok: false, error: (e && e.message) || String(e) };
+          bookmarkCount = { ok: false, code: HAS_BOOKMARKS_API ? 'BOOKMARKS_API_FAILED' : 'NO_BOOKMARKS_API', error: (e && e.message) || String(e) };
         }
         const cfg = await MiniSync.storage.getLocal(['webdav_url', 'sync_enabled']);
         const perm = cfg.webdav_url
           ? await MiniSync.utils.hasHostPermission(cfg.webdav_url)
           : { ok: true, skipped: true };
-        return {
+        return MiniSync.utils.sanitizeDiagnosticValue({
           ok: true,
           at: new Date().toISOString(),
           extensionId: chrome.runtime.id,
@@ -676,7 +687,7 @@ function onRuntimeMessage(message, sender, sendResponse) {
           syncEnabled: !!cfg.sync_enabled,
           permissionQuery: perm,       // 权限接口可用性（不可用会带超时原文）
           moduleErrors: _bgErrors.slice(-10)
-        };
+        });
       });
       return true;
 
@@ -812,7 +823,7 @@ function onRuntimeMessage(message, sender, sendResponse) {
     case 'restoreFromBackup':
       handleAsyncResponse(sendResponse, async () => {
         const restored = await MiniSync.orchestrator.restoreLocalBackup();
-        if (restored && restored.restored > 0) {
+        if (restored && restored.ok && restored.restored > 0 && !(restored.conflicts && restored.conflicts.length)) {
           return {
             ok: true,
             success: true,
@@ -820,7 +831,10 @@ function onRuntimeMessage(message, sender, sendResponse) {
             restored: restored.restored
           };
         }
-        return { ok: false, success: false, message: '没有可用的备份数据' };
+        return { ok: false, success: false,
+          message: restored && restored.restored > 0 ? '备份恢复未完成，已保留备份，请检查后重试' : '没有可用的备份数据',
+          restored: (restored && restored.restored) || 0,
+          conflicts: (restored && restored.conflicts) || [] };
       });
       return true;
 
@@ -1363,7 +1377,7 @@ async function startupRecovery() {
   }
   console.warn(`[MiniSync] 检测到本地书签为空，正在从备份恢复 ${backup.length} 条书签...`);
   const restored = await MiniSync.orchestrator.restoreLocalBackup();
-  if (restored && restored.restored > 0) {
+  if (restored && restored.ok && restored.restored > 0 && !(restored.conflicts && restored.conflicts.length)) {
     // 恢复成功后清理备份，避免下次启动重复恢复同一份数据
     await MiniSync.storage.removeLocal([STORAGE_KEYS.LOCAL_BACKUP]);
   }

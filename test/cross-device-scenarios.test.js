@@ -155,16 +155,29 @@ vm.runInThisContext(
   { filename: 'lib/import.js' }
 );
 const M = global.MiniSync;
+vm.runInThisContext(fs.readFileSync(path.join(ROOT, 'lib/webdav.js'), 'utf8'), { filename: 'lib/webdav.js' });
+const isStrongETag = M.webdav.isStrongETag;
 
 // 共享云端：双设备看到同一份 WebDAV 文件
 const CLOUD_FILE = 'minibookmarks.xbel'; // 与 getWebDAVConfig 的默认文件名一致
-const cloud = new Map(); // filename -> { content, lastModified }
+const cloud = new Map(); // filename -> { content, etag, lastModified }
 let cloudClock = 1000;
 M.webdav = {
+  isStrongETag,
+  getFileVersion: async (u, s, p, f) => (cloud.has(f)
+    ? { ...cloud.get(f), exists: true }
+    : { exists: false, content: null, etag: null, lastModified: 0 }),
   getFile: async (u, s, p, f) => (cloud.has(f) ? cloud.get(f).content : null),
-  putFile: async (u, s, p, f, content) => {
-    cloud.set(f, { content, lastModified: ++cloudClock });
-    return { lastModified: cloud.get(f).lastModified };
+  putFile: async (u, s, p, f, content, contentType, writeCondition) => {
+    const current = cloud.get(f);
+    if (!writeCondition || (writeCondition.missing ? !!current : !current || writeCondition.etag !== current.etag)) {
+      const error = new Error('云端文件已更改，请重新下载并合并后重试');
+      error.code = 'CLOUD_CONFLICT';
+      throw error;
+    }
+    const lastModified = ++cloudClock;
+    cloud.set(f, { content, etag: `"v${lastModified}"`, lastModified });
+    return { lastModified };
   },
   getFileInfo: async (u, s, p, f) => (cloud.has(f)
     ? { exists: true, lastModified: cloud.get(f).lastModified }
@@ -344,9 +357,10 @@ describe('跨端场景（真实 merge/import 引擎 + 双设备共享云端）',
     A.byId.delete('10');
     const putLog = [];
     const origPut = M.webdav.putFile;
-    M.webdav.putFile = async (u, s, p, f, c) => {
+    M.webdav.putFile = async (...args) => {
+      const c = args[4];
       putLog.push({ hasBaiduBookmark: c.includes('href="https://baidu.com"'), hasTs: c.includes('ROOT:bar/L:https://baidu.com') });
-      return origPut(u, s, p, f, c);
+      return origPut(...args);
     };
     const mrA = await M.mergeStrategy.mergeSync({});
     M.webdav.putFile = origPut;
@@ -493,8 +507,10 @@ describe('跨端场景（真实 merge/import 引擎 + 双设备共享云端）',
     ));
     const down = await M.orchestrator.downloadBookmarks({});
     expect(down.success).toBe(true);
-    // ★ A4 修复断言：全局 URL 复用的节点不得被 leftover 删除段清掉
-    expect(findUrl(B, 'https://dupe.com').length).toBe(1);
+    // Identical URLs under independent folders must not be silently moved or merged.
+    const copies = findUrl(B, 'https://dupe.com');
+    expect(copies).toHaveLength(2);
+    expect(copies.map(n => B.byId.get(n.parentId).title).sort()).toEqual(['P1', 'P2']);
   });
 
   test('S8 替换式回滚（A5 修复）：清空当前+按备份恢复，无重复', async () => {
@@ -540,6 +556,35 @@ describe('跨端场景（真实 merge/import 引擎 + 双设备共享云端）',
     const serverTs = cloud.get(CLOUD_FILE).lastModified;
     expect(seen.cloud_last_modified).toBe(serverTs);
   });
+
+  test('云端 GET 后版本变化时，条件合并不得覆盖另一设备的更新', async () => {
+    useDevice('A');
+    expect((await M.orchestrator.uploadBookmarks({})).success).toBe(true);
+    useDevice('B');
+    expect((await M.orchestrator.downloadBookmarks({})).success).toBe(true);
+    await new Promise((res) => chrome.bookmarks.create(
+      { parentId: '1', title: 'B 新增', url: 'https://b-only.example' }, res
+    ));
+    const originalGetVersion = M.webdav.getFileVersion;
+    let newer;
+    M.webdav.getFileVersion = async (...args) => {
+      const version = await originalGetVersion(...args);
+      const content = cloud.get(CLOUD_FILE).content.replace('href="https://baidu.com"',
+        'href="https://a-newer.example"');
+      const lastModified = ++cloudClock;
+      newer = { content, etag: `"v${lastModified}"`, lastModified };
+      cloud.set(CLOUD_FILE, newer);
+      return version;
+    };
+    let result;
+    try {
+      result = await M.mergeStrategy.mergeSync({});
+    } finally {
+      M.webdav.getFileVersion = originalGetVersion;
+    }
+    expect(result.success).toBe(false);
+    expect(cloud.get(CLOUD_FILE)).toEqual(newer);
+  });
 });
 
 
@@ -584,48 +629,43 @@ describe('下载写入的如实上报与「同步文件夹」落点（手机端�
     expect(flatTree(dst).filter(n => n.url === 'https://baidu.com').map(n => n.parentId)).toEqual(['1']);
   });
 
-  test('写入失败（create 抛错）：收进 conflicts，消息说「没能写入本地」，台账 ok:false', async () => {
+  test('写入失败（create 抛错）：下载失败、不推进成功基线，云端数据仍在', async () => {
     useDevice(src.name);
     await M.orchestrator.uploadBookmarks({});
+    const cloudBefore = cloud.get(CLOUD_FILE).content;
+    const etagBefore = cloud.get(CLOUD_FILE).etag;
     useDevice(dst.name);
-    // 模拟宿主拒绝落盘（历史真凶：create 的 parentId 在本机不存在）
     dst.chromeObj.bookmarks.create = () => { throw new Error('Parent bookmark folder does not exist'); };
 
     const down = await M.orchestrator.downloadBookmarks({});
-    // 本地未被改动 ⇒ 不触发回滚、状态机仍是成功；但结果绝不许再说「下载成功」
-    expect(down.success).toBe(true);
+    expect(down.success).toBe(false);
     expect(down.conflictCount).toBeGreaterThan(0);
-    expect(down.message).toContain('没能写入本地');
-    expect(down.message).not.toBe('下载成功');
-    expect(down.conflictSamples.length).toBeGreaterThan(0);
-    expect(down.conflictSamples[0]).toContain('Parent bookmark folder does not exist');
-    expect(flatTree(dst).filter(n => n.url).length).toBe(0);   // 一条都没落地
-
-    // 台账进了 storage.local：诊断报告不依赖消息通道也能读到
-    const led = dst.store.last_write_report;
-    expect(led).toBeTruthy();
-    expect(led.ok).toBe(false);
-    expect(led.failedWrites).toBe(down.conflictCount);
-    expect(led.importedCount).toBe(0);
-    expect(led.bucketId).toBe('1');
-    expect(led.rootChildTitles.map(c => c.title)).toEqual(['书签栏', '其他书签', '移动设备书签']);
+    expect(down.message).not.toContain('下载成功');
+    expect(down.conflicts.some(c => c.error.includes('Parent bookmark folder does not exist'))).toBe(true);
+    expect(flatTree(dst).filter(n => n.url).length).toBe(0);
+    expect(cloud.get(CLOUD_FILE).content).toBe(cloudBefore);
+    expect(cloud.get(CLOUD_FILE).etag).toBe(etagBefore);
+    expect(dst.store.last_sync_at).toBeUndefined();
+    expect(dst.store.sync_snapshots?.localTree).toBeUndefined();
+    expect(dst.store.cloud_last_modified || 0).toBe(0);
   });
 
-  test('合并同步同样不许把写入失败说成「合并成功」（合并是手机上更安全的那个按钮）', async () => {
+  test('合并落盘失败时返回失败，且不以残缺本地树覆盖云端', async () => {
     useDevice(src.name);
     await M.orchestrator.uploadBookmarks({});
+    const cloudBefore = cloud.get(CLOUD_FILE).content;
+    const etagBefore = cloud.get(CLOUD_FILE).etag;
     useDevice(dst.name);
     dst.chromeObj.bookmarks.create = () => { throw new Error('Parent bookmark folder does not exist'); };
 
     const mr = await M.mergeStrategy.mergeSync({});
-    expect(mr.success).toBe(true);
+    expect(mr.success).toBe(false);
     expect(mr.conflictCount).toBeGreaterThan(0);
-    expect(mr.message).toContain('没能写入本地');
-    expect(mr.message).not.toBe('合并成功');
-    const led = dst.store.last_write_report;
-    expect(led.via).toBe('merge');
-    expect(led.ok).toBe(false);
-    expect(led.failedWrites).toBe(mr.conflictCount);
+    expect(mr.message).toContain('云端保持不变');
+    expect(cloud.get(CLOUD_FILE).content).toBe(cloudBefore);
+    expect(cloud.get(CLOUD_FILE).etag).toBe(etagBefore);
+    expect(dst.store.last_sync_at).toBeUndefined();
+    expect(dst.store.sync_snapshots?.localTree).toBeUndefined();
     expect(flatTree(dst).filter(n => n.url).length).toBe(0);
   });
 
@@ -716,7 +756,7 @@ describe('下载写入的如实上报与「同步文件夹」落点（手机端�
     dst.tree.children = [];
     const down = await M.orchestrator.downloadBookmarks({});
     expect(down.success).toBe(false);
-    expect(down.message).toContain('找不到可写入的根文件夹');
+    expect(down.message).toContain('找不到同步文件夹');
   });
 });
 
@@ -1007,7 +1047,7 @@ describe('单同步桶：身份归一、桶外永不进出、增量增删', () =
   }
   function putLegacy(sections, props) {
     const { xml } = legacyCloudXbel(sections, props);
-    cloud.set(CLOUD_FILE, { content: xml, lastModified: new Date(2000) });
+    cloud.set(CLOUD_FILE, { content: xml, etag: '"legacy-2000"', lastModified: 2000 });
     cloudClock = 2000;
   }
 
@@ -1669,7 +1709,7 @@ describe('增量删减：上传 / 下载 / 合并三条路径都传播删除', (
     //   真实场景：删除发生在 4 天前，桌面这台一直没同步 ⇒ 两端看到的墓碑都是过期的。
     const cj = M.xbel.xbelToJson(cloud.get(CLOUD_FILE).content);
     cj.tombstones = cj.tombstones.map(t => (t.key === BAIDU_PK ? Object.assign({}, t, { deletedAt: OLD }) : t));
-    cloud.set(CLOUD_FILE, { content: M.xbel.jsonToXbel(cj), lastModified: ++cloudClock });
+    cloud.set(CLOUD_FILE, { content: M.xbel.jsonToXbel(cj), etag: `"v${++cloudClock}"`, lastModified: cloudClock });
     // 自证装置有效：云端确实带着一条 4 天前的墓碑（格式若变，这里先红，而不是测试悄悄变空）
     const aged = M.xbel.xbelToJson(cloud.get(CLOUD_FILE).content).tombstones.find(t => t.key === BAIDU_PK);
     expect(aged && aged.deletedAt).toBe(OLD);
@@ -1686,7 +1726,7 @@ describe('增量删减：上传 / 下载 / 合并三条路径都传播删除', (
     expect(data.tombstones.map(t => t.key)).toContain(BAIDU_PK);  // 墓碑保留（还要传给别的端）
   });
 
-  test('墓碑过期且两端都不再有该节点 ⇒ 允许回收（列表不会无限增长）', async () => {
+  test('墓碑过期且当前两端都没有节点，未知离线设备未确认时仍须保留', async () => {
     const { D } = await phoneDeletedBaidu();
     const OLD = Date.now() - 4 * 24 * 60 * 60 * 1000;
 
@@ -1696,9 +1736,9 @@ describe('增量删减：上传 / 下载 / 合并三条路径都传播删除', (
     const m = await M.mergeStrategy.mergeSync({});
     expect(m.success).toBe(true);
     const keys = (D.store.sync_tombstones || []).map(t => t.key);
-    expect(keys).not.toContain('ROOT:bar/L:https://gone.example');
+    expect(keys).toContain('ROOT:bar/L:https://gone.example');
     expect(M.xbel.xbelToJson(cloud.get(CLOUD_FILE).content).tombstones.map(t => t.key))
-      .not.toContain('ROOT:bar/L:https://gone.example');
+      .toContain('ROOT:bar/L:https://gone.example');
   });
 
   test('墓碑只作用于同步桶内：桶外节点即便路径撞上墓碑键也不被删、不上云', async () => {
@@ -2043,7 +2083,7 @@ describe('同步代价：顺序已一致时不得再动书签（手机卡顿的�
     // 让「云端比本机上次见到的更新」成立（真实时钟下这由 mtime 决定；
     // 测试装置的 cloudClock 只有千级，够不到 ORDER_TOLERANCE=2000 的判定门槛）
     const cur = cloud.get(CLOUD_FILE);
-    cloud.set(CLOUD_FILE, { content: cur.content, lastModified: 1e9 });
+    cloud.set(CLOUD_FILE, { content: cur.content, etag: `"v${++cloudClock}"`, lastModified: 1e9 });
 
     useDevice('COST2-PHONE');
     resetCalls(PH);

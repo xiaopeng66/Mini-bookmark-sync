@@ -239,7 +239,8 @@ describe('collectDiagnostics：逐项探测并保留原始报错', () => {
     expect(rep.backgroundPage.ok).toBe(true);
     expect(rep.backgroundPage.hasMiniSync).toBe(true);
     expect(rep.backgroundPage.selfCheck.bootStage).toBe('ready');
-    expect(rep.backgroundPage.bgErrors[0].message).toBe('boom');
+    expect(rep.backgroundPage.bgErrors[0]).toMatchObject({ kind: 'error', message: '[redacted error]' });
+    expect(JSON.stringify(rep)).not.toContain('boom');
   });
 
   test('getBackgroundPage 回空 → 明说后台页不存在（不是含糊的「未响应」）', async () => {
@@ -503,7 +504,7 @@ describe('传输带提速：幂等标签 / 记住坏管道 / 每条消息耗时�
 
 // 「下载显示成功但书签栏里没有」必须能分辨两种可能：写错节点 / 宿主没落盘。
 describe('书签树探针：同步到底写进了哪个节点', () => {
-  test('报出根节点下每个子节点的 id/标题/顺序/条数，并给出 import 的命中口径', async () => {
+  test('报出根节点下每个子节点的 id/顺序/条数，不暴露标题或 URL', async () => {
     makeChrome({
       bookmarks: {
         getTree: (cb) => cb([{ id: '0', title: '', children: [
@@ -517,7 +518,9 @@ describe('书签树探针：同步到底写进了哪个节点', () => {
     const rep = await U.collectDiagnostics({ messageTimeoutMs: 100 });
     expect(rep.bookmarkTreeProbe.ok).toBe(true);
     expect(rep.bookmarkTreeProbe.childCount).toBe(2);
-    expect(rep.bookmarkTreeProbe.children[0]).toMatchObject({ index: 0, id: '1', title: '书签栏', urlCount: 1 });
+    expect(rep.bookmarkTreeProbe.children[0]).toMatchObject({ index: 0, id: '1', urlCount: 1 });
+    expect(rep.bookmarkTreeProbe.children[0].title).toBeUndefined();
+    expect(JSON.stringify(rep)).not.toContain('https://a/');
     expect(rep.bookmarkTreeProbe.zoneByTitle).toEqual({ bar: '1', other: '2', mobile: null });
     expect(rep.bookmarkTreeProbe.zoneByPosition).toEqual({ first: '1', second: '2', third: null });
   });
@@ -587,7 +590,7 @@ describe('落盘台账：上次下载/合并到底写了什么', () => {
     expect(rep.downloadLedger.note).toContain('还没有下载/合并过');
   });
 
-  test('有写入失败 → 台账里能读到失败条数、原因、目标父节点与宿主根命名', async () => {
+  test('有写入失败 → 台账里保留失败条数与目标节点，不带书签样本及原始原因', async () => {
     makeChrome({
       bookmarks: { getTree: (cb) => cb([]) },
       sendMessage: () => Promise.resolve(undefined),
@@ -608,7 +611,9 @@ describe('落盘台账：上次下载/合并到底写了什么', () => {
     expect(rep.downloadLedger.report.bucketId).toBe('x1');
     expect(rep.downloadLedger.report.targets[0].byBucket).toBe(true);
     expect(rep.downloadLedger.note).toContain('244 条写入失败');
-    expect(rep.downloadLedger.note).toContain('Parent bookmark folder does not exist');
+    expect(rep.downloadLedger.report.conflictSamples).toBeUndefined();
+    expect(rep.downloadLedger.report.bucketTitle).toBeUndefined();
+    expect(JSON.stringify(rep)).not.toMatch(/百度|手机书签|Parent bookmark folder does not exist/);
   });
 
   test('合并写的台账带 via=merge，措辞要跟着变（不能一律说「下载」）', async () => {
@@ -880,7 +885,7 @@ describe('诊断：alarms 能力面 + 自动同步台账（不依赖消息通道
     expect(rep.autoSyncReport.note).toContain('从未触发过');
   });
 
-  test('校准报过错 → 台账里的原始报错必须带出来（不能只剩一个 action=error）', async () => {
+  test('校准报过错 → 台账保留错误类别，不暴露原始错误文本', async () => {
     makeChrome({
       bookmarks: { getTree: (cb) => cb([]) },
       sendMessage: () => Promise.resolve(undefined),
@@ -893,6 +898,7 @@ describe('诊断：alarms 能力面 + 自动同步台账（不依赖消息通道
     });
     const rep = await U.collectDiagnostics({ messageTimeoutMs: 100 });
     expect(rep.autoSyncReport.note).toContain('alarm.action=error');
-    expect(rep.autoSyncReport.note).toContain('宿主拒绝创建定时器');
+    expect(rep.autoSyncReport.report.alarm.lastError).toBe('[redacted error]');
+    expect(JSON.stringify(rep)).not.toContain('宿主拒绝创建定时器');
   });
 });

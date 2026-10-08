@@ -25,34 +25,12 @@ var esc = function (s) {
 };
 
 // ========== WebDAV 配置读取（统一入口，消除新旧格式兼容逻辑散落三处）==========
-// 兼容「新版嵌套 webdav_config」与「旧版扁平 webdav_url/user/password/bookmark_path」，
-// 并做一次性迁移：检测到旧格式且新格式缺失时，写入嵌套 webdav_config，删除扁平 key。
+// 共享配置解析负责扁平/嵌套一致性及旧默认文件名迁移。
 async function readWebDAVConfig() {
-  const data = await new Promise(resolve =>
-    chrome.storage.local.get(
-      ['webdav_config', 'webdav_url', 'webdav_user', 'webdav_password', 'webdav_bookmark_path'],
-      resolve
-    )
-  );
-  const wc = data.webdav_config || {};
-  const url = data.webdav_url || wc.url || '';
-  const user = data.webdav_user || wc.username || '';
-  const pass = data.webdav_password || wc.password || '';
-  const path = data.webdav_bookmark_path || (wc.filename ? wc.filename.replace(/\/[^/]+$/, '') : '') || '';
-
-  // 规范化：确保扁平 key（popup/background 直接读取的权威源）始终存在且与解析结果一致。
-  // 注意：绝不能 remove 扁平 key —— popup.js / background.js 的自动同步、删除合并、配置状态
-  // 等 9 处都直接读扁平 key，删除会导致自动同步与合并静默失效。
-  // 因此采用「双写」而非「删除迁移」：扁平缺失则补写，缺失嵌套则补写嵌套，二者并存。
-  const legacyMissing = !data.webdav_url || !data.webdav_user || !data.webdav_password || !data.webdav_bookmark_path;
-  if (legacyMissing || !data.webdav_config) {
-    const filename = path ? path + '/' + PLUGIN_FILE : PLUGIN_FILE;
-    const patch = { webdav_url: url, webdav_user: user, webdav_password: pass, webdav_bookmark_path: path };
-    if (!data.webdav_config) patch.webdav_config = { url, username: user, password: pass, filename };
-    await chrome.storage.local.set(patch);
-  }
-
-  return { url, user, pass, path, configured: !!(url && user) };
+  const config = await MiniSync.utils.getWebDAVConfig();
+  const filename = config.filename || PLUGIN_FILE;
+  const path = filename.includes('/') ? filename.slice(0, filename.lastIndexOf('/')) : '';
+  return { url: config.url, user: config.username, pass: config.password, filename, path, configured: !!(config.url && config.username) };
 }
 
 // ========== 配置 Keys ==========
@@ -273,7 +251,7 @@ async function loadPage() {
   ]);
 
   // --- WebDAV 配置（统一入口，兼容新旧格式并自动迁移）---
-  const { url: webdavUrl, user: webdavUser, pass: webdavPass, configured } = await readWebDAVConfig();
+  const { url: webdavUrl, user: webdavUser, pass: webdavPass, path: webdavPath, configured } = await readWebDAVConfig();
   setText('webdavType', webdavUrl || '未配置');
   setText('accountInfo', webdavUser || '未配置');
   // 设备 ID：不存在时主动生成
@@ -337,7 +315,7 @@ async function loadPage() {
   // 填充桌面端云端文件夹路径
   const chromeFolderEl = document.getElementById('chromeFolder');
   if (chromeFolderEl) {
-    chromeFolderEl.textContent = r.webdav_bookmark_path || '/minibookmark';
+    chromeFolderEl.textContent = webdavPath || '/minibookmark';
   }
   // Berry/Via/Aira 文件夹路径由各自的 checkXFile 统一设置（含默认路径写回）
 
@@ -504,7 +482,7 @@ document.getElementById('diagBtn')?.addEventListener('click', async () => {
     report.pageSide = { note: '以上为设置页自身探测；backgroundSelfCheck 为后台自述' };
     out.textContent = JSON.stringify(report, null, 2);
   } catch (e) {
-    out.textContent = '诊断本身出错：' + ((e && e.message) || e);
+    out.textContent = '诊断本身出错：' + MiniSync.utils.diagnosticErrorText(e);
   } finally {
     btn.disabled = false;
     if (copyBtn) copyBtn.disabled = !out.textContent.trim();
@@ -536,20 +514,18 @@ document.getElementById('grantPermBtn')?.addEventListener('click', async () => {
 async function checkCloudStatus(force) {
   const el = document.getElementById('cloudStatus');
   if (!el) return;
-  const cfg = await chrome.storage.local.get(['webdav_bookmark_path']);
-  if (!cfg.webdav_bookmark_path) {
+  const { path, filename } = await readWebDAVConfig();
+  if (!path) {
     el.classList.remove('on');
     el.innerHTML = '<span class="dot"></span>未配置';
     return;
   }
-  let path;
-  try { path = normalizeBookmarkPath(cfg.webdav_bookmark_path); } catch (e) { return; }
-  if (!path) return;
+  const file = filename.slice(filename.lastIndexOf('/') + 1);
 
   try {
     const result = await cachedProbe(
-      'cloud:' + path, force,
-      () => chrome.runtime.sendMessage({ action: 'checkFileExists', path, file: PLUGIN_FILE }),
+      'cloud:' + filename, force,
+      () => chrome.runtime.sendMessage({ action: 'checkFileExists', path, file }),
       (r) => r && r.busy
     );
     if (result && result.busy) { el.classList.remove('on'); el.innerHTML = '<span class="dot"></span>同步中'; return; }
@@ -654,14 +630,16 @@ async function checkAiraFile(force) {
   }
 
   // 主页文件 personalization：aira/g2/personalization（与 aira-adapter.getAiraPersonalizationPath 同算法）
-  const segs = path.split('/');
-  const root = segs[0] || 'aira';
-  const persPath = root + '/g2/personalization';
+  const segs = path.split('/').filter(Boolean);
+  const root = segs.length >= 3 && segs[segs.length - 2] === 'g3' && segs[segs.length - 1] === 'bookmarks'
+    ? segs.slice(0, -2).join('/') || 'aira'
+    : segs[0] || 'aira';
+  const persPath = (path.startsWith('/') ? '/' : '') + root + '/g2/personalization';
 
   const setAiraDisabled = (disabled) => {
     if (!sw) return;
-    if (disabled) { sw.classList.add('disabled'); sw.classList.remove('on'); }
-    else { sw.classList.remove('disabled'); }
+    if (disabled) sw.classList.add('disabled');
+    else sw.classList.remove('disabled');
   };
 
   try {
@@ -678,8 +656,8 @@ async function checkAiraFile(force) {
         (r) => r && r.busy
       )
     ]);
-    // ★ 同步进行中：跳过全部状态更新（尤其不能走「失败 → 强制关闭 Aira 开关」分支）
-    if (result && result.busy) {
+    // 同步进行中时，保留开关意图，稍后重新探测。
+    if ((result && result.busy) || (persResult && persResult.busy)) {
       tag.classList.remove('on');
       tag.innerHTML = '<span class="dot"></span>同步中';
       persTag.classList.remove('on');
@@ -694,7 +672,7 @@ async function checkAiraFile(force) {
       tag.classList.add('on');
       tag.innerHTML = '<span class="dot"></span>正常';
       if (pathEl) pathEl.textContent = path;
-      if (persPathEl) persPathEl.textContent = '/' + persPath;
+      if (persPathEl) persPathEl.textContent = persPath;
     } else if (result && !result.folderExists) {
       tag.classList.remove('on');
       tag.innerHTML = '<span class="dot"></span>文件夹不存在';
@@ -713,20 +691,14 @@ async function checkAiraFile(force) {
       persTag.innerHTML = '<span class="dot"></span>待初始化（请先在移动端同步一次 Aira 书签）';
     }
 
-    // 两个文件都正常才允许启用，否则强制关闭并禁用
-    if (bookmarksOk && persOk) {
-      setAiraDisabled(false);
-    } else {
-      setAiraDisabled(true);
-      await chrome.storage.local.set({ option_aira_enabled: false });
-    }
+    // 可用性只控制是否可点击；不能覆盖用户已保存的启用偏好。
+    setAiraDisabled(!(bookmarksOk && persOk));
   } catch (e) {
     tag.classList.remove('on');
     tag.innerHTML = '<span class="dot"></span>检测失败';
     persTag.classList.remove('on');
     persTag.innerHTML = '<span class="dot"></span>检测失败';
     setAiraDisabled(true);
-    await chrome.storage.local.set({ option_aira_enabled: false });
   }
 }
 
@@ -949,7 +921,19 @@ function initFolderPicker(opts) {
       btn.textContent = '修改';
       btn.classList.remove('save');
 
-      if (val) {
+      if (storageKey === 'webdav_bookmark_path') {
+        const current = await MiniSync.utils.getWebDAVConfig();
+        const filename = current.filename.slice(current.filename.lastIndexOf('/') + 1) || PLUGIN_FILE;
+        const folder = val ? normalizeBookmarkPath(val) : '';
+        await chrome.storage.local.set({
+          webdav_bookmark_path: folder,
+          webdav_config: {
+            url: current.url, username: current.username, password: current.password,
+            filename: folder ? folder + '/' + filename : filename
+          }
+        });
+        pathEl.textContent = folder || defaultPath;
+      } else if (val) {
         pathEl.textContent = val;
         await chrome.storage.local.set({ [storageKey]: val });
       } else {
@@ -1149,16 +1133,29 @@ document.getElementById('importConfigFile')?.addEventListener('change', async (e
     setBackupResult('导入失败：' + parsed.error, 'err');
     return;
   }
-  // 覆盖前把要写的东西逐项摆给用户看（导入是覆盖操作，不能悄悄进行）
+  const current = await chrome.storage.local.get(
+    ['webdav_config', 'webdav_url', 'webdav_user', 'webdav_password', 'webdav_bookmark_path', 'sync_enabled']
+  );
+  let prepared;
+  try { prepared = MiniSync.utils.prepareConfigImport(parsed.config, current); }
+  catch (err) {
+    setBackupResult('导入失败：' + ((err && err.message) || err), 'err');
+    return;
+  }
   const keys = Object.keys(parsed.config);
   const preview = keys.map(k => '· ' + k).join('\n');
+  const target = prepared.preview;
+  const targetPreview = '\n\n当前目标：' + target.before.url + ' / ' + target.before.filename + '（账户：' + (target.before.account || '未设置') + '）' +
+    '\n导入后目标：' + target.after.url + ' / ' + target.after.filename + '（账户：' + (target.after.account || '未设置') + '）' +
+    (prepared.identityChanged ? '\n目标或账户变更：备份中未提供的凭据/密码将清空。' : '') +
+    (prepared.targetChanged ? '\n自动同步将暂停，检查目标和凭据后请手动启用。' : '');
   const droppedNote = (parsed.dropped && parsed.dropped.length)
     ? '\n\n已忽略 ' + parsed.dropped.length + ' 项不认识的设置：' + parsed.dropped.join('、')
     : '';
   const ok = window.confirm(
     '导入这份配置？\n\n' +
     '来自：v' + (parsed.meta.manifestVersion || '?') + '（导出于 ' + (parsed.meta.exportedAt || '未知时间') + '）\n' +
-    '将覆盖本机以下 ' + keys.length + ' 项配置：\n' + preview + droppedNote +
+    '将覆盖本机以下 ' + keys.length + ' 项配置：\n' + preview + targetPreview + droppedNote +
     '\n\n书签数据和本机设备身份不受影响。'
   );
   if (!ok) {
@@ -1166,20 +1163,7 @@ document.getElementById('importConfigFile')?.addEventListener('change', async (e
     return;
   }
   try {
-    await chrome.storage.local.set(parsed.config);
-    // 扁平配置变了，把「嵌套格式」的副本按最终值重建（有两个读取方在读它，不能留旧的）
-    const final = await chrome.storage.local.get(
-      ['webdav_url', 'webdav_user', 'webdav_password', 'webdav_bookmark_path']
-    );
-    const bp = final.webdav_bookmark_path || '';
-    await chrome.storage.local.set({
-      webdav_config: {
-        url: final.webdav_url || '',
-        username: final.webdav_user || '',
-        password: final.webdav_password || '',
-        filename: bp ? bp + '/' + PLUGIN_FILE : PLUGIN_FILE
-      }
-    });
+    await chrome.storage.local.set(prepared.patch);
     // 自动同步开关/间隔可能变了 ⇒ 让后台重建定时器
     chrome.runtime.sendMessage({ action: 'updateSyncInterval' }).catch(() => {});
     setBackupResult('导入成功，正在刷新页面…', 'ok');

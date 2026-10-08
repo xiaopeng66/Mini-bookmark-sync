@@ -3,29 +3,34 @@
 
 MiniSync.storage = (function() {
 
+let pendingSyncStatusConfig = null;
+
 /** 从 storage.local 批量读取 */
 async function getLocal(keys) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     chrome.storage.local.get(keys, (result) => {
-      resolve(result || {});
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(result || {});
     });
   });
 }
 
 /** 写入 storage.local */
 async function setLocal(data) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     chrome.storage.local.set(data, () => {
-      resolve();
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve();
     });
   });
 }
 
 /** 删除 storage.local 中的指定 keys */
 async function removeLocal(keys) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     chrome.storage.local.remove(keys, () => {
-      resolve();
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve();
     });
   });
 }
@@ -55,16 +60,12 @@ async function setWebdavConfig(config) {
 
 /** 获取设备 ID（不存在则自动生成） */
 async function getDeviceId() {
-  const data = await getLocal(['sync_device_id']);
-  if (data.sync_device_id) return data.sync_device_id;
-  const id = await generateDeviceId();
-  await setLocal({ sync_device_id: id });
-  return id;
+  return MiniSync.utils.generateDeviceId();
 }
 
 /** 读取同步状态（SYNCING 超过 5 分钟自动释放） */
 async function getSyncStatus() {
-  const data = await getLocal(['sync_status', 'last_sync_time', 'sync_error', 'sync_action']);
+  const data = await getLocal(['sync_status', 'last_sync_time', 'sync_error', 'sync_action', 'sync_partial', 'sync_bridge_results']);
   let status = data.sync_status || IDLE;
 
   // SYNCING 超时自动释放（5分钟）
@@ -81,19 +82,40 @@ async function getSyncStatus() {
     status: status,
     lastSyncTime: data.last_sync_time || null,
     error: data.sync_error || '',
+    partial: !!data.sync_partial,
+    bridgeResults: data.sync_bridge_results || {},
     // 任务类型（upload/download/merge）：前端据此显示「XX进行中」
     action: data.sync_action || ''
   };
+}
+
+/** Bind once after cloud metadata has selected the task's actual bucket. */
+async function bindSyncStatusBucket(bucketId) {
+  const config = pendingSyncStatusConfig;
+  if (!config || !bucketId) return;
+  const key = await MiniSync.utils.syncStatusConfigKey({ ...config, bookmark_target_id: String(bucketId) });
+  await setLocal({ sync_status_config_key: key });
+  if (pendingSyncStatusConfig === config) pendingSyncStatusConfig = null;
 }
 
 /** 写入同步状态 */
 async function setSyncStatus(status) {
   const update = { sync_status: status.status };
   if (status.error !== undefined) update.sync_error = status.error;
+  if (status.partial !== undefined) update.sync_partial = !!status.partial;
+  else if (status.status === SYNCING) update.sync_partial = false;
+  if (status.bridgeResults !== undefined) update.sync_bridge_results = status.bridgeResults;
+  else if (status.status === SYNCING) update.sync_bridge_results = {};
   if (status.action !== undefined) update.sync_action = status.action;
-  if (status.status === SYNCING) update.last_sync_time = Date.now();
-  else if (status.status === SUCCESS) update.last_sync_time = Date.now();
+  let config = null;
+  if (status.status === SYNCING) {
+    config = await getLocal(['webdav_config', 'webdav_url', 'webdav_user', 'webdav_password',
+      'webdav_bookmark_path', 'bookmark_target_id']);
+    update.sync_status_config_key = await MiniSync.utils.syncStatusConfigKey(config);
+    update.last_sync_time = Date.now();
+  } else if (status.status === SUCCESS) update.last_sync_time = Date.now();
   await setLocal(update);
+  pendingSyncStatusConfig = config;
 }
 
 return {
@@ -104,7 +126,8 @@ return {
   setWebdavConfig,
   getDeviceId,
   getSyncStatus,
-  setSyncStatus
+  setSyncStatus,
+  bindSyncStatusBucket
 };
 
 })();

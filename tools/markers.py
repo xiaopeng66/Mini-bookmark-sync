@@ -252,8 +252,13 @@ MARKERS = {
         'mergedTombstones',
         'renameLocalNodes',
         '顺序没落到位',
-        'mergeViaData(finalMergedData.bookmarks, tombstoneKeys)',
-        'mergeViaData(mergedFlatList, tombstoneKeys2)',
+        # 桥接读入必须返回完整变更计划；仅在本地导入和主文件条件写入成功后提交快照。
+        # 不再二次读 Via：旧的 mergeViaData 包装会提前写入删除基线并可能复活节点。
+        'changes.complete !== true || !Array.isArray(changes.list)',
+        'MiniSync.via.mergeViaDataWithChanges(list, tombstoneKeys)',
+        'Object.assign(bridgeSnapshotUpdates, changes.snapshotUpdates || {})',
+        'await MiniSync.storage.setLocal(bridgeSnapshotUpdates);',
+        '!mergeViaData(mergedFlatList',
         # 本轮重排的真实代价落进台账（手机 console 读不到，台账是唯一证据）
         'movesAttempted',
         'movesSkippedParents',
@@ -313,7 +318,9 @@ MARKERS = {
         'cleanFakeTombstones',
         'mergeTombstoneSources',
         'prevSnapshotList',
-        '允许遗忘',
+        # 没有全设备确认协议，不得按 TTL 或两端当前缺席回收有效墓碑。
+        'return tombstones.filter(item => typeof item ===',
+        '!Date.now() - item.deletedAt',
     ],
     'core/sync-input.js': [
         'applyTombstoneDeletions',

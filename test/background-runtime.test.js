@@ -277,7 +277,8 @@ describe('后台探针与自述诊断', () => {
     expect(resp.ok).toBe(true);
     expect(resp.hasBookmarksApi).toBe(false);
     expect(resp.bookmarkCount.ok).toBe(false);
-    expect(resp.bookmarkCount.error).toContain('NO_BOOKMARKS_API');
+    expect(resp.bookmarkCount.code).toBe('NO_BOOKMARKS_API');
+    expect(resp.bookmarkCount.error).toBe('[redacted error]');
     expect(resp.globals.bookmarks).toBe('undefined');
   });
 

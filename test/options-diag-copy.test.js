@@ -72,6 +72,10 @@ function makeHarness({ clipboard, execResult = true, diagnose } = {}) {
     MiniSync: { utils: { collectDiagnostics: diagnose || (async () => ({ ok: true })) } },
   };
   vm.createContext(ctx);
+  for (const file of ['lib/constants.js', 'lib/utils.js']) {
+    vm.runInContext(fs.readFileSync(path.join(__dirname, '..', file), 'utf8'), ctx, { filename: file });
+  }
+  ctx.MiniSync.utils.collectDiagnostics = diagnose || (async () => ({ ok: true }));
   vm.runInContext(DIAG_CODE, ctx, { filename: 'options.js#diag' });
   return { els, el, created, calls };
 }
@@ -161,15 +165,16 @@ describe('设置页：一键复制诊断报告', () => {
     expect(hint.textContent).toContain('长按');
   });
 
-  test('诊断出错也允许复制（报错文本本身就是给开发者看的）', async () => {
+  test('诊断出错仍可复制安全的错误类别，不复制原始错误文本', async () => {
     const h = makeHarness({ clipboard: { writeText: (t) => { h.calls.writeText.push(t); return Promise.resolve(); } },
-                            diagnose: () => { throw new Error('宿主不给力'); } });
+                            diagnose: () => { throw new Error('GET https://u:pw@dav.invalid/?token=secret#frag failed'); } });
     await clickDiag(h);
     await flush();
-    expect(h.el('diagOut').textContent).toContain('宿主不给力');
+    expect(h.el('diagOut').textContent).toContain('诊断本身出错');
+    expect(h.el('diagOut').textContent).not.toMatch(/u:pw|token=secret|#frag|failed/);
     expect(h.el('diagCopyBtn').disabled).toBe(false);
     await clickCopy(h);
     await flush();
-    expect(h.calls.writeText[0]).toContain('宿主不给力');
+    expect(h.calls.writeText[0]).toBe(h.el('diagOut').textContent);
   });
 });

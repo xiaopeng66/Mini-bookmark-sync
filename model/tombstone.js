@@ -4,40 +4,20 @@
 MiniSync.tombstone = (function() {
 
 /**
- * 清理过期墓碑（TTL 3 天）。
+ * 保留墓碑，直到所有设备明确确认删除。
  *
- * ★ TTL 的语义是「多久之后**允许遗忘**」，不是「多久之后删除失效」。
- *   过期墓碑只有在下述条件成立时才允许丢弃：该 pathKey 在**本地树与云端都不存在**
- *   （两端都已收敛，墓碑已经没有用武之地）。若某一端仍留着这个节点，说明这条删除
- *   还没传到位，丢掉它那端就会把节点当「本地独有」重新推上云端 —— 实测复现：
- *   手机 3 天前删掉的书签，桌面合并时被判为「本地新增」复活并写回云端。
- *   旧实现无条件按时间丢弃，等于给「删了又回来」留了一条时间隧道。
+ * A TTL alone cannot prove every device has observed a deletion. Keep valid
+ * tombstones until explicit acknowledgment from every registered device exists.
+ * This module has no device registry or acknowledgment protocol yet, so it
+ * conservatively retains them (except malformed entries).
  *
  * @param {Array} tombstones
  * @param {number} [ttlMs]
  * @param {{localPKSet?:Set<string>, remotePKSet?:Set<string>}} [ctx]
- *   两端现存节点的 pathKey 集合（由 buildTombstoneView 提供）。传了才启用
- *   「仍有节点存活则保留」；不传＝旧行为（纯按时间丢弃），仅供不掌握两端视图的调用方。
  */
 function cleanExpired(tombstones, ttlMs, ctx) {
-  if (ttlMs == null) ttlMs = TOMBSTONE_TTL_MS;
-  if (!tombstones || !Array.isArray(tombstones)) return [];
-  const now = Date.now();
-  const localPKSet = ctx ? ctx.localPKSet : null;
-  const remotePKSet = ctx ? ctx.remotePKSet : null;
-  if (!localPKSet && !remotePKSet) {
-    return tombstones.filter(item => {
-      const delAt = (typeof item === 'string') ? 0 : (item.deletedAt || 0);
-      return (now - delAt) < ttlMs;
-    });
-  }
-  return tombstones.filter(item => {
-    const delAt = (typeof item === 'string') ? 0 : (item.deletedAt || 0);
-    if ((now - delAt) < ttlMs) return true;
-    const pk = typeof item === 'string' ? item : (item && item.key ? item.key : null);
-    if (!pk) return false;
-    return !!((localPKSet && localPKSet.has(pk)) || (remotePKSet && remotePKSet.has(pk)));
-  });
+  if (!Array.isArray(tombstones)) return [];
+  return tombstones.filter(item => typeof item === 'string' ? !!item : !!(item && item.key));
 }
 
 /** 提取墓碑 key 集合（支持 string 和 object 两种格式） */
@@ -62,9 +42,7 @@ function mergeTombstones(existing, newlyDeleted, readdedPKs, deviceId) {
       if (!pk) continue;
       // 如果被重新加回来，跳过
       if (readdedPKs && readdedPKs.has(pk)) continue;
-      // ★ 此处**不做**时间过期回收：本函数被 onRemoved/快照兜底等「只看得到本端」的
-      //   调用方使用，它们无从判断对端是否还留着该节点，丢掉墓碑就可能让节点复活。
-      //   过期回收统一交给 cleanExpired（同步时能同时看到两端，见其注释）。
+      // 没有全设备确认协议，不做时间过期回收；否则离线端可能使节点复活。
       if (typeof item === 'string') {
         finalTombstones.push({ key: pk, deletedAt: now, deviceId: deviceId || '' });
       } else {
@@ -113,9 +91,7 @@ function mergeTombstoneSources(local, remote) {
  *  @param {Array} [prevSnapshotList] 上次成功同步时的本地扁平树（sync_snapshots.localTree）。
  *    用于把「本端在上一轮同步之后新建/挪回来的节点」从「对端已删、本端还没删的残留」里分出来：
  *    墓碑命中一个**当前存在、但上次快照里没有**的 pathKey ⇒ 是本端的新动作（用户意图），
- *    墓碑作废。**少了这一条，两道保护会互相锁死**：墓碑因「节点还在」被 TTL 永久保留
- *    （cleanExpired 的新判据），而被删的书签又是用户刚加回来的 —— 结果是这个路径被永久
- *    拉黑，删一次就再也加不回来。判据用快照而不是时间戳，避免跨端时钟比较。
+ *    墓碑作废，否则新建/挪回的书签会被旧墓碑持续挡住。
  */
 function cleanFakeTombstones(tombstones, currentTree, myDeviceId, prevSnapshotList) {
   if (!tombstones || !Array.isArray(tombstones) || !currentTree || !Array.isArray(currentTree)) return tombstones;
@@ -149,10 +125,10 @@ function cleanFakeTombstones(tombstones, currentTree, myDeviceId, prevSnapshotLi
  *
  * 视图的含义（顺序与历史实现逐条对齐，改动等于改变删除语义）：
  *   ① 本地 ∪ 云端墓碑，同 key 取 deletedAt 较新者（时间戳更深者代表更新的删除意图）
- *   ② 过期回收：仅当该 pathKey 在两端都不存在时才丢（见 cleanExpired）
+ *   ② 墓碑不按时间或当前两端可见性回收，等待全设备确认机制
  *   ③ 假墓碑清理：本端产生、但节点仍在本地树里的（重命名残留）丢弃；
  *      本端在上一轮同步之后新建/挪回来的节点（当前树里有、上次快照里没有）也丢弃——
- *      否则「节点还在 ⇒ 墓碑永不过期」会把用户重新加回的书签永久拉黑；
+ *      否则旧墓碑会把用户重新加回的书签持续挡住；
  *      他端产生的、且本端上次同步时就有的残留节点保留（那正是「对端已删除，本端要跟上」）
  *   ④ 两端都存在的节点，墓碑一律作废（它确实活着，说明删除已被撤销/被重新加回）
  *

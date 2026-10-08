@@ -7,7 +7,10 @@
 //   2) 顺序冲突 localOrderWins：本地顺序领先时不重排、但仍写回云端
 //   3) 收养节点迁移：adoptedLocalOnlyIds + renamePairs 触发 chrome.bookmarks.create
 
-const { loadSource } = require('./load-source');
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+const { loadSource, ROOT } = require('./load-source');
 
 // 预置 chrome.bookmarks / chrome.runtime stub（mergeSync 直接调用 chrome.bookmarks.*，
 // 且 getChromeTree 内会读取 chrome.runtime.lastError）
@@ -23,6 +26,9 @@ global.chrome.bookmarks = {
 
 loadSource();
 const M = global.MiniSync;
+const bindSyncStatusBucket = M.storage.bindSyncStatusBucket;
+vm.runInThisContext(fs.readFileSync(path.join(ROOT, 'lib/webdav.js'), 'utf8'), { filename: 'lib/webdav.js' });
+const isStrongETag = M.webdav.isStrongETag;
 
 // 默认可控 chrome 树：书签栏(1) 下挂 百度(10) 与 工作(11)，工作下挂 GitHub(110)
 const DEFAULT_TREE = [{
@@ -44,19 +50,21 @@ function installMocks(mergeResultOverride = {}) {
   global.__chromeTree = DEFAULT_TREE;
 
   // storage：全部返回空/无操作，避免依赖 chrome.storage.local 真实行为
+  const store = {};
   M.storage = {
     getSyncStatus: async () => ({ status: 'idle' }),
     setSyncStatus: async () => {},
-    getLocal: async () => ({}),
-    setLocal: async () => {},
+    bindSyncStatusBucket,
+    getLocal: async (keys) => Object.fromEntries((keys || []).filter(k => k in store).map(k => [k, store[k]])),
+    setLocal: async (values) => Object.assign(store, values),
     getDeviceId: async () => 'dev-test',
     getWebdavConfig: async () => ({ url: 'https://dav/file.xbel', username: '', password: '', filename: 'file.xbel' }),
   };
 
-  // webdav：getFile 返回 null（remoteData=null，简化分支）；getFileInfo 可控；putFile 记录调用
+  // A missing-file GET has no ETag; the implementation must create it conditionally.
   M.webdav = {
-    getFile: async () => null,
-    getFileInfo: async () => ({ exists: true, lastModified: 0 }),
+    isStrongETag,
+    getFileVersion: async () => ({ exists: false, content: null, etag: null, lastModified: 0 }),
     putFile: async () => { captured.putCalled = true; return { lastModified: 123 }; },
   };
 
@@ -119,10 +127,10 @@ function installMocks(mergeResultOverride = {}) {
 
   // tombstone 使用真实实现（load-source 已加载 model/tombstone.js，纯逻辑无副作用）；
   // bridge / berry/via/aira：no-op
-  M.bridgePatcher = { patchBridges: async () => {} };
-  M.berry = { mergeBerryData: async (l) => l };
-  M.via = { mergeViaData: async (l) => l };
-  M.aira = { mergeAiraData: async (l) => l };
+  M.bridgePatcher = { patchBridges: async () => ({ bridgeResults: {}, partial: false }) };
+  M.berry = { mergeBerryDataWithChanges: async (list) => ({ list, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] }) };
+  M.via = { mergeViaDataWithChanges: async (list) => ({ list, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] }) };
+  M.aira = { mergeAiraDataWithChanges: async (list) => ({ list, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] }) };
 
   // importer：记录接收到的落盘数据
   M.importer = {
@@ -161,15 +169,13 @@ describe('mergeSync — 顺序冲突 localOrderWins', () => {
   }));
 
   test('顺序冲突 localOrderWins：统一走落盘分支（import 被调用），且仍写回云端（putFile 被调用）', async () => {
-    // 控制 getFileInfo 返回的云端时间 == 本机记录（localOrderWins 成立）
-    M.webdav.getFileInfo = async () => ({ exists: true, lastModified: 0 });
+    // The GET timestamp is the only remote timestamp used for ordering.
+    M.webdav.getFileVersion = async () => ({ exists: true, content: '<xbel/>', etag: '"v1"', lastModified: 0 });
+    M.xbel.parseXbelFromString = () => ({ bookmarks: [] });
     // 本机记录 localLastSeen 通过 storage.getLocal 返回 100，云端 lastModified=0
     // 则 remoteLastModified(0) <= localLastSeen(100)+TOL → localOrderWins=true
-    M.storage.getLocal = async (keys) => {
-      const out = {};
-      if (Array.isArray(keys) && keys.includes('cloud_last_modified')) out.cloud_last_modified = 100;
-      return out;
-    };
+    const getLocal = M.storage.getLocal;
+    M.storage.getLocal = async (keys) => ({ ...await getLocal(keys), ...(keys.includes('cloud_last_modified') ? { cloud_last_modified: 100 } : {}) });
     await baseMerge({});
     // 注：当前实现已将 localOrderWins 统一进落盘分支（对纯顺序变化幂等），
     // 因此 import 仍会被调用；"不重排本地"的语义由顺序修复段（useRemoteOrder=false
@@ -231,15 +237,15 @@ describe('mergeSync — 回迁桥必须收到墓碑集合（否则桥接写回�
   test('每一处 mergeViaData 调用都带墓碑 pathKey 集合', async () => {
     installMocks();
     const calls = [];
-    M.via = { mergeViaData: async (...args) => { calls.push(args); return args[0]; } };
-    M.storage.getLocal = async (keys) => {
-      const out = {};
-      if (Array.isArray(keys) && keys.includes('option_via_enabled')) out.option_via_enabled = true;
-      if (Array.isArray(keys) && keys.includes('sync_tombstones')) {
-        out.sync_tombstones = [{ key: 'ROOT:bar/L:https://dead.example', deletedAt: 1, deviceId: 'dev-test' }];
-      }
-      return out;
-    };
+    M.via = { mergeViaDataWithChanges: async (...args) => {
+      calls.push(args);
+      return { list: args[0], deletedIds: [], deletedPathKeys: [], complete: true, errors: [] };
+    } };
+    const getLocal = M.storage.getLocal;
+    M.storage.getLocal = async (keys) => ({ ...await getLocal(keys),
+      ...(keys.includes('option_via_enabled') ? { option_via_enabled: true } : {}),
+      ...(keys.includes('sync_tombstones') ? { sync_tombstones: [{ key: 'ROOT:bar/L:https://dead.example', deletedAt: 1, deviceId: 'dev-test' }] } : {})
+    });
 
     await baseMerge({});
 
@@ -255,22 +261,21 @@ describe('mergeSync — 回迁桥必须收到墓碑集合（否则桥接写回�
 });
 
 describe('mergeSync — 顺序重排失败必须如实上报', () => {
-  test('importResult.moveFailed>0 ⇒ 合并消息里说出来（不再静默报「合并成功」）', async () => {
+  test('reported reorder failures prevent cloud write and baseline', async () => {
     installMocks();
-    M.importer = {
-      importBookmarksFromData: async (data) => ({
-        importedCount: (data.bookmarks || []).length, createdFolderCount: 0,
-        conflicts: [], removedCount: 0, totalCount: (data.bookmarks || []).length,
-        targets: [], rootId: '0', rootChildTitles: [],
-        zoneIds: { bar: null, other: null, mobile: null }, landedSample: [],
-        moveFailed: 3, // 模拟：3 处顺序没落到位（旧实现只计数不报，用户看到「合并成功」）
-      }),
-    };
-
+    M.importer.importBookmarksFromData = async () => ({ importedCount: 0, removedCount: 0, conflicts: [], moveFailed: 3 });
     const r = await baseMerge({});
-
-    expect(r.success).toBe(true);
-    expect(r.message).toContain('顺序没落到位');
+    expect(r.success).toBe(false);
+    expect(captured.putCalled).toBe(false);
     expect(r.message).toContain('3');
+  });
+
+  test('a meaningful move conflict prevents cloud write', async () => {
+    installMocks();
+    M.importer.importBookmarksFromData = async () => ({ importedCount: 0, removedCount: 0, moveFailed: 1,
+      conflicts: [{ type: 'move', title: 'Work', error: 'Cannot move' }] });
+    const r = await baseMerge({});
+    expect(r.success).toBe(false);
+    expect(captured.putCalled).toBe(false);
   });
 });

@@ -81,6 +81,8 @@ function remoteData(folderAChildren, folderBChildren, deviceId) {
 
 async function installStorage(tombstones) {
   storageState.sync_tombstones = tombstones || [];
+  storageState.sync_snapshots = { localTree: [] };
+  storageState.sync_move_intents = {};
   storageState.cloud_last_modified = 0;
   M.storage = M.storage || {};
   M.storage.getDeviceId = async () => DEV_EDGE;
@@ -109,6 +111,7 @@ describe('书签跨文件夹移动 — 旧位置不复活（5f 书签移动识�
   test('接收端（无移动意图）：生成迁移对（本地跟随云端）', async () => {
     await installStorage([]);
     const localTreeArg = localTree([X('xa')], []); // 本地：X 在 FolderA（未同步移动）
+    storageState.sync_snapshots = { localTree: M.merger.chromeTreeToList(localTreeArg) };
     const remote = remoteData([], [X('xb')]);      // 云端：X 已在 FolderB
     const result = await M.merger.mergeBookmarks(localTreeArg, remote, {});
 
@@ -123,6 +126,7 @@ describe('书签跨文件夹移动 — 旧位置不复活（5f 书签移动识�
     await installStorage([]);
     // 本地：X 在 FolderA（addedAt=T0）；云端：X 在 FolderB（addedAt=T0+1天，跨端创建时间不同）
     const localTreeArg = localTree([X('xa')], []);
+    storageState.sync_snapshots = { localTree: M.merger.chromeTreeToList(localTreeArg) };
     const remote = remoteData([], [{ ...X('xb'), addedAt: NOW + 86400000 }]);
     const result = await M.merger.mergeBookmarks(localTreeArg, remote, {});
 

@@ -534,7 +534,12 @@ function startStatusPolling(action, since) {
     setSyncBtnBusy(action, false);
     const label = SYNC_ACTION_LABELS[action] || { successTag: '同步成功', failPrefix: '同步失败：' };
     const fresh = !since || (st.lastSyncTime && st.lastSyncTime >= since - 2000);
-    if (st.status === 'success' && fresh) {
+    if (st.status === 'partial' && fresh) {
+      setStatus(st.error || st.message || '主文件已同步，手机桥接部分失败', 'warn');
+      const { last_sync_at, last_sync_count } = await chrome.storage.local.get(['last_sync_at', 'last_sync_count']);
+      renderLastSync(last_sync_at);
+      renderProgressLine(last_sync_count, undefined, 'warn');
+    } else if (st.status === 'success' && fresh) {
       setStatus('✓ ' + label.successTag, 'ok');
       const { last_sync_at, last_sync_count } = await chrome.storage.local.get(['last_sync_at', 'last_sync_count']);
       renderLastSync(last_sync_at);
@@ -557,12 +562,13 @@ function startStatusPolling(action, since) {
 //   还套了 15s/20s 超时），重复探测就是让用户干等；② 探测成功后会写 ever_connected，而那条
 //   写入会触发下面的 storage.onChanged 再调一次 updateHomeStatus —— 用户看到的就是
 //   「检查结束又要再检查」（第二轮答完才真正停下）。
-//   key 用「地址|账号|路径」：改了配置就是新 key，立刻重新探测，不会被缓存挡住。
+//   key uses the opaque resolved configuration identity, including credentials and basename.
 //   「同步进行中」是瞬时态，按 skipCache 不进缓存（否则同步结束后还在显示进行中）。
 const STATUS_PROBE_TTL = 30000;
-const _statusProbe = MiniSync.utils.createCoalescedProbe(STATUS_PROBE_TTL);
-function statusProbeKey(r) {
-  return [r.webdav_url, r.webdav_user, r.webdav_bookmark_path].join('|');
+let _statusProbe = MiniSync.utils.createCoalescedProbe(STATUS_PROBE_TTL);
+async function statusProbeKey(r) {
+  try { return await MiniSync.utils.syncStatusConfigKey(r); }
+  catch (_) { return null; } // Without a reliable identity, probe without caching.
 }
 
 // 状态栏显示规则：未配置不显示；已配置则异步测试连接。
@@ -590,10 +596,14 @@ function renderBusySync(action) {
 
 async function updateHomeStatus() {
   if (homeView.classList.contains('hide')) return;
+  const probe = _statusProbe;
+  const isCurrent = () => probe === _statusProbe && !homeView.classList.contains('hide');
   const r = await chrome.storage.local.get([
-    'webdav_url', 'webdav_user', 'webdav_password', 'webdav_bookmark_path',
-    'last_sync_count', 'ever_connected', CONN_CACHE_STORAGE_KEY
+    'webdav_url', 'webdav_user', 'webdav_password', 'webdav_bookmark_path', 'webdav_config', 'bookmark_target_id',
+    'last_sync_count', 'ever_connected', CONN_CACHE_STORAGE_KEY,
+    'sync_status', 'sync_error', 'sync_action', 'sync_status_config_key'
   ]);
+  if (!isCurrent()) return;
   const configured = !!(r.webdav_url && r.webdav_user && r.webdav_password);
   if (!configured) {
     setStatus('');
@@ -601,8 +611,25 @@ async function updateHomeStatus() {
     return;
   }
 
-  const probeKey = statusProbeKey(r);
-  const first = MiniSync.utils.pickConnStatus(r[CONN_CACHE_STORAGE_KEY], probeKey, Date.now());
+  if (r.sync_status === 'syncing') {
+    renderBusySync(r.sync_action);
+    return;
+  }
+  let partialMatchesConfig = false;
+  if (r.sync_status === 'partial' && r.sync_status_config_key) {
+    try { partialMatchesConfig = r.sync_status_config_key === await MiniSync.utils.syncStatusConfigKey(r); }
+    catch (_) { /* Cannot associate this result with the current configuration. */ }
+  }
+  if (!isCurrent()) return;
+  if (partialMatchesConfig) {
+    setStatus(r.sync_error || '主文件已同步，手机桥接部分失败', 'warn');
+    renderProgressLine(r.last_sync_count, undefined, 'warn');
+    return;
+  }
+
+  const probeKey = await statusProbeKey(r);
+  if (!isCurrent()) return;
+  const first = MiniSync.utils.pickConnStatus(probeKey ? r[CONN_CACHE_STORAGE_KEY] : null, probeKey, Date.now());
   setStatus(first.text, first.level || undefined);
   renderProgressLine(null);
 
@@ -611,7 +638,7 @@ async function updateHomeStatus() {
   //    「正在检查配置...」（用户手机的原始症状）；超时按「没拿到结论」处理，不冒充连不上。
   let result = null;
   try {
-    result = await _statusProbe.run(probeKey, () => MiniSync.utils.raceHardTimeout(
+    const request = () => MiniSync.utils.raceHardTimeout(
       chrome.runtime.sendMessage({
         action: 'checkConfig',
         webdavUrl: r.webdav_url,
@@ -620,11 +647,14 @@ async function updateHomeStatus() {
         webdavPath: r.webdav_bookmark_path
       }),
       CONN_PROBE_HARD_MS
-    ), (v) => !!(v && (v.busy || v.timedOut)));
+    );
+    result = probeKey ? await probe.run(probeKey, request,
+      (v) => !isCurrent() || !!(v && (v.busy || v.timedOut))) : await request();
   } catch (e) {
     // SW 未就绪等场景
     result = null;
   }
+  if (!isCurrent()) return;
   if (result && result.ok) {
     setStatus('配置已就绪', 'ok');
     // 只在真正变化时写：写同一个值也会触发 storage.onChanged，白跑一趟探测
@@ -636,8 +666,8 @@ async function updateHomeStatus() {
     renderProgressLine(null);
   }
   // 落盘「下次打开可以立刻画出来」的那份结论（否定结论与无响应都不落，见 utils 里的说明）
-  const entry = MiniSync.utils.connCacheFromResult(result, probeKey, Date.now());
-  if (entry) await chrome.storage.local.set({ [CONN_CACHE_STORAGE_KEY]: entry });
+  const entry = probeKey && MiniSync.utils.connCacheFromResult(result, probeKey, Date.now());
+  if (entry && isCurrent()) await chrome.storage.local.set({ [CONN_CACHE_STORAGE_KEY]: entry });
 }
 
 // 显示/隐藏操作记录行（level='ok'/'err' 时同色，手机上「成了没有」一眼可见）
@@ -966,9 +996,13 @@ saveBtn.onclick = async () => {
   // ★ 双写补全：此前只写扁平 key 不写 webdav_config——清空重配后后台「规范化补写」
   //   会写入 filename=裸文件名、账号密码全空的残缺嵌套，getWebDAVConfig 读 filename
   //   取嵌套值优先 → 用户填的路径被无视 → PUT 落到 WebDAV 根目录（坚果云 404）。
-  //   现按 storage.setWebdavConfig 同一口径双写：filename=路径+默认文件名。
+  //   现按 storage.setWebdavConfig 同一口径双写，并保留当前文件名。
+  const currentConfig = MiniSync.utils.resolveWebDAVConfigData(await chrome.storage.local.get([
+    'webdav_config', 'webdav_url', 'webdav_user', 'webdav_password', 'webdav_bookmark_path'
+  ]));
   const normPath = path.replace(/\/+$/, '') || '';
-  const filename = normPath ? normPath + '/' + DEFAULT_FILENAME : DEFAULT_FILENAME;
+  const basename = currentConfig.filename.slice(currentConfig.filename.lastIndexOf('/') + 1) || DEFAULT_FILENAME;
+  const filename = normPath ? normPath + '/' + basename : basename;
   await chrome.storage.local.set({
     webdav_config: { url, username: user, password, filename },
     webdav_url: url,
@@ -1248,11 +1282,10 @@ async function runSyncAction(action) {
       return;
     }
     resp = recovered;
+    const recoveredStatus = MiniSync.utils.describeActionStatus(recovered, label);
     applySyncResult(action, label, {
-      text: recovered.success
-        ? `${label.successTag}（后台台账：${recovered.message || '已完成'}）`
-        : label.failPrefix + (recovered.message || '未知原因'),
-      level: recovered.success ? 'ok' : 'err'
+      text: recoveredStatus.text + '（后台台账）',
+      level: recoveredStatus.level
     }, recovered);
     return;
   }
@@ -1392,13 +1425,27 @@ connBadge.onclick = async () => {
 // ========== 监听 storage 变化 ==========
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
+  const configChanged = ['webdav_url', 'webdav_user', 'webdav_password',
+    'webdav_bookmark_path', 'webdav_config', 'bookmark_target_id'].some(key => changes[key]);
+  if (configChanged) {
+    // Replace synchronously: an old in-flight promise can outlive invalidate().
+    _statusProbe.invalidate();
+    const probe = _statusProbe = MiniSync.utils.createCoalescedProbe(STATUS_PROBE_TTL);
+    if (!homeView.classList.contains('hide')) {
+      setStatus('正在检查配置...');
+      renderProgressLine(null);
+    }
+    chrome.storage.local.remove(CONN_CACHE_STORAGE_KEY).catch(() => {}).then(() => {
+      if (probe === _statusProbe) loadAll();
+    });
+  }
   if (changes.last_sync_at) {
     renderLastSync(changes.last_sync_at.newValue);
   }
   if (changes.last_sync_count) {
     // 不在此处渲染操作记录，由 runSyncAction 的 sendResponse 回调统一渲染（带 diff）
   }
-  if (changes.ever_connected) {
+  if (changes.ever_connected && !configChanged) {
     updateHomeStatus();
   }
   if (changes.sync_enabled || changes.sync_interval || changes.sync_type) {
@@ -1409,9 +1456,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
       const configured = !!(r.webdav_url && r.webdav_user && r.webdav_password);
       renderBadge(configured, !!r.sync_enabled);
     });
-  }
-  if (changes.webdav_url || changes.webdav_user || changes.webdav_password) {
-    loadAll();
   }
 });
 

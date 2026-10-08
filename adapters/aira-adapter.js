@@ -50,13 +50,14 @@ async function uploadAiraBookmarks(snapshot) {
   await MiniSync.webdav.putFile(config.url, config.username, config.password, filePath, JSON.stringify(snapshot), 'application/json; charset=utf-8');
 }
 
-// 取 Aira personalization（g2）路径：将 g3/bookmarks 的父级 aira/ 换成 aira/g2/personalization
+// 取 Aira personalization（g2）路径，保留自定义 g3 路径的完整前缀。
 async function getAiraPersonalizationPath() {
   const base = (await getAiraPath()).replace(/\/+$/, '');
-  // base 形如 "aira/g3/bookmarks" → 取其第一段 "aira" → "aira/g2/personalization"
-  const segs = base.split('/');
-  const root = segs[0] || 'aira';
-  return root + '/g2/personalization';
+  const segs = base.split('/').filter(Boolean);
+  const root = segs.length >= 3 && segs[segs.length - 2] === 'g3' && segs[segs.length - 1] === 'bookmarks'
+    ? segs.slice(0, -2).join('/') || 'aira'
+    : segs[0] || 'aira';
+  return (base.startsWith('/') ? '/' : '') + root + '/g2/personalization';
 }
 
 async function downloadAiraPersonalization() {
@@ -95,24 +96,17 @@ function computePersonalizationChecksum(sections) {
 async function patchAiraPersonalization(mergedList, opts = {}) {
   const align = !!(opts && opts.align);
   let prev;
-  try {
-    prev = await downloadAiraPersonalization();
-  } catch (e) {
-    prev = null;
-  }
+  prev = await downloadAiraPersonalization();
 
   // personalization 缺失时的种子创建：若 g3 snapshot.json 存在（内含移动端 deviceId），
   // 桌面可携带该 deviceId 创建 personalization 骨架并按桌面 home 填充——
   // 移动端的 deviceId 一致性校验可过，不会形成死锁。g3 也不存在 → 仍不创建（保持保护）。
   if (!prev) {
-    let seedDeviceId = '';
-    try {
-      const g3 = await downloadAiraBookmarks();
-      seedDeviceId = (g3 && (g3.deviceId || (g3.meta && g3.meta.deviceId))) || '';
-    } catch (e) { /* ignore */ }
+    const g3 = await downloadAiraBookmarks();
+    const seedDeviceId = (g3 && (g3.deviceId || (g3.meta && g3.meta.deviceId) || (g3.snapshot && g3.snapshot.meta && g3.snapshot.meta.deviceId))) || '';
     if (!align || !seedDeviceId) {
       // 合并语义（非 align）不创建；连移动端 deviceId 都拿不到 → 不创建（保持原保护）
-      return;
+      return { status: 'skipped', reason: 'Aira 主页缺失且无设备 ID' };
     }
     const now = Date.now();
     prev = {
@@ -126,7 +120,7 @@ async function patchAiraPersonalization(mergedList, opts = {}) {
     };
     console.log(`[sync] 🤖 Aira 主页文件缺失：以移动端 deviceId 种子创建并按桌面 home 填充`);
   }
-  if (!prev.sections || !prev.sections.home_shortcuts) return;
+  if (!prev.sections || !prev.sections.home_shortcuts) throw new Error('Aira 主页文件格式无效');
 
   const homeItems = mergedList.filter(n => n.source === 'home' && !n.isFolder && n.url);
   // ★ 归一化去重：http/https、www.、尾斜杠差异视为同一书签。
@@ -228,8 +222,10 @@ async function patchAiraPersonalization(mergedList, opts = {}) {
       console.log('[sync] 🤖 Aira 主页文件已推送');
     } catch (e) {
       console.warn('[sync] 🤖 Aira 主页推送失败:', e.message);
+      throw e;
     }
   }
+  return { status: needUpload ? 'success' : 'skipped' };
 }
 
 // 取 snapshot 容器（兼容顶层直接是三表对象的旧形态）
@@ -265,6 +261,15 @@ function airaSnapshotToList(raw) {
   const items = (Array.isArray(snap.bookmarkItems) ? snap.bookmarkItems : []).filter(it => !it.type || it.type === 'bookmark-item');
   for (const f of folders) byId.set(f.id, f);
   for (const it of items) byId.set(it.id, it);
+  for (const node of [...folders, ...items]) {
+    const seen = new Set();
+    let parent = node;
+    while (parent) {
+      if (seen.has(parent.id)) throw new Error('Aira 快照包含环形父链');
+      seen.add(parent.id);
+      parent = parent.parentId ? byId.get(parent.parentId) : null;
+    }
+  }
 
   // 向上回溯，确定某个节点所属根区的 source（bar/other/mobile）
   function resolveSource(node) {
@@ -528,7 +533,9 @@ function dedupeAiraSnapshot(folders, items, orders) {
   all.forEach(n => byId.set(n.id, n));
 
   // 计算 pathKey（复用 computePathKeys 的同一算法）
-  function pkOf(node) {
+  function pkOf(node, visiting = new Set()) {
+    if (visiting.has(node.id)) throw new Error('Aira 快照包含环形父链');
+    visiting.add(node.id);
     if (node.id === 'root') return 'ROOT';
     const ROOTMAP = { browser_root_toolbar: 'bar', browser_root_other: 'other', browser_root_mobile: 'mobile' };
     if (ROOTMAP[node.id]) return 'ROOT:' + ROOTMAP[node.id];
@@ -536,7 +543,7 @@ function dedupeAiraSnapshot(folders, items, orders) {
     const seg = isFolder ? 'F:' + node.title : 'L:' + (node.url || '');
     const p = byId.get(node.parentId);
     if (!p) return 'ROOT:unknown/' + seg;
-    let pp = (p.id === 'root' && node.source && node.source !== 'home') ? 'ROOT:' + node.source : pkOf(p);
+    let pp = (p.id === 'root' && node.source && node.source !== 'home') ? 'ROOT:' + node.source : pkOf(p, visiting);
     return pp + '/' + seg;
   }
 
@@ -598,23 +605,22 @@ async function patchAiraFile(mergedList, opts = {}) {
   try {
     prev = await downloadAiraBookmarks();
   } catch (e) {
-    return;
+    throw new Error(`Aira 读取失败: ${e.message}`);
   }
   if (!prev) {
-    // WebDAV 上尚无 Aira 文件 → 不创建。
-    // 原因：Aira 的 deviceId 必须以移动端为准（移动端强校验，不一致则拒绝合并）。
-    // 若此处用桌面端自己的 deviceId 自创文件，移动端将永远合并不了、且形成死锁。
-    // 正确顺序：由移动端先上传一份（带移动端 deviceId），桌面端再同步时沿用它。
-    return;
+    // Aira deviceId 只能由移动端创建；明确标记跳过。
+    return { status: 'skipped', reason: 'Aira 文件不存在' };
   }
 
   const snap = airaGetSnapshotContainer(prev);
-  if (!snap) return;
+  if (!snap || !Array.isArray(snap.bookmarkFolders)) throw new Error('Aira 快照格式无效');
 
   // ===== 重建（对齐）模式：以桌面列表为准清理手机端 snapshot =====
   // 实现要点：保留 Aira 原生节点对象（字段齐全 → 手机端格式校验通过；从零重建的新节点
   // 缺失 Aira 原生专有字段，曾导致手机端「格式无效」），按桌面 pathKey 集合删除桌面
   // 没有的节点（历史镜像/残留），桌面独有节点随后由统一增量追加逻辑补齐。
+  // Validate before deduplication and before any remote write.
+  airaSnapshotToList(prev);
   let folders, items, orders;
   let prevList;
   // 实际写入 snapshot 的节点（扁平表示）：供回写日志的四区统计使用
@@ -858,31 +864,64 @@ async function patchAiraFile(mergedList, opts = {}) {
     }
   };
 
-  try {
-    await uploadAiraBookmarks(out);
-    console.log(`[sync] 🤖 Aira 回写完成: ${zoneSummary(writtenFlatList, { includeHome: false })}`);
-  } catch (e) {
-    // 上传失败静默忽略，避免阻塞主上传流程
-    console.warn('[sync] 🤖 Aira 桥接：上传失败', e.message);
-  }
+  await uploadAiraBookmarks(out);
+  console.log(`[sync] 🤖 Aira 回写完成: ${zoneSummary(writtenFlatList, { includeHome: false })}`);
+  return { status: 'success' };
 }
 
 // ====== 从 Aira 文件读取变更并合并 ======
 async function mergeAiraData(currentList, preferLocalOrder = false, tombstoneKeys = null) {
+  const result = await mergeAiraDataWithChanges(currentList, preferLocalOrder, tombstoneKeys);
+  if (result.complete && result.snapshotUpdates) await chrome.storage.local.set(result.snapshotUpdates);
+  return result.list;
+}
+
+async function mergeAiraDataWithChanges(currentList, preferLocalOrder = false, tombstoneKeys = null) {
+  const changes = { list: currentList, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] };
   let airaData;
   try {
     airaData = await downloadAiraBookmarks();
+    if (!airaData) throw new Error('Aira 文件不存在');
+    if (!airaGetSnapshotContainer(airaData) || !Array.isArray(airaGetSnapshotContainer(airaData).bookmarkFolders)) {
+      throw new Error('Aira 快照格式无效');
+    }
+    const airaList = airaSnapshotToList(airaData);
+    if (airaList.length === 0) throw new Error('Aira 根容器缺失');
+    return await mergeAiraValidated(currentList, airaList, tombstoneKeys, changes);
   } catch (e) {
-    return currentList;
+    changes.complete = false;
+    changes.errors.push(e.message);
+    return changes;
   }
-  const airaList = airaSnapshotToList(airaData);
-  if (!airaList || airaList.length === 0) return currentList;
+}
+
+async function mergeAiraValidated(currentList, airaList, tombstoneKeys, changes) {
+  const originalList = currentList;
+  let homePKSet = null;
 
   // 0. 从 Aira personalization（g2）读 home_shortcuts，合并回 Berry主页（source==='home'）
   try {
     const pers = await downloadAiraPersonalization();
-    if (pers && pers.sections && pers.sections.home_shortcuts) {
-      const scs = pers.sections.home_shortcuts.payload.shortcuts || [];
+    if (pers !== null) {
+      const scs = pers && pers.sections && pers.sections.home_shortcuts && pers.sections.home_shortcuts.payload && pers.sections.home_shortcuts.payload.shortcuts;
+      if (!Array.isArray(scs)) throw new Error('Aira 主页快照格式无效');
+      homePKSet = new Set();
+      for (const sc of scs) {
+        if (!sc || typeof sc.url !== 'string' || !sc.url) throw new Error('Aira 主页书签格式无效');
+        const node = { id: sc.id || ('shortcut-' + stableSuffix(sc.url)), title: sc.title || '', url: sc.url, isFolder: false, parentId: HOME_FOLDER_ID, source: 'home' };
+        homePKSet.add(computePathKeys([node]).get(node.id));
+      }
+      const previousHome = (await chrome.storage.local.get(['aira_home_pathkey_snapshot'])).aira_home_pathkey_snapshot || [];
+      const currentHomePKs = computePathKeys(currentList);
+      for (const n of currentList) {
+        const pk = currentHomePKs.get(n.id);
+        if (n.source === 'home' && pk && previousHome.includes(pk) && !homePKSet.has(pk)) {
+          changes.deletedIds.push(n.id);
+          changes.deletedPathKeys.push(pk);
+        }
+      }
+      if (changes.deletedIds.length) currentList = currentList.filter(n => !changes.deletedIds.includes(n.id));
+      changes.snapshotUpdates = { ...(changes.snapshotUpdates || {}), aira_home_pathkey_snapshot: [...homePKSet] };
       // ★ 归一化匹配：http/https、www.、尾斜杠差异视为同一主页书签。
       //   此前精确 toLowerCase 匹配导致 personalization 的历史条目（协议/斜杠略异）
       //   每次都被误判为「主页新增」注入，home 区数量逐轮膨胀（曾在手机端出现成对重复）。
@@ -890,6 +929,9 @@ async function mergeAiraData(currentList, preferLocalOrder = false, tombstoneKey
       const homeNodes = [];
       for (const sc of scs) {
         if (!sc.url || localUrls.has(normalizeUrlForDedup(sc.url))) continue;
+        const homeNode = { id: sc.id || ('shortcut-' + stableSuffix(sc.url)), title: sc.title || '', url: sc.url || '', isFolder: false, parentId: HOME_FOLDER_ID, source: 'home' };
+        const homePK = computePathKeys([homeNode]).get(homeNode.id);
+        if (tombstoneKeys && tombstoneKeys.has(homePK)) continue;
         localUrls.add(normalizeUrlForDedup(sc.url));
         homeNodes.push({
           id: sc.id || ('shortcut-' + stableSuffix(sc.url)),
@@ -910,7 +952,15 @@ async function mergeAiraData(currentList, preferLocalOrder = false, tombstoneKey
           : [...currentList, ...homeNodes];
       }
     }
-  } catch (e) { /* personalization 不存在则忽略 */ }
+  } catch (e) {
+    changes.complete = false;
+    changes.errors.push(e.message);
+    changes.list = originalList;
+    changes.deletedIds = [];
+    changes.deletedPathKeys = [];
+    delete changes.snapshotUpdates;
+    return changes;
+  }
 
   // 建立 source → 本地 Chrome 根容器 id 的映射
   // 优先用 Chrome 标准根 id（'1'/'2'/'3'）识别，若用户浏览器根 id 被改写，
@@ -1039,7 +1089,7 @@ async function mergeAiraData(currentList, preferLocalOrder = false, tombstoneKey
   const snapshotData = (await chrome.storage.local.get(['aira_pathkey_snapshot']))['aira_pathkey_snapshot'] || [];
   const airaSnapshotSet = new Set(snapshotData);
   let airaDeletedCount = 0;
-  if (airaSnapshotSet.size > 0) {
+  if (changes.complete && airaSnapshotSet.size > 0) {
     enriched = enriched.filter(n => {
       // 本地 Chrome 根容器是系统容器，Aira 不能删除，必须保留（id='1'/'2'/'3' 或系统根标题）
       if (isRealRootContainer(n)) return true;
@@ -1054,12 +1104,14 @@ async function mergeAiraData(currentList, preferLocalOrder = false, tombstoneKey
         }
         if (n.isFolder && n.title && airaFolderTitles.has(n.title)) return true;
         airaDeletedCount++;
+        changes.deletedIds.push(n.id);
+        changes.deletedPathKeys.push(pk);
         return false; // Aira 真删了
       }
       return true;
     });
   }
-  await chrome.storage.local.set({ 'aira_pathkey_snapshot': [...airaPKSet] });
+  if (changes.complete) changes.snapshotUpdates = { ...(changes.snapshotUpdates || {}), aira_pathkey_snapshot: [...airaPKSet] };
 
   // ===== 4. 组装结果（保持输入数组顺序，仅追加 Aira 新增） =====
   const combined = [...enriched];
@@ -1121,7 +1173,8 @@ async function mergeAiraData(currentList, preferLocalOrder = false, tombstoneKey
   // Aira 新增节点（来自 snapshot 解析）无 _index → 补到同父已有节点之后
   MiniSync.utils.fillMissingSiblingIndex(result);
   console.log(`[sync] 🤖 Aira 处理完成: ${zoneSummary(result)}`);
-  return result;
+  changes.list = result;
+  return changes;
 }
 
 // 构建 pathKey → 节点 映射
@@ -1138,6 +1191,7 @@ function buildPathKeyMap(list) {
 // 挂载到 MiniSync
 MiniSync.aira = {
   mergeAiraData,
+  mergeAiraDataWithChanges,
   patchAiraFile,
   patchAiraPersonalization,
   downloadAiraBookmarks,

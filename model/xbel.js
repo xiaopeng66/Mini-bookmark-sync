@@ -62,6 +62,70 @@ function buildMetadataXml(props) {
 }
 
 
+function sanitizeEndpoints(value) {
+  if (Array.isArray(value)) return value.map(sanitizeEndpoints);
+  if (!value || typeof value !== 'object') return value;
+  const clean = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (/password|passwd|secret|token|credential|authorization|api.?key|username|user(name)?|^auth$/i.test(key)) continue;
+    if (/url|uri|endpoint|server|host/i.test(key) && typeof entry === 'string') {
+      try {
+        const url = new URL(entry);
+        url.username = '';
+        url.password = '';
+        url.search = '';
+        url.hash = '';
+        clean[key] = url.toString();
+      } catch (_) { /* Unknown endpoint formats may contain credentials; omit them. */ }
+    } else {
+      clean[key] = sanitizeEndpoints(entry);
+    }
+  }
+  return clean;
+}
+
+/** Validate XML structure before the tolerant XBEL tree scanner runs. */
+function validateXbel(xml) {
+  if (typeof xml !== 'string' || !xml.trim()) throw new Error('Invalid XBEL document');
+  const tokens = /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[\s\S]*?\?>|<!DOCTYPE[^>]*>|<\/?[A-Za-z][\w:.-]*(?:\s+(?:[^<>"']|"[^"]*"|'[^']*')*)?\s*\/?>/g;
+  const invalidEntity = /&(?!(?:#(?:[0-9]+|x[0-9A-Fa-f]+)|[A-Za-z_:][\w:.-]*);)/;
+  let pos = 0;
+  let rootCount = 0;
+  const stack = [];
+  let token;
+  while ((token = tokens.exec(xml))) {
+    const between = xml.slice(pos, token.index);
+    if (between.includes('<') || invalidEntity.test(between) || (!stack.length && between.trim())) throw new Error('Malformed XBEL XML');
+    pos = tokens.lastIndex;
+    const tag = token[0];
+    if (tag.startsWith('<!--') || tag.startsWith('<?') || tag.startsWith('<!DOCTYPE')) {
+      if (stack.length) throw new Error('Malformed XBEL XML');
+      continue;
+    }
+    if (tag.startsWith('<![CDATA[')) {
+      if (!stack.length) throw new Error('Malformed XBEL XML');
+      continue;
+    }
+    const name = /^<\/?([A-Za-z][\w:.-]*)/.exec(tag)[1];
+    if (tag.startsWith('</')) {
+      if (!/^<\/[A-Za-z][\w:.-]*\s*>$/.test(tag) || stack.pop() !== name) throw new Error('Malformed XBEL XML');
+    } else {
+      let attributes = tag.slice(name.length + 1, tag.length - (tag.endsWith('/>') ? 2 : 1));
+      while (attributes.trim()) {
+        const attribute = /^\s+[A-Za-z_:][\w:.-]*\s*=\s*(?:"[^"<]*"|'[^'<]*')/.exec(attributes);
+        if (!attribute || invalidEntity.test(attribute[0])) throw new Error('Malformed XBEL XML');
+        attributes = attributes.slice(attribute[0].length);
+      }
+      if (!stack.length) {
+        if (name !== 'xbel' || rootCount++) throw new Error('Invalid XBEL root');
+      }
+      if (!tag.endsWith('/>')) stack.push(name);
+    }
+  }
+  if (xml.slice(pos).trim() || stack.length || rootCount !== 1) throw new Error('Malformed XBEL XML');
+  return xml.replace(/<xbel\b([^<>]*?)\s*\/>/, '<xbel$1></xbel>');
+}
+
 // 核心：扁平 JSON → XBEL XML 字符串
 
 /** 将插件数据对象转换为 XBEL XML 字符串 */
@@ -84,11 +148,8 @@ function jsonToXbel(pluginData) {
     const lines = [];
     for (const node of children) {
       if (node.isFolder) {
-        // 特殊虚拟容器不创建独立节点
-        if (node.id === HOME_FOLDER_ID || node.id === MOBILE_FOLDER_ID) {
-          lines.push(renderFolderContents(node.id, indent));
-          continue;
-        }
+        // Virtual containers are rendered in their dedicated sections below.
+        if (node.id === HOME_FOLDER_ID || node.id === MOBILE_FOLDER_ID) continue;
 
         const metaProps = {};
         if (node.addedAt != null) metaProps.addedAt = node.addedAt;
@@ -131,39 +192,10 @@ function jsonToXbel(pluginData) {
 
   // 构建三区根文件夹内容
   const barContent = renderFolderContents(ROOT_ID, '    ');
+  // Each ROOT_ID child belongs to the single sync bucket. Home and mobile use their own virtual roots.
   // Berry 主页（HOME_FOLDER_ID）下的内容归入 other 区
   const berryContent = renderFolderContents(HOME_FOLDER_ID, '      ');
-  const otherChildren = childrenMap.get(ROOT_ID) ?
-    childrenMap.get(ROOT_ID).filter(n => !n.isFolder || (n.id !== HOME_FOLDER_ID && n.id !== MOBILE_FOLDER_ID)) : [];
   let otherBody = '';
-  for (const n of otherChildren) {
-    if (n.isFolder && n.id !== HOME_FOLDER_ID && n.id !== MOBILE_FOLDER_ID) {
-      const metaProps = {};
-      if (n.addedAt != null) metaProps.addedAt = n.addedAt;
-      if (n.color != null) metaProps.color = n.color;
-      if (n.id != null) metaProps.id = n.id;
-      if (n.source) metaProps.source = n.source;
-      if (n._otherIndex != null) metaProps._otherIndex = n._otherIndex;
-      const metaXml = buildMetadataXml(metaProps);
-      const subContent = renderFolderContents(n.id, '      ');
-      otherBody += `    <folder>\n      <title>${escapeXml(n.title || '')}</title>\n`;
-      if (metaXml) otherBody += '      ' + metaXml + '\n';
-      if (subContent) otherBody += subContent + '\n';
-      otherBody += `    </folder>\n`;
-    } else if (!n.isFolder) {
-      const metaProps = {};
-      if (n.addedAt != null) metaProps.addedAt = n.addedAt;
-      if (n.color != null) metaProps.color = n.color;
-      if (n.favicon != null) metaProps.favicon = n.favicon;
-      if (n.customIcon != null) metaProps.customIcon = n.customIcon;
-      if (n.id != null) metaProps.id = n.id;
-      if (n.source) metaProps.source = n.source;
-      const metaXml = buildMetadataXml(metaProps);
-      otherBody += `    <bookmark href="${escapeAttr(n.url || '')}">\n      <title>${escapeXml(n.title || '')}</title>\n`;
-      if (metaXml) otherBody += '      ' + metaXml + '\n';
-      otherBody += `    </bookmark>\n`;
-    }
-  }
   // Berry 主页作为其他收藏夹下的第一个子文件夹
   let otherFolderBody = '';
   if (berryContent) {
@@ -182,7 +214,7 @@ function jsonToXbel(pluginData) {
     globalMeta.tombstones = JSON.stringify(pluginData.tombstones);
   }
   if (pluginData.endpoints) {
-    globalMeta.endpoints = JSON.stringify(pluginData.endpoints);
+    globalMeta.endpoints = JSON.stringify(sanitizeEndpoints(pluginData.endpoints));
   }
   if (pluginData.snapshots) {
     globalMeta.snapshots = JSON.stringify(pluginData.snapshots);
@@ -214,6 +246,16 @@ function jsonToXbel(pluginData) {
 // ================================================================
 //  核心：XBEL XML 字符串 → 扁平 JSON
 // ================================================================
+
+function parseAttributes(attrStr) {
+  const attrs = new Map();
+  const attrRegex = /([A-Za-z_:][\w:.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+  let match;
+  while ((match = attrRegex.exec(attrStr)) !== null) {
+    attrs.set(match[1], match[2] == null ? match[3] : match[2]);
+  }
+  return attrs;
+}
 
 /**
  * 从 XML 文本中提取所有指定标签（正确处理嵌套同名标签）
@@ -271,12 +313,7 @@ function extractXmlTags(xmlText, tagName) {
     const innerXml = xmlText.substring(innerStart, foundClose);
 
     const attrStr = xmlText.substring(afterPrefix, gtIdx);
-    const attrs = new Map();
-    const attrRegex = /(\w[\w-]*)\s*=\s*"([^"]*)"/g;
-    let attrMatch;
-    while ((attrMatch = attrRegex.exec(attrStr)) !== null) {
-      attrs.set(attrMatch[1], attrMatch[2]);
-    }
+    const attrs = parseAttributes(attrStr);
 
     results.push({ tagName: tagName, attrs: attrs, innerXml: innerXml, fullText: fullText });
     pos = foundClose + closeTag.length;
@@ -307,16 +344,13 @@ function unescapeXml(str) {
 /** 提取 metadata 中的 prop 键值对 */
 function extractMetadata(innerXml) {
   const result = {};
-  const metaRegex = /<metadata\s+owner="([^"]*)">([\s\S]*?)<\/metadata>/i;
-  const metaMatch = metaRegex.exec(innerXml);
-  if (!metaMatch) return result;
+  const metadata = extractXmlTags(innerXml, 'metadata')[0];
+  if (!metadata) return result;
 
-  const propsStr = metaMatch[2];
-  const propRegex = /<prop\s+key="([^"]*)">([\s\S]*?)<\/prop>/gi;
-  let propMatch;
-  while ((propMatch = propRegex.exec(propsStr)) !== null) {
-    const key = propMatch[1];
-    const val = unescapeXml(propMatch[2].trim());
+  for (const prop of extractXmlTags(metadata.innerXml, 'prop')) {
+    const key = prop.attrs.get('key');
+    if (key == null) continue;
+    const val = unescapeXml(prop.innerXml.trim());
     // 关键修复：保留原始字符串，不要对纯数字 id 做 parseInt。
     // Chrome/Edge 的书签 id 本质是字符串（如 "123"），若将 <prop key="id">123</prop>
     // 解析成 number 123，会在 XBEL 多端往返后破坏「字符串 id === 字符串 id」的严格匹配，
@@ -331,16 +365,8 @@ function extractMetadata(innerXml) {
 
 /** 将 XBEL XML 字符串转换为插件数据格式（扁平 JSON） */
 function xbelToJson(xmlString) {
-  if (!xmlString || typeof xmlString !== 'string') {
-    return { version: 1, bookmarks: [] };
-  }
-
-  const xbelMatches = extractXmlTags(xmlString, 'xbel');
-  if (xbelMatches.length === 0) {
-    console.warn('[xbel] 无效的 XBEL 文档：找不到 <xbel> 根元素');
-    return { version: 1, bookmarks: [] };
-  }
-
+  const validatedXml = validateXbel(xmlString);
+  const xbelMatches = extractXmlTags(validatedXml, 'xbel');
   const xbelInner = xbelMatches[0].innerXml;
   const result = {
     version: 1,
@@ -409,18 +435,19 @@ function xbelToJson(xmlString) {
 
   let barFolder = null, otherFolder = null, mobileFolder = null;
   const assigned = new Set();
+  const assignedFolders = new Set();
   // 第一遍：按 title 精确匹配分配
   for (const f of rootFolders) {
     const src = matchRootSourceByTitle(f);
-    if (src === 'bar' && !assigned.has('bar')) { barFolder = f; assigned.add('bar'); }
-    else if (src === 'other' && !assigned.has('other')) { otherFolder = f; assigned.add('other'); }
-    else if (src === 'mobile' && !assigned.has('mobile')) { mobileFolder = f; assigned.add('mobile'); }
+    if (src === 'bar' && !assigned.has('bar')) { barFolder = f; assigned.add('bar'); assignedFolders.add(f); }
+    else if (src === 'other' && !assigned.has('other')) { otherFolder = f; assigned.add('other'); assignedFolders.add(f); }
+    else if (src === 'mobile' && !assigned.has('mobile')) { mobileFolder = f; assigned.add('mobile'); assignedFolders.add(f); }
   }
   // 第二遍：未匹配的 folder 用剩余空位按出现顺序兜底（兼容旧版/异常 XBEL）
   const orderedSources = ['bar', 'other', 'mobile'];
   let orderIdx = 0;
   for (const f of rootFolders) {
-    if (assigned.has(f)) continue;
+    if (assignedFolders.has(f)) continue;
     while (orderIdx < orderedSources.length && assigned.has(orderedSources[orderIdx])) orderIdx++;
     if (orderIdx >= orderedSources.length) break;
     const src = orderedSources[orderIdx++];
@@ -591,13 +618,8 @@ function xbelToJson(xmlString) {
         
         // 提取属性和内容
         const attrStr = folderInnerXml.substring(nextStart + 10, gtIdx); // '<bookmark '.length = 10
-        const attrs = new Map();
-        const attrRegex = /(\w[\w-]*)\s*=\s*"([^"]*)"/g;
-        let attrMatch;
-        while ((attrMatch = attrRegex.exec(attrStr)) !== null) {
-          attrs.set(attrMatch[1], attrMatch[2]);
-        }
-        
+        const attrs = parseAttributes(attrStr);
+
         const href = attrs.get('href') || '';
         const title = extractChildText(bookmarkInner, 'title') || href;
         const meta = extractMetadata(bookmarkInner);
@@ -785,7 +807,7 @@ function chromeToXbel(tree, meta) {
     if (meta.deviceId) globalMeta.deviceId = meta.deviceId;
     if (meta.version) globalMeta.version = meta.version;
     if (meta.tombstones && Array.isArray(meta.tombstones)) globalMeta.tombstones = JSON.stringify(meta.tombstones);
-    if (meta.endpoints) globalMeta.endpoints = JSON.stringify(meta.endpoints);
+    if (meta.endpoints) globalMeta.endpoints = JSON.stringify(sanitizeEndpoints(meta.endpoints));
     if (meta.snapshots) globalMeta.snapshots = JSON.stringify(meta.snapshots);
   }
   // 容器名声明：桶是「容器型」（手机根下那个文件夹、桌面的 其他收藏夹/根目录 镜像）时

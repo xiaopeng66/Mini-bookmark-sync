@@ -8,10 +8,14 @@ edge://extensions 点一下该扩展的「重新加载」，WebDAV 配置原地�
 去掉 update_url（避免浏览器去商店把布局回滚成旧版）。
 
 用法：python tools/stage_edge_unpacked.py
+发布隔离暂存：python tools/stage_edge_unpacked.py --output dist/edge-unpacked-2.2.0
+显式输出必须是工作区内尚不存在的目录，不会清理已有的已安装目录。
 """
+import argparse
 import io
 import json
 import os
+from pathlib import Path
 import shutil
 
 import packaging as P
@@ -54,10 +58,46 @@ def clean_dir(path):
             os.remove(p)
 
 
+def isolated_output(value):
+    if not value.strip():
+        raise ValueError('显式输出目录不能为空')
+    if '..' in Path(value).parts:
+        raise ValueError('显式输出路径不能包含 ..')
+    workspace = Path(P.SRC).resolve().parents[1]
+    target = Path(os.path.abspath(value))
+    try:
+        target.relative_to(workspace)
+    except ValueError:
+        raise ValueError('显式输出目录必须位于工作区内')
+    if target == workspace or target == Path(P.SRC).resolve():
+        raise ValueError('不能暂存到工作区或项目根目录')
+    legacy = Path(P.DIST).resolve() / 'edge-unpacked'
+    if target == legacy or legacy in target.parents or target in legacy.parents:
+        raise ValueError('显式输出目录不能覆盖或包含默认 Edge 目录')
+    for part in (target, *target.parents):
+        if part == workspace.parent:
+            break
+        if part.is_symlink():
+            raise ValueError('输出路径不能包含符号链接')
+    if target.exists() or target.is_symlink():
+        raise FileExistsError('输出目录已存在，拒绝覆盖: ' + str(target))
+    return str(target)
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', help='工作区内新的隔离输出目录；必须不存在')
+    args = parser.parse_args()
     ver = P.source_version()
-    out = os.path.join(P.DIST, 'edge-unpacked')
-    clean_dir(out)
+    if args.output is not None:
+        try:
+            out = isolated_output(args.output)
+        except (ValueError, FileExistsError) as error:
+            parser.error(str(error))
+        os.makedirs(out)
+    else:
+        out = os.path.join(P.DIST, 'edge-unpacked')
+        clean_dir(out)
     P.stage_sources(out, refresh=False)
     with io.open(os.path.join(out, 'VERSION.txt'), 'w', encoding='utf-8', newline='\n') as f:
         f.write(ver + '\n')
