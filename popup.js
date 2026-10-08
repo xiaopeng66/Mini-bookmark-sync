@@ -1066,9 +1066,13 @@ clearConfigBtn.onclick = async () => {
     });
     if (result && result.success) {
       if (result.cloudCleared === false) {
-        setConfigStatus('✓ 本地缓存已清除（云端清理失败，请检查网络后重试）', 'status-bar ok');
+        // ★ 「别的设备刚写过云端」是条件写入的安全拒绝，不是网络故障 —— 报错方向错
+        //   会让用户去查网络，而真正该做的是先同步一次再重试。
+        setConfigStatus(result.cloudError === 'conflict'
+          ? '✓ 本地缓存已清除（云端文件刚被其他设备修改，已拒绝覆盖；请先同步一次再重试）'
+          : '✓ 本地缓存已清除（云端清理失败，请检查网络后重试）', 'status-bar ok');
       } else {
-        setConfigStatus('✓ 同步缓存已清除', 'status-bar ok');
+        setConfigStatus('✓ 同步缓存已清除' + (result.note || ''), 'status-bar ok');
       }
     } else {
       setConfigStatus('重置失败：' + (result && result.message || '未知错误'));

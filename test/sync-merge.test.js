@@ -29,6 +29,9 @@ const M = global.MiniSync;
 const bindSyncStatusBucket = M.storage.bindSyncStatusBucket;
 vm.runInThisContext(fs.readFileSync(path.join(ROOT, 'lib/webdav.js'), 'utf8'), { filename: 'lib/webdav.js' });
 const isStrongETag = M.webdav.isStrongETag;
+const versionWriteCondition = M.webdav.versionWriteCondition;
+const describeWriteProtection = M.webdav.describeWriteProtection;
+const writeProtectionNote = M.webdav.writeProtectionNote;
 
 // 默认可控 chrome 树：书签栏(1) 下挂 百度(10) 与 工作(11)，工作下挂 GitHub(110)
 const DEFAULT_TREE = [{
@@ -64,8 +67,11 @@ function installMocks(mergeResultOverride = {}) {
   // A missing-file GET has no ETag; the implementation must create it conditionally.
   M.webdav = {
     isStrongETag,
-    getFileVersion: async () => ({ exists: false, content: null, etag: null, lastModified: 0 }),
-    putFile: async () => { captured.putCalled = true; return { lastModified: 123 }; },
+    versionWriteCondition,
+    describeWriteProtection,
+    writeProtectionNote,
+    getFileVersion: async () => ({ exists: false, content: null, etag: null, lastModified: 0, serverModified: 0 }),
+    putFile: async () => { captured.putCalled = true; return { lastModified: 123, protection: 'create-only' }; },
   };
 
   // xbel：捕获 chromeToXbel 的输入树，xbelToJson 据此返回其扁平列表（反映 prune 结果）

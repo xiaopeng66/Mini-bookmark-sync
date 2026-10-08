@@ -4,14 +4,20 @@
 > 本仓库是 [原项目](https://github.com/jagshen/Mini-bookmark-sync) 的维护版：保留原项目的全部功能，
 > 并补上手机端支持、双向增量增删，以及一批跨端同步的一致性修复。
 
-[![Version](https://img.shields.io/badge/version-2.2.0-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
+[![Version](https://img.shields.io/badge/version-2.2.1-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
 
-## v2.2.0 发布说明
+## v2.2.1 发布说明
 
-本版针对 v2.1.0 审查中的数据完整性、目标隔离和跨端失败报告进行修复；兼容性限制及升级注意事项见 [v2.2.0 发布说明](docs/release-v2.2.0.md)。
+修掉 v2.2.0 的兼容性回归：v2.2.0 要求云端文件必须返回**强 ETag**，否则拒绝写入，导致坚果云等
+不返回强 ETag 的服务上「合并」直接失败（显示「云端缺少强 ETag，无法安全地合并写入」）。
+v2.2.1 改为按服务器实际能力分层选择并发校验，详见 [v2.2.1 发布说明](docs/release-v2.2.1.md)。
+若你装的是 v2.2.0 且同步报该错误，升级到 v2.2.1 即可，不需要改任何配置。
+
+v2.2.0 的内容仍有效：针对 v2.1.0 审查中的数据完整性、目标隔离和跨端失败报告进行修复；
+兼容性限制及升级注意事项见 [v2.2.0 发布说明](docs/release-v2.2.0.md)。
 
 ## ✨ 功能特色
 
@@ -98,9 +104,19 @@
 | Nextcloud | ⭐⭐⭐ | 开源自建，完全可控 |
 | 群晖 NAS | ⭐⭐⭐ | WebDAV Server 套件 |
 | Teracloud | ⭐⭐ | 免费提供 WebDAV |
-| 其他 WebDAV | ⭐ | 仅支持 RFC 4918 不足以保证兼容；还需下述条件请求能力 |
+| 其他 WebDAV | ⭐ | 仅支持 RFC 4918 不足以保证兼容；并发写入保护取决于下述能力 |
 
-本版未对上述服务完成生产 WebDAV 验证。现有文件须返回强 ETag 并正确执行 `If-Match`；新文件须执行 `If-None-Match: *`。缺失或弱 ETag 会被客户端拒绝，具体服务的并发语义仍待验证。
+写入共用一份文件时，客户端按服务器**实际提供的能力**分层选择并发校验，从强到弱：
+
+1. 强 ETag → `If-Match`（原子、精确；本地已有的文件首选这一档）
+2. 只有弱 ETag 或只有 `Last-Modified` → `If-Unmodified-Since`（仍是服务端原子比较，秒级粒度）。
+   弱 ETag 不会被当成强 ETag 送去 `If-Match`（RFC 7232 要求强比较，那样只会拿到必然的 412）
+3. 两者都没有 → 仍然写入，但**同步结果里会明说本次没有并发保护**，不会假装安全
+
+新文件使用 `If-None-Match: *`，只允许创建，避免覆盖同名既有文件。降档时弹窗的同步结果会带上说明。
+
+v2.2.1 未对上述服务完成生产 WebDAV 验证：具体服务实际返回哪些头、是否真正执行
+`If-Unmodified-Since`，仍待你在真实服务上确认。本仓库的自动化测试用模拟服务器覆盖了这三种能力档位。
 
 > 💡 **坚果云用户**：需要在[第三方应用管理](https://www.jianguoyun.com/d/account/security)中创建应用密码，不能使用登录密码。
 
@@ -123,7 +139,7 @@
 - WebDAV 协议通信
 - Chrome Storage API 本地存储
 
-开发测试使用的 `Vitest 1.6.1` 存在已知安全公告，本版未升级；该工具及其依赖树不随扩展分发。镜像来源的传递依赖公告覆盖不完整，不代表完整依赖树已排除漏洞，详见 [发布说明](docs/release-v2.2.0.md)。
+开发测试使用的 `Vitest 1.6.1` 存在已知安全公告，本版未升级；该工具及其依赖树不随扩展分发。镜像来源的传递依赖公告覆盖不完整，不代表完整依赖树已排除漏洞，详见 [发布说明](docs/release-v2.2.1.md)。
 
 同一份源码出两种宿主形态，差异只在 manifest：Chromium 系用 `background.service_worker`，
 Gecko 系用 `background.scripts`（Gecko 会直接拒绝 MV3 的 service worker，那种宿主上 MV3 包的后台从不运行）。

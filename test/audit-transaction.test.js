@@ -264,23 +264,261 @@ test('relationship switch clears every bridge baseline before actual Berry read'
   }
 });
 
-test.each(['upload', 'merge', 'download'])('%s rejects weak ETag before local mutation', async action => {
-  const d = device('weak-etag-' + action);
-  const bookmark = await d.add('1', 'Keep', 'https://weak.invalid/');
+// ===== 服务器并发标识能力差异 =====
+// 实测回归（坚果云）：v2.2.0 要求云端必须返回强 ETag，否则「合并」直接报
+// 「云端缺少强 ETag，无法安全地合并写入」—— 同步彻底不可用。
+// 契约改为按服务器实际能力分层，下面这组用例锁定分层结果：
+//   ① 强 ETag 可用 → If-Match，不得退化；
+//   ② 只有弱 ETag → 绝不拿它做 If-Match（RFC 7232 强比较必然 412），改用 Last-Modified；
+//   ③ 连 Last-Modified 都没有 → 仍然写成功，但在结果里如实说明没有并发保护；
+//   ④ 下载不写云端，版本标识缺失一律不影响。
+// ②③④ 在 v2.2.0 上必须失败，否则这组回归没有守住任何东西。
+
+function mainFilePuts(d) {
+  return d.cloud.requests.filter(r => r.method === 'PUT' && r.url === d.mainUrl);
+}
+
+test('versionWriteCondition never hands a weak ETag to If-Match', async () => {
+  const d = device('write-condition-unit');
+  const condition = d.M.webdav.versionWriteCondition({ exists: true, etag: 'W/"weak"', serverModified: 0 });
+  expect(condition).toEqual({});
+  expect(d.M.webdav.describeWriteProtection({ etag: 'W/"weak"' })).toBe('none');
+  expect(d.M.webdav.versionWriteCondition({ exists: true, etag: 'W/"weak"', serverModified: 1000 }))
+    .toEqual({ since: 1000 });
+  expect(d.M.webdav.versionWriteCondition({ exists: true, etag: '"strong"', serverModified: 1000 }))
+    .toEqual({ etag: '"strong"' });
+  expect(d.M.webdav.versionWriteCondition({ exists: false })).toEqual({ missing: true });
+});
+
+test('a strong-ETag server still uses If-Match and never degrades', async () => {
+  const d = device('strong-etag-kept');
+  await d.add('1', 'Keep', 'https://strong.invalid/');
   expect((await d.M.orchestrator.uploadBookmarks({})).success).toBe(true);
-  const cloudFile = d.cloud.files.get(d.mainUrl);
-  const parsed = d.M.xbel.parseXbelFromString(cloudFile.content);
-  const key = [...d.M.xbelPath.computeJsonPathKeys(parsed.bookmarks).values()].find(pk => pk.includes('weak.invalid'));
+  // 云端本来没有文件 → 只允许创建，避免覆盖掉同名的既有文件
+  expect(mainFilePuts(d).pop().headers['If-None-Match']).toBe('*');
+
+  await d.add('1', 'Later', 'https://later.invalid/');
+  const beforeEtag = d.cloud.files.get(d.mainUrl).etag;
+  expect((await d.M.orchestrator.uploadBookmarks({})).success).toBe(true);
+  const updated = mainFilePuts(d).pop();
+  expect(updated.headers['If-Match']).toBe(beforeEtag);
+  expect(updated.headers['If-Unmodified-Since']).toBeUndefined();
+});
+
+test('clearing cloud tombstones writes the shared XBEL conditionally', async () => {
+  const cloud = makeCloud();
+  const d = device('clear-cache-conditional', cloud, { background: true });
+  await d.add('1', 'Keep', 'https://keep.invalid/');
+  expect((await d.M.orchestrator.uploadBookmarks({})).success).toBe(true);
+  const lastPut = () => cloud.requests.filter(r => r.method === 'PUT').pop();
+  const mainUrl = lastPut().url;
+
+  const beforeEtag = cloud.files.get(mainUrl).etag;
+  const first = await d.send({ action: 'clearSyncCache', scope: 'current' });
+  expect(first).toMatchObject({ ok: true, success: true, cloudCleared: true });
+  expect(first.note).toBe('');                       // 满档保护不该冒出降档提醒
+  expect(lastPut().headers['If-Match']).toBe(beforeEtag);
+
+  // 服务器不再暴露 ETag：清理仍要写成功（不许整条流程失败），但必须带条件，
+  // 不许退回成无条件覆盖 —— 这条路径改的是全局共享的 XBEL。
+  cloud.etagMode = 'none';
+  const beforeModified = new Date(cloud.files.get(mainUrl).mtime).toUTCString();
+  const second = await d.send({ action: 'clearSyncCache', scope: 'all' });
+  expect(second).toMatchObject({ ok: true, success: true, cloudCleared: true });
+  expect(lastPut().headers['If-Match']).toBeUndefined();
+  expect(lastPut().headers['If-Unmodified-Since']).toBe(beforeModified);
+  // ★ 这条路径此前既不写条件、也不告诉用户保护级别；现在两者都必须成立。
+  expect(second.note).toContain('改用云端修改时间做并发校验');
+
+  // 完全没有版本线索的服务器上，清理仍然成功，但必须如实说明没有并发保护
+  cloud.lastModifiedMode = 'none';
+  cloud.dateMode = 'none';
+  const third = await d.send({ action: 'clearSyncCache', scope: 'all' });
+  expect(third).toMatchObject({ ok: true, success: true, cloudCleared: true });
+  expect(third.note).toContain('没有并发保护');
+});
+
+test('a rejected maintenance write is reported as a conflict, not a network fault', async () => {
+  const cloud = makeCloud();
+  const d = device('clear-cache-conflict', cloud, { background: true });
+  await d.add('1', 'Keep', 'https://keep.invalid/');
+  expect((await d.M.orchestrator.uploadBookmarks({})).success).toBe(true);
+  cloud.etagMode = 'weak';
+  const mainUrl = cloud.requests.filter(r => r.method === 'PUT').pop().url;
+  // 清理流程读完之后，另一台设备抢先写入了共享 XBEL
+  cloud.hook = req => {
+    if (req.method !== 'GET' || req.url !== mainUrl) return null;
+    const served = response(200, cloud.files.get(req.url).content, cloud.files.get(req.url), cloud);
+    cloud.put(req.url, cloud.files.get(req.url).content.replace('Keep', 'Theirs'));
+    return served;
+  };
+  const result = await d.send({ action: 'clearSyncCache', scope: 'all' });
+  expect(result.cloudCleared).toBe(false);
+  expect(result.cloudError).toBe('conflict');   // 安全拒绝 ≠ 网络故障，不能报错方向
+  expect(cloud.files.get(mainUrl).content).toContain('Theirs');
+});
+
+test.each(['upload', 'merge'])('%s writes when the server exposes no strong ETag', async action => {
+  const cloud = makeCloud();
+  const d = device('no-strong-etag-' + action, cloud);
+  const keep = await d.add('1', 'Keep', 'https://keep.invalid/');
+  expect((await d.M.orchestrator.uploadBookmarks({})).success).toBe(true);
+  cloud.etagMode = 'none';                    // 服务器从此不再暴露 ETag
+  await d.add('1', 'Later', 'https://later.invalid/');
+  const beforeModified = new Date(cloud.files.get(d.mainUrl).mtime).toUTCString();
+  const result = await d.M.orchestrator[action === 'upload' ? 'uploadBookmarks' : 'mergeSync']({});
+  expect(result.success).toBe(true);
+  const body = d.cloud.files.get(d.mainUrl).content;
+  expect(body).toContain('Later');
+  expect(body).toContain('Keep');             // 既有内容不许在降档写入里被顺手丢掉
+  expect(d.byId.has(keep.id)).toBe(true);
+  expect(d.state.removals).toHaveLength(0);   // 降档不等于放任本地删除
+  const put = mainFilePuts(d).pop();
+  expect(put.headers['If-Match']).toBeUndefined();
+  expect(put.headers['If-Unmodified-Since']).toBe(beforeModified);
+  // 降档必须说出「降到哪一档」，只用「并发」二字无法区分「秒级校验」与「完全没保护」
+  expect(result.message).toContain('改用云端修改时间做并发校验');
+  expect(result.message).not.toContain('没有并发保护');
+});
+
+test.each(['upload', 'merge'])('%s falls back to If-Unmodified-Since on a weak ETag', async action => {
+  const cloud = makeCloud();
+  const d = device('weak-etag-' + action, cloud);
+  const keep = await d.add('1', 'Keep', 'https://keep.invalid/');
+  expect((await d.M.orchestrator.uploadBookmarks({})).success).toBe(true);
+  cloud.etagMode = 'weak';
+  await d.add('1', 'Later', 'https://later.invalid/');
+  const beforeModified = new Date(cloud.files.get(d.mainUrl).mtime).toUTCString();
+  const result = await d.M.orchestrator[action === 'upload' ? 'uploadBookmarks' : 'mergeSync']({});
+  expect(result.success).toBe(true);
+  const put = mainFilePuts(d).pop();
+  expect(put.headers['If-Match']).toBeUndefined();
+  expect(put.headers['If-Unmodified-Since']).toBe(beforeModified);
+  expect(d.cloud.files.get(d.mainUrl).content).toContain('Keep');
+  expect(d.byId.has(keep.id)).toBe(true);
+  expect(d.state.removals).toHaveLength(0);
+});
+
+test.each(['upload', 'merge'])('%s still writes but reports when the server has no version header', async action => {
+  const cloud = makeCloud();
+  const d = device('no-version-' + action, cloud);
+  const keep = await d.add('1', 'Keep', 'https://keep.invalid/');
+  expect((await d.M.orchestrator.uploadBookmarks({})).success).toBe(true);
+  cloud.etagMode = 'none';
+  cloud.lastModifiedMode = 'none';
+  cloud.dateMode = 'none';
+  await d.add('1', 'Later', 'https://later.invalid/');
+  const result = await d.M.orchestrator[action === 'upload' ? 'uploadBookmarks' : 'mergeSync']({});
+  expect(result.success).toBe(true);
+  const body = d.cloud.files.get(d.mainUrl).content;
+  expect(body).toContain('Later');
+  expect(body).toContain('Keep');
+  expect(d.byId.has(keep.id)).toBe(true);
+  expect(d.state.removals).toHaveLength(0);
+  const put = mainFilePuts(d).pop();
+  expect(put.headers['If-Match']).toBeUndefined();
+  expect(put.headers['If-Unmodified-Since']).toBeUndefined();
+  expect(result.message).toContain('没有并发保护');
+});
+
+test.each(['upload', 'merge'])('%s propagates a cloud tombstone at the fallback tier', async action => {
+  const cloud = makeCloud();
+  const d = device('fallback-tombstone-' + action, cloud);
+  const bookmark = await d.add('1', 'Doomed', 'https://doomed.invalid/');
+  expect((await d.M.orchestrator.uploadBookmarks({})).success).toBe(true);
+  // 另一台设备删掉了它：云端写出墓碑，但服务器只给弱 ETag
+  const cloudFile = cloud.files.get(d.mainUrl);
+  const key = [...d.M.xbelPath.computeJsonPathKeys(d.M.xbel.parseXbelFromString(cloudFile.content).bookmarks).values()]
+    .find(pk => pk.includes('doomed.invalid'));
   cloudFile.content = d.M.xbel.chromeToXbel([{ id: '0', children: [{ id: '1', title: '书签栏', children: [] }] }], {
     tombstones: [{ key, deletedAt: d.state.now + 1, deviceId: 'other' }]
   });
-  cloudFile.etag = 'W/"weak"';
-  const puts = d.cloud.requests.filter(req => req.method === 'PUT').length;
-  const result = await d.M.orchestrator[action === 'upload' ? 'uploadBookmarks' : action === 'merge' ? 'mergeSync' : 'downloadBookmarks']({ force: true });
+  cloud.etagMode = 'weak';
+  const result = await d.M.orchestrator[action === 'upload' ? 'uploadBookmarks' : 'mergeSync']({});
+  expect(result.success).toBe(true);
+  // 降档后删除传播必须照旧生效 —— 旧版那条「弱 ETag 一律拒绝」的用例正是在覆盖这个矩阵
+  expect(d.byId.has(bookmark.id)).toBe(false);
+  expect(d.state.removals.map(n => n.url)).toContain('https://doomed.invalid/');
+  expect(mainFilePuts(d).pop().headers['If-Unmodified-Since']).toBeTruthy();
+});
+
+test('download needs no version identifier because it never writes to the cloud', async () => {
+  const cloud = makeCloud();
+  const source = device('no-etag-download-source', cloud);
+  await source.add('1', 'Remote', 'https://remote-no-etag.invalid/');
+  expect((await source.M.orchestrator.uploadBookmarks({})).success).toBe(true);
+  const target = device('no-etag-download-target', cloud);
+  cloud.etagMode = 'none';
+  cloud.lastModifiedMode = 'none';
+  cloud.dateMode = 'none';
+  const puts = cloud.requests.filter(r => r.method === 'PUT').length;
+  const result = await target.M.orchestrator.downloadBookmarks({});
+  expect(result.success).toBe(true);
+  expect(target.paths().some(n => n.url === 'https://remote-no-etag.invalid/')).toBe(true);
+  expect(cloud.requests.filter(r => r.method === 'PUT')).toHaveLength(puts);
+});
+
+test('fallback condition still stops a concurrent overwrite', async () => {
+  const cloud = makeCloud();
+  const d = device('fallback-conflict', cloud);
+  const keep = await d.add('1', 'Keep', 'https://keep.invalid/');
+  const other = await d.add('1', 'Other', 'https://other.invalid/');
+  expect((await d.M.orchestrator.uploadBookmarks({})).success).toBe(true);
+  cloud.etagMode = 'weak';   // 服务器只给弱 ETag ⇒ 本机必须走 If-Unmodified-Since 这一档
+  const modified = cloud.files.get(d.mainUrl).mtime;
+  // ★ 真实的竞争窗口是「本机读完之后、写回之前」：在服务这一版 GET 的同时让另一台设备写入。
+  //   客户端会在操作开始时重新 GET，所以必须在 GET 里制造竞争；在 PUT 里挂 hook 只能造出
+  //   一个客户端本来就能满足的条件，那样测的是「错误路径接没接通」，不是「并发有没有被挡住」。
+  cloud.hook = req => {
+    if (req.method !== 'GET' || req.url !== d.mainUrl) return null;
+    const served = response(200, cloud.files.get(req.url).content, cloud.files.get(req.url), cloud);
+    cloud.put(req.url, cloud.files.get(req.url).content.replace('Keep', 'Theirs'));
+    return served;
+  };
+  await d.chrome.bookmarks.update(keep.id, { title: 'Mine' });
+  const result = await d.M.orchestrator.uploadBookmarks({ force: true });
+
   expect(result.success).toBe(false);
-  expect(d.byId.has(bookmark.id)).toBe(true);
+  expect(result.code).toBe('CLOUD_CONFLICT');
+  expect(result.message).toMatch(/云端文件已更改/);
+  // 对端的正文没有被覆盖，本机也没有把它自己的删除/改名落成既成事实
+  expect(cloud.files.get(d.mainUrl).content).toContain('Theirs');
+  expect(cloud.files.get(d.mainUrl).mtime).toBeGreaterThan(modified);
+  expect(d.byId.has(keep.id) && d.byId.has(other.id)).toBe(true);
   expect(d.state.removals).toHaveLength(0);
-  expect(d.cloud.requests.filter(req => req.method === 'PUT')).toHaveLength(puts);
+  expect(cloud.requests.filter(r => r.method === 'PUT')).toHaveLength(2);   // 首次上传 + 被拒的这一次
+});
+
+test('a server that exposes only Date never gets If-Unmodified-Since', async () => {
+  const cloud = makeCloud();
+  const d = device('date-only-server', cloud);
+  await d.add('1', 'Keep', 'https://keep.invalid/');
+  expect((await d.M.orchestrator.uploadBookmarks({})).success).toBe(true);
+  cloud.etagMode = 'none';
+  cloud.lastModifiedMode = 'none';   // 只有响应 Date，没有 Last-Modified
+  expect(cloud.files.get(d.mainUrl).mtime).toBeGreaterThan(0);
+  await d.add('1', 'Later', 'https://later.invalid/');
+  const result = await d.M.orchestrator.uploadBookmarks({});
+  expect(result.success).toBe(true);
+  // 拿响应 Date（≈现在）当修改时间会得到一个永远匹配不上的条件：真实服务器必然 412，
+  // 而这里因为 enforcePreconditions 打开，写一个坑条件就不可能「碰巧通过」。
+  expect(mainFilePuts(d).pop().headers['If-Unmodified-Since']).toBeUndefined();
+  expect(result.message).toMatch(/没有并发保护/);
+});
+
+test('a server without Last-Modified does not fake a cloud conflict', async () => {
+  const cloud = makeCloud();
+  const d = device('no-last-modified-conflict', cloud);
+  await d.add('1', 'Keep', 'https://keep.invalid/');
+  expect((await d.M.orchestrator.uploadBookmarks({})).success).toBe(true);
+  cloud.lastModifiedMode = 'none';   // 只剩响应 Date
+  await d.add('1', 'Later', 'https://later.invalid/');
+  // 不传 force：服务端没给修改时间时，不能把响应 Date 当「云端被别人改过」，
+  // 否则这台服务器上每次非强制上传都会先跟用户吵一架。
+  const result = await d.M.orchestrator.uploadBookmarks({});
+  expect(result.code).not.toBe('CLOUD_CONFLICT');
+  expect(result.success).toBe(true);
+  expect(d.cloud.files.get(d.mainUrl).content).toContain('Later');
 });
 
 test('conditional PUT rejects weak ETag without network writes', async () => {

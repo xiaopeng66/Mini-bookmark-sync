@@ -14,12 +14,66 @@ const flush = async () => { for (let i = 0; i < 80; i++) await Promise.resolve()
 
 function makeCloud() {
   return { files: new Map(), requests: [], hook: null, clock: Date.UTC(2026, 9, 7, 12),
+    // 真实服务器的并发标识能力差异（坚果云/部分移动端宿主拿不到可用的强 ETag）正是
+    // 「写入能否成立」的前提条件，测试必须能如实造出来，否则回归会再次漏网。
+    etagMode: 'strong',        // 'strong' | 'weak' | 'none'
+    lastModifiedMode: 'full',  // 'full' | 'none'
+    dateMode: 'full',          // 'full' | 'none' —— 与 Last-Modified 分开，才能造出「只给 Date」的服务器
+    // ★ 默认按真实服务器语义检查 PUT 预条件。不检查的话，测试只能看客户端「发了什么头」，
+    //   发一个永远匹配不上的条件（例如拿响应 Date 当修改时间、或丢掉了亚秒精度）也会全绿。
+    enforcePreconditions: true,
+    // ★ 响应 Date 是「服务器当前时间」，与文件 mtime 是两回事：日期头随每次请求前进，
+    //   而 mtime 只在写入时变。两者混同的话，「拿 Date 当修改时间去比对」这种错误
+    //   在测试里永远撞不出来（旧骨架正是如此）。
+    serverTick: 0,
+    serverNow() { this.serverTick += 1; return new Date(this.clock + this.serverTick * 1000).toUTCString(); },
     put(url, content, contentType) {
       const file = { content: String(content), mtime: this.clock += 5000,
         etag: '"v' + (this.requests.length + this.clock) + '"', contentType: contentType || 'text/plain' };
       this.files.set(url, file);
       return file;
     } };
+}
+
+/** 按 cloud 的 etagMode / lastModifiedMode / dateMode 决定本次响应暴露哪些版本头。 */
+function responseHeaders(file, cloud) {
+  const etagMode = cloud ? cloud.etagMode : 'strong';
+  const lastModifiedMode = cloud ? cloud.lastModifiedMode : 'full';
+  const dateMode = cloud ? cloud.dateMode : 'full';
+  const lastModifiedStamp = new Date(file.mtime || Date.UTC(2026, 9, 7, 12)).toUTCString();
+  // 每次构造响应都向服务器时钟要一次「现在」（也正因此只在 response() 里调用一次）。
+  const dateStamp = cloud && typeof cloud.serverNow === 'function'
+    ? cloud.serverNow() : lastModifiedStamp;
+  return { get(name) {
+    const k = String(name).toLowerCase();
+    if (k === 'etag') {
+      if (etagMode === 'none' || !file.etag) return null;
+      return etagMode === 'weak' ? 'W/' + file.etag : file.etag;
+    }
+    if (k === 'last-modified') return lastModifiedMode === 'none' ? null : lastModifiedStamp;
+    if (k === 'date') return dateMode === 'none' ? null : dateStamp;
+    return null;
+  } };
+}
+
+/**
+ * 真实服务器的预条件判定（RFC 7232）。命中返回状态码，否则 null。
+ * HTTP 日期只有秒精度，所以比较的是截断到秒的 mtime —— 这正是真实服务端的口径，
+ * 也正因为如此，「客户端发出的时间必须与服务器给的一致」才会被真正检验。
+ */
+function preconditionFailure(headers, current) {
+  const ifMatch = headers['If-Match'];
+  const ifNoneMatch = headers['If-None-Match'];
+  const ifUnmodified = headers['If-Unmodified-Since'];
+  if (ifMatch !== undefined) return (!current || ifMatch !== current.etag) ? 412 : null;
+  if (ifNoneMatch !== undefined) return (ifNoneMatch === '*' && current) ? 412 : null;
+  if (ifUnmodified !== undefined) {
+    // 资源不存在时 RFC 7232 要求忽略该条件；存在则比较秒级修改时间
+    if (!current) return null;
+    const known = Date.parse(ifUnmodified);
+    return Number.isNaN(known) ? null : (Math.floor(current.mtime / 1000) * 1000 > known ? 412 : null);
+  }
+  return null;
 }
 
 function makeDevice(name, cloud = makeCloud(), opts = {}) {
@@ -130,14 +184,17 @@ function makeDevice(name, cloud = makeCloud(), opts = {}) {
       const req = { device: name, url: String(url), method: init.method || 'GET', headers: clone(init.headers || {}), body: init.body };
       cloud.requests.push(req);
       if (cloud.hook) { const handled = await cloud.hook(req, state); if (handled) return handled; }
-      if (req.method === 'MKCOL') return response(405, '');
+      if (req.method === 'MKCOL') return response(405, '', {}, cloud);
       if (req.method === 'PUT') {
+        const failed = cloud.enforcePreconditions
+          ? preconditionFailure(req.headers, cloud.files.get(req.url)) : null;
+        if (failed) return response(failed, 'precondition failed', {}, cloud);
         const file = cloud.put(req.url, req.body, req.headers['Content-Type']);
-        return response(201, '', file);
+        return response(201, '', file, cloud);
       }
-      if (req.method === 'PROPFIND') return response(207, '');
+      if (req.method === 'PROPFIND') return response(207, '', {}, cloud);
       const file = cloud.files.get(req.url);
-      return file ? response(200, req.method === 'HEAD' ? '' : file.content, file) : response(404, '');
+      return file ? response(200, req.method === 'HEAD' ? '' : file.content, file, cloud) : response(404, '', {}, cloud);
     }
   };
   sandbox.self = sandbox; sandbox.window = sandbox;
@@ -161,9 +218,9 @@ function makeDevice(name, cloud = makeCloud(), opts = {}) {
     async send(message) { return new Promise(resolve => runtime.onMessage.listeners[0](message, { id: runtime.id }, resolve)); },
     close() { for (const t of state.timers) clearTimeout(t); state.timers.clear(); } };
 }
-function response(status, body, file = {}) {
+function response(status, body, file = {}, cloud = null) {
   return { ok: status >= 200 && status < 300, status,
-    headers: { get(name) { const k = name.toLowerCase(); return k === 'last-modified' || k === 'date' ? new Date(file.mtime || Date.UTC(2026,9,7,12)).toUTCString() : k === 'etag' ? file.etag : null; } },
+    headers: responseHeaders(file, cloud),
     text: async () => String(body), json: async () => JSON.parse(String(body)) };
 }
-module.exports = { ROOT, BG, MODULES, clone, flush, makeCloud, makeDevice, response };
+module.exports = { ROOT, BG, MODULES, clone, flush, makeCloud, makeDevice, response, preconditionFailure };

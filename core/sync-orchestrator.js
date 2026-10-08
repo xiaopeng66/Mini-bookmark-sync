@@ -59,20 +59,31 @@ async function doUploadBookmarks(options) {
 
     // Read body and ETag together; HEAD timestamps cannot protect a later PUT.
     const remoteVersion = await MiniSync.webdav.getFileVersion(config.url, config.username, config.password, config.filename);
-    if (remoteVersion.exists && !MiniSync.webdav.isStrongETag(remoteVersion.etag)) throw new Error('云端缺少强 ETag，无法安全地上传覆盖');
     if (remoteVersion.exists && !remoteVersion.content) throw new Error('云端文件为空，已拒绝覆盖');
     if (remoteVersion.exists && !MiniSync.xbel.parseXbelFromString(remoteVersion.content)) throw new Error('XBEL 文件格式无效');
+    // ★ 写条件按服务器实际能力分层：强 ETag→If-Match，退而求其次用同一响应里的
+    //   Last-Modified→If-Unmodified-Since。旧版在这里要求必须有强 ETag，否则拒绝上传 ——
+    //   坚果云这类不返回强 ETag 的服务就此彻底不可用（v2.2.0 实测回归）。
+    const writeCondition = MiniSync.webdav.versionWriteCondition(remoteVersion);
+    if (remoteVersion.exists && !MiniSync.webdav.isStrongETag(remoteVersion.etag)) {
+      console.warn(`[sync] 云端未提供强 ETag（etag=${JSON.stringify(remoteVersion.etag)}，`
+        + `Last-Modified=${remoteVersion.serverModified || '(无)'}），本次写入保护级别：`
+        + MiniSync.webdav.describeWriteProtection(writeCondition));
+    }
 
     // ===== 回迁：上传前云端冲突检测（非强制上传） =====
     // 云端文件 lastModified 比本地记录新 → 说明被其他设备修改过，需用户确认
-    if (!options.force && remoteVersion.exists && remoteVersion.lastModified > 0) {
+    // ★ 只认服务器真的发来的 Last-Modified（serverModified）。没有它时 lastModified
+    //   退化成响应 Date（≈现在），拿去和上次记录比必然「更晚」——那样在没有
+    //   Last-Modified 的服务器上，每次非强制上传都会误报「云端已被其他设备修改」。
+    if (!options.force && remoteVersion.exists && remoteVersion.serverModified > 0) {
       const stored = await MiniSync.storage.getLocal([STORAGE_KEYS.CLOUD_LAST_MODIFIED]);
       const lastSeen = stored[STORAGE_KEYS.CLOUD_LAST_MODIFIED] || 0;
-      if (lastSeen > 0 && remoteVersion.lastModified > lastSeen) {
+      if (lastSeen > 0 && remoteVersion.serverModified > lastSeen) {
         await MiniSync.storage.setSyncStatus({ status: IDLE });
         return { success: false, code: 'CLOUD_CONFLICT',
           message: '云端书签已被其他设备修改，请先下载并合并',
-          remoteModified: remoteVersion.lastModified, endpointKey };
+          remoteModified: remoteVersion.serverModified, endpointKey };
       }
     }
 
@@ -154,8 +165,9 @@ async function doUploadBookmarks(options) {
 
     const xbelString = MiniSync.xbel.chromeToXbel(xbelTree, Object.assign({ syncBucketId: bucketInfo.id }, meta));
     const putResult = await MiniSync.webdav.putFile(config.url, config.username, config.password, config.filename, xbelString, undefined,
-      remoteVersion.exists ? { etag: remoteVersion.etag } : { missing: true });
+      writeCondition);
     mainCommitted = true;
+    uploadNote += MiniSync.webdav.writeProtectionNote(putResult.protection);
     // 记录云端 lastModified，供下次上传冲突检测使用
     await MiniSync.storage.setLocal({ [STORAGE_KEYS.CLOUD_LAST_MODIFIED]: putResult.lastModified || Date.now() });
 
@@ -230,7 +242,10 @@ async function doUploadBookmarks(options) {
       catch (e) { recovery = { ok: false, reason: e.message }; }
     }
     await MiniSync.storage.setSyncStatus({ status: FAILED, error: error.message });
-    return { success: false, message: `上传失败: ${error.message}`, recovery };
+    // ★ code 必须透传：popup 靠 code === 'CLOUD_CONFLICT' 才给「强制覆盖」这条路。
+    //   条件写入在 PUT 阶段被拒（412/409）时如果不带 code，用户只会看到「上传失败」，
+    //   既不知道是并发冲突，也没有任何可走的下一步。
+    return { success: false, message: `上传失败: ${error.message}`, code: error.code, recovery };
   }
 }
 
@@ -288,7 +303,8 @@ async function doDownloadBookmarks(options) {
     const remoteVersion = await MiniSync.webdav.getFileVersion(config.url, config.username, config.password, config.filename);
     const content = remoteVersion.content;
     if (!remoteVersion.exists || !content) throw new Error('云端文件为空或不存在');
-    if (!MiniSync.webdav.isStrongETag(remoteVersion.etag)) throw new Error('云端缺少强 ETag，无法安全地下载');
+    // ★ 下载全程不写云端（下面只有「备份 → 导入本机」），因此不需要任何并发版本标识。
+    //   v2.2.0 曾在这里也要求强 ETag，把一次纯只读操作一并卡死 —— 纯过度的限制，已移除。
 
     // XBEL XML → JSON 中间态
     // ★ 扁平根宿主（手机）在解析云端之前先声明自己的容器名：云端还带着旧版写下的包装

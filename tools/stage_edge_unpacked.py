@@ -8,7 +8,7 @@ edge://extensions 点一下该扩展的「重新加载」，WebDAV 配置原地�
 去掉 update_url（避免浏览器去商店把布局回滚成旧版）。
 
 用法：python tools/stage_edge_unpacked.py
-发布隔离暂存：python tools/stage_edge_unpacked.py --output dist/edge-unpacked-2.2.0
+发布隔离暂存：python tools/stage_edge_unpacked.py --output dist/edge-unpacked-2.2.1
 显式输出必须是工作区内尚不存在的目录，不会清理已有的已安装目录。
 """
 import argparse

@@ -872,24 +872,33 @@ function onRuntimeMessage(message, sender, sendResponse) {
       // 根据范围处理云端墓碑
         // 云端无文件/未配置视为无需清理（cloudCleared=true）；仅网络等异常才标记 false
         let cloudCleared = true;
+        // 云端写入的保护级别说明（见 lib/webdav.js 的分层）；以及失败原因分类
+        // ——「别的设备刚写过」是安全拒绝，不能说成网络故障。
+        let cloudNote = '';
+        let cloudError = '';
         if (scope === 'all') {
           // 清除全部设备：上传空墓碑到云端
           try {
             const config = await MiniSync.webdav.getWebDAVConfig();
             if (config.url) {
               // 下载当前 XBEL，清空 tombstones 和 snapshots，写回（endpoints 随 xbelToJson→jsonToXbel 往返保留）
-              const xbelStr = await MiniSync.webdav.getFile(config.url, config.username, config.password, config.filename);
-              if (xbelStr) {
-                const pluginData = MiniSync.xbel.xbelToJson(xbelStr);
+              // ★ 正文与版本取自同一次 GET：这是全局共享的 XBEL，不带条件地写回会把
+              //   别的设备刚同步上去的内容整份抹掉（旧实现正是不带任何条件的 putFile）。
+              const version = await MiniSync.webdav.getFileVersion(config.url, config.username, config.password, config.filename);
+              if (version.content) {
+                const pluginData = MiniSync.xbel.xbelToJson(version.content);
                 pluginData.tombstones = [];
                 pluginData.snapshots = {};
                 pluginData.lastModified = Date.now();
                 const newXbel = MiniSync.xbel.jsonToXbel(pluginData);
-                await MiniSync.webdav.putFile(config.url, config.username, config.password, config.filename, newXbel);
+                const putResult = await MiniSync.webdav.putFile(config.url, config.username, config.password, config.filename, newXbel, undefined,
+                  MiniSync.webdav.versionWriteCondition(version));
+                cloudNote = MiniSync.webdav.writeProtectionNote(putResult.protection);
               }
             }
           } catch (e) {
             cloudCleared = false;
+            cloudError = e.code === 'CLOUD_CONFLICT' ? 'conflict' : 'error';
             console.warn('[sync] 清除云端墓碑失败:', e.message);
           }
         } else {
@@ -897,27 +906,30 @@ function onRuntimeMessage(message, sender, sendResponse) {
           try {
             const config = await MiniSync.webdav.getWebDAVConfig();
             if (config.url) {
-              const xbelStr = await MiniSync.webdav.getFile(config.url, config.username, config.password, config.filename);
-              if (xbelStr) {
-                const pluginData = MiniSync.xbel.xbelToJson(xbelStr);
+              const version = await MiniSync.webdav.getFileVersion(config.url, config.username, config.password, config.filename);
+              if (version.content) {
+                const pluginData = MiniSync.xbel.xbelToJson(version.content);
                 if (pluginData.tombstones && Array.isArray(pluginData.tombstones)) {
                   // 过滤掉当前设备的墓碑
                   pluginData.tombstones = pluginData.tombstones.filter(t => t.deviceId !== devId);
                 }
                 pluginData.lastModified = Date.now();
                 const newXbel = MiniSync.xbel.jsonToXbel(pluginData);
-                await MiniSync.webdav.putFile(config.url, config.username, config.password, config.filename, newXbel);
+                const putResult = await MiniSync.webdav.putFile(config.url, config.username, config.password, config.filename, newXbel, undefined,
+                  MiniSync.webdav.versionWriteCondition(version));
+                cloudNote = MiniSync.webdav.writeProtectionNote(putResult.protection);
               }
             }
           } catch (e) {
             cloudCleared = false;
+            cloudError = e.code === 'CLOUD_CONFLICT' ? 'conflict' : 'error';
             console.warn('[sync] 过滤云端当前设备墓碑失败:', e.message);
           }
         }
 
         // ★ 修复：返回值补 success 字段。popup 判定 result.success，
         //   此前只返回 {ok:true} 导致两个清理按钮永远显示「重置失败：未知错误」。
-        return { ok: true, success: true, scope, cloudCleared };
+        return { ok: true, success: true, scope, cloudCleared, cloudError, note: cloudNote };
       });
       return true;
 

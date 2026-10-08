@@ -78,6 +78,8 @@ async function doMergeSync(options) {
 
     let config;
     let endpointKey;
+    // 主文件写入拿到的并发保护级别（见 lib/webdav.js 的分层说明）；降档时要说给用户听。
+    let mergeWriteProtectionNote = '';
     
     if (options.endpointKey && options.endpointKey !== MAIN_ENDPOINT_KEY) {
       const epData = await MiniSync.storage.getLocal(['sync_endpoints']);
@@ -102,7 +104,15 @@ async function doMergeSync(options) {
     const remoteContent = remoteVersion.content;
     const remoteData = remoteContent !== null ? MiniSync.xbel.parseXbelFromString(remoteContent) : null;
     if (remoteVersion.exists && !remoteData) throw new Error('XBEL 文件格式无效');
-    if (remoteVersion.exists && !MiniSync.webdav.isStrongETag(remoteVersion.etag)) throw new Error('云端缺少强 ETag，无法安全地合并写入');
+    // ★ 写条件按服务器实际能力分层：强 ETag→If-Match，退而用同一响应里的
+    //   Last-Modified→If-Unmodified-Since。旧版在这里要求必须有强 ETag，
+    //   坚果云这类不返回强 ETag 的服务因此完全无法合并（v2.2.0 实测回归）。
+    const remoteWriteCondition = MiniSync.webdav.versionWriteCondition(remoteVersion);
+    if (remoteVersion.exists && !MiniSync.webdav.isStrongETag(remoteVersion.etag)) {
+      console.warn(`[sync] 云端未提供强 ETag（etag=${JSON.stringify(remoteVersion.etag)}，`
+        + `Last-Modified=${remoteVersion.serverModified || '(无)'}），本次写入保护级别：`
+        + MiniSync.webdav.describeWriteProtection(remoteWriteCondition));
+    }
 
     // ★ 云端已解析（parseXbelFromString 写入了它声明的容器名）之后才解析「同步文件夹」：
     //   桌面 Edge 只能靠那个声明认出「其他收藏夹/根目录」这层镜像就是自己的桶，
@@ -630,8 +640,9 @@ async function doMergeSync(options) {
           };
           const xbelString = MiniSync.xbel.chromeToXbel(finalTree, Object.assign({ syncBucketId: mergeBucketInfo.id }, meta));
           const putResult = await MiniSync.webdav.putFile(config.url, config.username, config.password, config.filename, xbelString, undefined,
-            remoteVersion.exists ? { etag: remoteVersion.etag } : { missing: true });
+            remoteWriteCondition);
           mainCommitted = true;
+          mergeWriteProtectionNote = MiniSync.webdav.writeProtectionNote(putResult.protection);
           // 用 WebDAV 服务器返回的 lastModified 更新本机记录，与上传/下载分支口径一致。
           const cloudTs = (putResult && typeof putResult.lastModified === 'number') ? putResult.lastModified : writeTs;
           await MiniSync.storage.setLocal({ [STORAGE_KEYS.CLOUD_LAST_MODIFIED]: cloudTs });
@@ -756,11 +767,14 @@ async function doMergeSync(options) {
     } catch (e) {
       console.warn('[sync] 写落盘台账失败（忽略）:', e.message);
     }
+    const mergeMessage = (bridgeOutcome.partial
+      ? buildMergeMessage(failedWrites, conflictSamples, crossZoneDiag, importResult, remoteSpliced) + '（主文件已同步，手机桥接部分失败）'
+      : buildMergeMessage(failedWrites, conflictSamples, crossZoneDiag, importResult, remoteSpliced)) + mergeWriteProtectionNote;
     return {
       success: true,
       partial: !!bridgeOutcome.partial,
       bridgeResults: bridgeOutcome.bridgeResults || {},
-      message: bridgeOutcome.partial ? buildMergeMessage(failedWrites, conflictSamples, crossZoneDiag, importResult, remoteSpliced) + '（主文件已同步，手机桥接部分失败）' : buildMergeMessage(failedWrites, conflictSamples, crossZoneDiag, importResult, remoteSpliced),
+      message: mergeMessage,
       stats: stats,
       importedCount: importResult ? importResult.importedCount : 0,
       removedCount: importResult ? importResult.removedCount : 0,
@@ -779,7 +793,7 @@ async function doMergeSync(options) {
   } catch (error) {
     console.error('[sync] 合并失败:', error.message);
     await MiniSync.storage.setSyncStatus({ status: FAILED, error: error.message });
-    return { success: false, message: `合并失败: ${error.message}` };
+    return { success: false, message: `合并失败: ${error.message}`, code: error.code };
   }
 }
 

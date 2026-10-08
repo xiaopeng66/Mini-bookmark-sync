@@ -157,6 +157,9 @@ vm.runInThisContext(
 const M = global.MiniSync;
 vm.runInThisContext(fs.readFileSync(path.join(ROOT, 'lib/webdav.js'), 'utf8'), { filename: 'lib/webdav.js' });
 const isStrongETag = M.webdav.isStrongETag;
+const versionWriteCondition = M.webdav.versionWriteCondition;
+const describeWriteProtection = M.webdav.describeWriteProtection;
+const writeProtectionNote = M.webdav.writeProtectionNote;
 
 // 共享云端：双设备看到同一份 WebDAV 文件
 const CLOUD_FILE = 'minibookmarks.xbel'; // 与 getWebDAVConfig 的默认文件名一致
@@ -164,20 +167,25 @@ const cloud = new Map(); // filename -> { content, etag, lastModified }
 let cloudClock = 1000;
 M.webdav = {
   isStrongETag,
+  versionWriteCondition,
+  describeWriteProtection,
+  writeProtectionNote,
   getFileVersion: async (u, s, p, f) => (cloud.has(f)
-    ? { ...cloud.get(f), exists: true }
-    : { exists: false, content: null, etag: null, lastModified: 0 }),
+    ? { ...cloud.get(f), exists: true, serverModified: cloud.get(f).lastModified }
+    : { exists: false, content: null, etag: null, lastModified: 0, serverModified: 0 }),
   getFile: async (u, s, p, f) => (cloud.has(f) ? cloud.get(f).content : null),
   putFile: async (u, s, p, f, content, contentType, writeCondition) => {
     const current = cloud.get(f);
-    if (!writeCondition || (writeCondition.missing ? !!current : !current || writeCondition.etag !== current.etag)) {
+    if (!writeCondition || (writeCondition.missing ? !!current
+      : writeCondition.etag ? (!current || writeCondition.etag !== current.etag)
+        : writeCondition.since ? (!current || current.lastModified > writeCondition.since) : false)) {
       const error = new Error('云端文件已更改，请重新下载并合并后重试');
       error.code = 'CLOUD_CONFLICT';
       throw error;
     }
     const lastModified = ++cloudClock;
     cloud.set(f, { content, etag: `"v${lastModified}"`, lastModified });
-    return { lastModified };
+    return { lastModified, protection: describeWriteProtection(writeCondition) };
   },
   getFileInfo: async (u, s, p, f) => (cloud.has(f)
     ? { exists: true, lastModified: cloud.get(f).lastModified }
