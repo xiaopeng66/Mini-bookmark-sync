@@ -4,7 +4,7 @@
 // 这里在 beforeEach 安装可控 mock，让 mergeSync 跑通一条受控路径，重点断言三处
 // 曾反复踩坑的修复逻辑：
 //   1) 删除传播：localDeletedIds 的子树在落盘前被 prune（跨端删除生效）
-//   2) 顺序冲突 localOrderWins：本地顺序领先时不重排、但仍写回云端
+//   2) 顺序冲突「本地领先」（兜底判定）：不重排本地、但仍写回云端
 //   3) 收养节点迁移：adoptedLocalOnlyIds + renamePairs 触发 chrome.bookmarks.create
 
 const fs = require('fs');
@@ -166,7 +166,7 @@ describe('mergeSync — 删除传播（跨端删除生效）', () => {
   });
 });
 
-describe('mergeSync — 顺序冲突 localOrderWins', () => {
+describe('mergeSync — 顺序冲突：本地领先（时间戳兜底判定）', () => {
   // 仅顺序变化、无增删；云端时间 <= 本机记录 → 本地顺序领先，不重排但写回云端
   beforeEach(() => installMocks({
     orderChanged: true,
@@ -174,18 +174,18 @@ describe('mergeSync — 顺序冲突 localOrderWins', () => {
     stats: { added: 0, updated: 0, skipped: 0, deleted: 0 },
   }));
 
-  test('顺序冲突 localOrderWins：统一走落盘分支（import 被调用），且仍写回云端（putFile 被调用）', async () => {
+  test('顺序冲突：统一走落盘分支（import 被调用），且仍写回云端（putFile 被调用）', async () => {
     // The GET timestamp is the only remote timestamp used for ordering.
     M.webdav.getFileVersion = async () => ({ exists: true, content: '<xbel/>', etag: '"v1"', lastModified: 0 });
     M.xbel.parseXbelFromString = () => ({ bookmarks: [] });
     // 本机记录 localLastSeen 通过 storage.getLocal 返回 100，云端 lastModified=0
-    // 则 remoteLastModified(0) <= localLastSeen(100)+TOL → localOrderWins=true
+    // 则 remoteLastModified(0) <= localLastSeen(100)+TOL → 时间戳兜底判「本机领先」
     const getLocal = M.storage.getLocal;
     M.storage.getLocal = async (keys) => ({ ...await getLocal(keys), ...(keys.includes('cloud_last_modified') ? { cloud_last_modified: 100 } : {}) });
     await baseMerge({});
-    // 注：当前实现已将 localOrderWins 统一进落盘分支（对纯顺序变化幂等），
-    // 因此 import 仍会被调用；"不重排本地"的语义由顺序修复段（useRemoteOrder=false
-    // 时保留本地 _index）保证，而非跳过落盘。
+    // 注：纯顺序变化（无增删）统一走落盘分支（对纯顺序变化幂等），因此 import 仍会被调用；
+    // 「顺序以谁为准」由三方比较判出（core/sync-merge.js computeOrderWinsByParent，
+    // base=上次同步快照），判不出结论时才用上面这条时间戳兜底。
     expect(captured.importCalled).toBe(true);
     expect(captured.putCalled).toBe(true);     // 仍写回云端
   });

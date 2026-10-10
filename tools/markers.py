@@ -137,6 +137,38 @@ MARKERS = {
         'alarmsOnAlarm',
         'autoSyncReport',
     ],
+    'lib/update.js': [
+        # 版本更新检查（v2.2.2）：只做「查发布页 → 比对版本 → 定位安装包」，
+        # 不做也不假装能自装 —— WebExtensions 里没有安装扩展的 API，
+        # XPI/ZIP 的安装确认只能由宿主浏览器做（用户点了确认才算装上）。
+        'releases.atom',
+        'api.github.com/repos/',
+        'compareVersions',
+        'channelVersion',
+        'selectHostVariant',
+        'variantText',
+        'assetName',
+        'gecko-mv2-persistent',
+        'parseAtomFeed',
+        'parseApiRelease',
+        'pickAsset',
+        # 点下载前先 HEAD 探一次：能确认不存在就撤下按钮，探不动如实记 unknown
+        # （「不知道」不许说成「没问题」）。
+        'probeAsset',
+        "'missing'",
+        '未能预先确认',
+        # 常驻变体的版本号是「源码版本 + .1」，与发布标签比对前必须剥掉最后一段，
+        # 否则刚更新完的 2.2.2.1 会被判成「比发布版 v2.2.2 还新」而永远不提示更新。
+        "gecko-mv2-persistent' && /\\.\\d+$/",
+        'checkForUpdate',
+        'describeUpdate',
+        'updateStatusText',
+        # 界面文案的诚实底线：安装确认必须由宿主做，明确写出来
+        '扩展没有安装扩展的权限',
+        # 负向：任何「已经自动装好了」的说法都不许出现在代码或文案里（平台做不到）
+        '!已自动更新',
+        '!自动安装完成',
+    ],
     'options.js': [
         'describeBookmarkCount',
         'describeMessageFailure',
@@ -160,6 +192,17 @@ MARKERS = {
         'diagHint',
         'copyPlainText',
         '复制失败：请长按上面的报告手动选择复制',
+        # 版本更新卡（v2.2.2）：只做「查 + 定位安装包」，安装确认由宿主浏览器完成。
+        # 结论、下载地址、发布页兜底链接都由 lib/update.js 的纯函数产出，这里只负责画和落盘；
+        # 上次结果落盘成 update_last_check（本机版本一变就作废，不许停在过期结论上）。
+        'updateCheckBtn',
+        'updateDownloadBtn',
+        'renderUpdateResult',
+        'initUpdateCard',
+        'update_last_check',
+        'MiniSync.update.checkForUpdate',
+        # API、Atom 与探测共用整体 30 秒截止时间。
+        '正在检查（最长约 30 秒）',
     ],
     'options.html': [
         'diagOut',
@@ -181,6 +224,14 @@ MARKERS = {
         'diagCopyBtn',
         '.btn-mini {',
         '复制报告',
+        # 版本更新卡：当前版本行 + 「检查更新」/「下载并安装」两个动作 + 发布页兜底链接。
+        # 下载按钮默认 display:none（没有检查结果时不该出现），样式与 .btn-mini 按钮同款。
+        'id="updateCard"',
+        'id="updateCurrent"',
+        'updateCheckBtn',
+        'updateDownloadBtn',
+        'id="updateReleaseLink"',
+        'a.btn-mini, a.btn-mini:visited',
     ],
     'popup.js': [
         'requestHostPermission',
@@ -262,6 +313,18 @@ MARKERS = {
         # 本轮重排的真实代价落进台账（手机 console 读不到，台账是唯一证据）
         'movesAttempted',
         'movesSkippedParents',
+        # 同文件夹内纯换序同步不上（v2.2.2）：
+        #   ① 顺序以谁为准改为快照三方比较（逐父文件夹），不再只看「云端 mtime 比本机记录新」
+        #      —— 只要别的端在本机上次同步之后写过云端，本机刚拖的顺序就会被旧判据回退。
+        #   ② 追加云端独有节点时重编撞号 id（两端 chrome id 空间重叠，撞号会让落盘引擎的
+        #      id 映射丢掉先写入的那支，子树被静默跳过、顺序被搅乱）。
+        'computeOrderWinsByParent',
+        'orderWinsByParent',
+        'useRemoteOrderFor',
+        'orderSnapData',
+        'idRemap',
+        "__ro_",
+        '撞号',
     ],
     'lib/import.js': [
         'byBucket',

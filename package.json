@@ -1,6 +1,6 @@
 {
   "name": "mini-bookmark-sync",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "private": true,
   "description": "Mini bookmark sync - unit tests for the fragile pathKey / merge core",
   "scripts": {

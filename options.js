@@ -1173,7 +1173,165 @@ document.getElementById('importConfigFile')?.addEventListener('change', async (e
   }
 });
 
+// ========== 版本更新 ==========
+// 检查、展示并缓存结果；下载链接由浏览器直接导航。
+const updateHintDefault = '点「检查更新」查询发布页有没有新版本';
+const UPDATE_CHECK_KEY = 'update_last_check';
+let updateGeneration = 0;
+
+function updateManifest() {
+  try {
+    return (chrome.runtime && chrome.runtime.getManifest) ? (chrome.runtime.getManifest() || {}) : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function updateCardEls() {
+  return {
+    cur: document.getElementById('updateCurrent'),
+    btn: document.getElementById('updateCheckBtn'),
+    dl: document.getElementById('updateDownloadBtn'),
+    hint: document.getElementById('updateHint'),
+    detail: document.getElementById('updateDetail'),
+    relRow: document.getElementById('updateReleaseRow'),
+    rel: document.getElementById('updateReleaseLink')
+  };
+}
+
+function updateVersionLine() {
+  const manifest = updateManifest();
+  const variant = MiniSync.update.selectHostVariant(manifest);
+  return 'v' + (manifest.version || '未知') + '（' + MiniSync.update.variantText(variant) + '）';
+}
+
+function updateTimeText(ts) {
+  const d = new Date(ts || Date.now());
+  const pad = (n) => (n < 10 ? '0' + n : '' + n);
+  return pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+/** 把检查结果画到卡片上；note 是额外一行（上次检查时间这类） */
+function renderUpdateResult(result, note) {
+  const els = updateCardEls();
+  if (!els.hint || !els.detail) return;
+  const view = MiniSync.update.describeUpdate(result);
+  // 结论上色：失败红、成功绿、进行中灰 —— 与诊断卡同一套语义
+  els.hint.className = 'diag-hint ' + (view.tone === 'err' ? 'err' : (view.tone === 'ok' ? 'ok' : ''));
+  els.hint.textContent = MiniSync.update.updateStatusText(result);
+  const lines = [];
+  if (view.headline) lines.push('<b>' + MiniSync.utils.escapeHtml(view.headline) + '</b>');
+  if (view.detail) lines.push(MiniSync.utils.escapeHtml(view.detail));
+  if (note) lines.push('<span style="color:#9ca3af;">' + MiniSync.utils.escapeHtml(note) + '</span>');
+  els.detail.innerHTML = lines.join('<br>');
+  els.detail.style.display = lines.length ? '' : 'none';
+  const updateDownloadUrl = (view.download && view.download.url) || '';
+  if (els.dl) {
+    if (updateDownloadUrl) {
+      els.dl.href = updateDownloadUrl;
+      els.dl.textContent = view.download.label;
+      els.dl.style.display = '';
+    } else {
+      els.dl.style.display = 'none';
+      els.dl.removeAttribute('href');
+    }
+  }
+  if (els.relRow && els.rel) {
+    if (view.link) {
+      els.rel.href = view.link.url;
+      els.rel.textContent = view.link.label;
+      els.relRow.style.display = '';
+    } else {
+      els.relRow.style.display = 'none';
+    }
+  }
+}
+
+// 在 click 的同步调用栈申请可选权限；已有 required host 的构建包无需申请。
+function requestUpdatePermissions(manifest) {
+  const hosts = (manifest.host_permissions || []).concat(manifest.permissions || []);
+  const origins = ['https://api.github.com/*', 'https://github.com/*'].filter((origin) => {
+    const host = origin.slice('https://'.length, -2);
+    return !hosts.some((pattern) => pattern === '<all_urls>' || pattern === '*://*/*'
+      || pattern === 'https://*/*' || pattern === origin || pattern === '*://' + host + '/*');
+  });
+  if (!origins.length || !chrome.permissions || typeof chrome.permissions.request !== 'function') return Promise.resolve(true);
+  return new Promise((resolve, reject) => {
+    try {
+      const pending = chrome.permissions.request({ origins }, (granted) => {
+        const error = chrome.runtime && chrome.runtime.lastError;
+        if (error) reject(new Error(error.message || String(error)));
+        else resolve(granted === true);
+      });
+      if (pending && typeof pending.then === 'function') pending.then((granted) => resolve(granted === true), reject);
+    } catch (error) { reject(error); }
+  });
+}
+
+document.getElementById('updateCheckBtn')?.addEventListener('click', async () => {
+  const els = updateCardEls();
+  if (!els.btn || els.btn.disabled) return;
+  const manifest = updateManifest();
+  updateGeneration++;
+  els.btn.disabled = true;
+  if (els.dl) { els.dl.style.display = 'none'; els.dl.removeAttribute('href'); }
+  if (els.relRow) els.relRow.style.display = 'none';
+  if (els.hint) { els.hint.className = 'diag-hint'; els.hint.textContent = '正在申请更新检查权限…'; }
+  if (els.detail) { els.detail.style.display = 'none'; els.detail.innerHTML = ''; }
+  try {
+    let result;
+    try {
+      // 不在 request 前 await contains，避免丢失用户手势。
+      const granted = await requestUpdatePermissions(manifest);
+      if (!granted) throw new Error('未获准访问 GitHub，无法检查更新');
+      if (els.hint) els.hint.textContent = '正在检查（最长约 30 秒）…';
+      result = await MiniSync.update.checkForUpdate({
+        current: manifest.version || '', manifest,
+        variant: MiniSync.update.selectHostVariant(manifest)
+      });
+    } catch (e) {
+      result = { ok: false, code: 'UNEXPECTED', error: (e && e.message) || String(e),
+                 releaseUrl: MiniSync.update.RELEASES_PAGE, checkedAt: Date.now() };
+    }
+    let note = '检查时间：' + updateTimeText(result.checkedAt);
+    try {
+      const patch = {};
+      patch[UPDATE_CHECK_KEY] = result;
+      await chrome.storage.local.set(patch);
+      note += '；结果已记住，重开本页仍能看到';
+    } catch (e) {
+      note += '；未能保存本次结果：' + ((e && e.message) || String(e));
+    }
+    renderUpdateResult(result, note);
+  } finally {
+    els.btn.disabled = false;
+  }
+});
+
+/** 页面加载：画出当前版本，并在本机版本没变的前提下恢复上次的检查结果 */
+async function initUpdateCard() {
+  const els = updateCardEls();
+  if (!els.cur || !MiniSync.update || updateGeneration) return;
+  const generation = updateGeneration;
+  els.cur.textContent = updateVersionLine();
+  // 提示行先归一成初始态：下面无论走「恢复上次结果」还是「作废」，
+  // 都不会把上一轮（或上一版）的结论留在页面上。
+  if (els.hint) { els.hint.className = 'diag-hint'; els.hint.textContent = updateHintDefault; }
+  const manifest = updateManifest();
+  try {
+    const data = await chrome.storage.local.get([UPDATE_CHECK_KEY]);
+    if (generation !== updateGeneration) return;
+    const last = data && data[UPDATE_CHECK_KEY];
+    // 本机版本或宿主形态变了（刚装过新版）⇒ 上次结论作废，
+    // 否则会一直停在「发现新版本 v2.2.2」这种过期判断上
+    if (!last || last.current !== (manifest.version || '')
+        || last.variant !== MiniSync.update.selectHostVariant(manifest)) return;
+    renderUpdateResult(last, '上次检查：' + updateTimeText(last.checkedAt));
+  } catch (_) { /* 读不到就当从来没检查过 */ }
+}
+
 // ========== 初始化 ==========
 loadPage();
 initBookmarkTargetPicker();
 initDownloadClearToggle();
+initUpdateCard();

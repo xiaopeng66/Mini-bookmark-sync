@@ -34,6 +34,76 @@ function buildMergeMessage(failedWrites, conflictSamples, crossZoneDiag, importR
   return notes.length > 0 ? `合并成功${tail}` : '合并成功';
 }
 
+// ===== 顺序冲突的三方判定（base = 上次同步快照）=====
+// 旧实现按「云端文件 mtime > 本机上次同步记录」判顺序归属。真实环境里只要别的端在本机
+// 上次同步之后写过云端（自动同步每 30 分钟一轮，「云端比本机记录新」是常态），本机刚拖好
+// 的顺序就会被判成「云端更新」而整段丢弃 —— 用户实测：同一文件夹里换个顺序，同步后顺序
+// 变回原样，另一端也拿不到。
+// 判据改成与内容变更（lib/merge.js 5d）同一套三方比较，去掉对跨端时钟的依赖：
+//   base = 上次成功同步时的本地树快照（sync_snapshots.localTree）
+//   本机顺序 ≠ base ⇒ 本机是这次顺序改动的作者 ⇒ 本机胜（保留本地 _index，随写回上云）
+//   本机 == base 而云端 ≠ base ⇒ 云端是作者 ⇒ 采用云端 _index（落盘重排）
+//   两端都改过（真冲突）或无 base 证据 ⇒ 不表态，调用方退回时间戳兜底（结果确定、两端收敛）
+// 逐父文件夹判定：A 端调文件夹 X、B 端调文件夹 Y 时，两处改动都能各自传出去。
+// 比较只用「三端都有」的节点（按 pathKey）：新增/删除会让同父内的绝对序号整体错位，
+// 拿绝对序号比会把「加了一个书签」误判成换序。
+function orderParentKey(node, keys) {
+  const parentPk = keys.get(String(node.parentId));
+  if (parentPk) return parentPk;
+  // 透明/虚拟父容器用路径根前缀对齐，桶顶层与主页分别排序。
+  const pk = keys.get(node.id);
+  return pk ? pk.split('/')[0] : ROOT_ID;
+}
+
+function computeOrderWinsByParent(input) {
+  const wins = new Map(); // parentPk -> 'local' | 'remote'
+  // 某一视图里「父 pathKey -> 子 pathKey 序列（按该视图自己的 _index）」
+  const seqByParent = (list, keys) => {
+    const buckets = new Map();
+    for (const n of (list || [])) {
+      const pk = keys.get(n.id);
+      if (!pk) continue;
+      const parentPk = orderParentKey(n, keys);
+      if (!buckets.has(parentPk)) buckets.set(parentPk, []);
+      buckets.get(parentPk).push({ pk, index: typeof n._index === 'number' ? n._index : 0 });
+    }
+    const out = new Map();
+    for (const [parentPk, arr] of buckets) {
+      arr.sort((a, b) => a.index - b.index);
+      out.set(parentPk, arr.map(item => item.pk));
+    }
+    return out;
+  };
+  const localByParent = seqByParent(input.localList, input.localKeys);
+  const remoteByParent = seqByParent(input.remoteList, input.remoteKeys);
+  const baseByParent = seqByParent(input.baseList, input.baseKeys);
+  const sep = '\u0000'; // pathKey 里不可能出现的分隔符
+  for (const [parentPk, localSeq] of localByParent) {
+    const remoteSeq = remoteByParent.get(parentPk);
+    if (!remoteSeq || remoteSeq.length < 2) continue;
+    const remotePKSet = new Set(remoteSeq);
+    const common = localSeq.filter(pk => remotePKSet.has(pk));
+    if (common.length < 2) continue;
+    const commonSet = new Set(common);
+    const localOrder = localSeq.filter(pk => commonSet.has(pk)).join(sep);
+    const remoteOrder = remoteSeq.filter(pk => commonSet.has(pk)).join(sep);
+    if (localOrder === remoteOrder) continue; // 两端顺序本来就一致，无需判定
+    const baseSeq = baseByParent.get(parentPk) || [];
+    const baseSeqSet = new Set(baseSeq);
+    const knownSet = new Set(common.filter(pk => baseSeqSet.has(pk)));
+    if (knownSet.size < 2) continue; // 没有 base 证据（首次同步/快照缺失）⇒ 交给兜底
+    const localKnown = localSeq.filter(pk => knownSet.has(pk)).join(sep);
+    const remoteKnown = remoteSeq.filter(pk => knownSet.has(pk)).join(sep);
+    const baseKnown = baseSeq.filter(pk => knownSet.has(pk)).join(sep);
+    const localMoved = localKnown !== baseKnown;
+    const remoteMoved = remoteKnown !== baseKnown;
+    if (localMoved && !remoteMoved) wins.set(parentPk, 'local');
+    else if (remoteMoved && !localMoved) wins.set(parentPk, 'remote');
+    // 两端都动过（真冲突）：不表态，由时间戳兜底决定，避免两端各执一词来回拉扯。
+  }
+  return wins;
+}
+
 function bookmarkWrite(method, ...args) {
   return new Promise((resolve, reject) => {
     chrome.bookmarks[method](...args, result => {
@@ -187,20 +257,15 @@ async function doMergeSync(options) {
       if (!backupReady) throw new Error('本地备份失败，已停止合并以保护书签');
 
       // ===== 顺序冲突判断 =====
-      // 仅有顺序变化（无新增/删除）时，唯一差异是节点 _index。此时需判断哪端顺序更新：
-      // - 若云端 XBEL 的修改时间 <= 本机上次同步记录的时间（remoteLastModified <= localLastSeen），
-      //   说明云端文件自本机上次同步后没被别人改过，当前顺序差异来自本机本地改动，
-      //   应以本机当前顺序为准写回云端（不重排本地）。
-      // - 若云端修改时间 > 本机记录的时间，说明对端先改了顺序并已写回云端，
-      //   本机应接受云端顺序（落盘重排为云端顺序）。
-      // - localLastSeen === 0（本机从未同步过该文件）时，保守以云端为准（首次对齐）。
-      // 注：remoteLastModified 取 XBEL metadata 里本程序写入的 lastModified，不受 WebDAV
-      // 服务器文件系统时间漂移影响，可稳定比对。
-      const onlyOrderChanged = mergeResult.orderChanged &&
-        mergeResult.stats.added === 0 &&
-        mergeResult.stats.deleted === 0 &&
-        (mergeResult.localOnlyIds ? mergeResult.localOnlyIds.length === 0 : true);
-      const localOrderWins = onlyOrderChanged && localLastSeen > 0 && remoteLastModified <= localLastSeen + ORDER_TOLERANCE;
+      // 仅有顺序变化（无新增/删除）时，唯一差异是节点 _index。顺序以谁为准由
+      // computeOrderWinsByParent 逐父文件夹按三方比较（base=上次同步快照）判定，
+      // 见该函数上方注释；只有它判不出结论（真冲突/无 base）时才退回时间戳兜底：
+      // - 云端文件比本机上次同步记录新（remoteLastModified > localLastSeen + 容差）
+      //   ⇒ 判「云端是顺序作者」，采用云端顺序；
+      // - 否则保留本机当前顺序（本机领先，写回云端传播）。
+      // 注：remoteLastModified 取 WebDAV 服务器给出的文件时间（与 PUT 返回值同一口径），
+      // 只用于兜底分支，顺序传播不再依赖它。
+      const useRemoteOrderFallback = remoteLastModified > localLastSeen + ORDER_TOLERANCE;
 
       // 旧逻辑曾为「仅顺序变化且本机领先」单独开一个 localOrderWins 分支，只写回云端、
       // 完全不落盘。该分支与下方落盘分支行为不一致，且会跳过 renamePairs 跨区移动，
@@ -409,14 +474,30 @@ async function doMergeSync(options) {
           }
           let appendedTail = 0;
           let matchedCount = 0;
-          // 顺序以谁为准：仅当云端文件确实比本机上次同步记录更新（remoteLastModified > localLastSeen + 容差）时，
-          // 才用云端顺序覆盖本地；否则保留本地当前顺序（双向同步：本地刚调的顺序不能丢）。
-          // 加容差是因为合并写回云端时记录的 lastSeen 与当前云端文件 mtime 可能相差数秒，
-          // 不加容差会永远判定「云端更新」从而把本地改动回退（见 ORDER_TOLERANCE）。
-          const useRemoteOrder = remoteLastModified > localLastSeen + ORDER_TOLERANCE;
+          // 顺序以谁为准：逐父文件夹三方比较（base = 上次同步快照）。
+          // 本机改过顺序的文件夹保持本机顺序（写回云端传播）；只有云端改过的文件夹才用
+          // 云端 _index 覆盖本地。判不出结论的（真冲突/无 base）退回时间戳兜底
+          // （useRemoteOrderFallback，见函数顶部「顺序冲突判断」）。
+          const orderSnapData = await MiniSync.storage.getLocal([STORAGE_KEYS.SNAPSHOTS]);
+          const orderBaseList = (orderSnapData[STORAGE_KEYS.SNAPSHOTS]
+            && orderSnapData[STORAGE_KEYS.SNAPSHOTS].localTree) || [];
+          const orderWinsByParent = computeOrderWinsByParent({
+            localList: mergedData.bookmarks,
+            localKeys: mergedKeys,
+            remoteList: remoteData.bookmarks,
+            remoteKeys,
+            baseList: orderBaseList,
+            baseKeys: MiniSync.xbelPath.computeJsonPathKeys(orderBaseList)
+          });
+          const useRemoteOrderFor = (node) => {
+            const parentPk = orderParentKey(node, mergedKeys);
+            const verdict = orderWinsByParent.get(parentPk);
+            if (verdict) return verdict === 'remote';
+            return useRemoteOrderFallback;
+          };
           for (const [pk, node] of mergedIndexByKey) {
             if (remoteIndexByKey.has(pk)) {
-              if (useRemoteOrder) {
+              if (useRemoteOrderFor(node)) {
                 node._index = remoteIndexByKey.get(pk);
               }
               // 否则保留 node._index（它已是本地顺序），不覆盖
@@ -457,18 +538,40 @@ async function doMergeSync(options) {
             remoteOnlyNodes.sort((a, b) => getDepth(a) - getDepth(b));
 
             let remoteOnlyAppended = 0;
+            // ★ 追加的远程独有节点必须重新分配【不与本地撞号】的 id：
+            //   落盘引擎（lib/import.js）用扁平列表的 id 建 nodeMap，两端 chrome id 空间
+            //   天然重叠（都是小整数自增）。远程 id 撞上某个本地 id 时，nodeMap 里后写入的
+            //   条目会顶掉先写入的：被顶掉那支的子节点挂到错误对象上、整支被落盘静默跳过
+            //   （实测：一端新建书签后，另一端那批节点既不参与复用也不参与重排，反被当成
+            //   「本地独有」挪到父文件夹末尾 —— 表现为顺序被搅乱且同步不生效）。
+            //   id 只在本次落盘的中间结构里使用：新建节点落盘后由 importedParentIds 换成
+            //   真实 chrome id；跨端身份一律按 pathKey，重编号不影响墓碑/合并语义。
+            const takenIds = new Set(mergedData.bookmarks.map(b => String(b.id)));
+            const idRemap = new Map(); // 远程 id -> 追加时实际使用的 id
+            let remapSeq = 0;
             for (const node of remoteOnlyNodes) {
               const pk = remoteKeys.get(node.id);
               if (!pk || mergedKeySet.has(pk)) continue;
               const clone = JSON.parse(JSON.stringify(node));
               // 若父节点在本地已存在（bothPresent），把 parentId 从远程 id 映射到本地 id；
-              // 若父节点也是 remoteOnly，则保持远程 id，父节点已先被追加进 mergedData。
+              // 若父节点也是 remoteOnly，则用父节点追加时分配的（可能已重编的）id —— 父节点
+              // 已按深度先于子节点追加进 mergedData。
               if (clone.parentId && clone.parentId !== ROOT_ID) {
                 const parentPk = remoteKeys.get(clone.parentId);
                 if (parentPk && pkToMergedId.has(parentPk)) {
                   clone.parentId = pkToMergedId.get(parentPk);
+                } else if (idRemap.has(String(clone.parentId))) {
+                  clone.parentId = idRemap.get(String(clone.parentId));
                 }
               }
+              let newId = String(node.id);
+              if (takenIds.has(newId)) {
+                // '__ro_' 前缀不可能与 chrome id（纯数字）撞号
+                do { newId = '__ro_' + (++remapSeq); } while (takenIds.has(newId));
+              }
+              idRemap.set(String(node.id), newId);
+              clone.id = newId;
+              takenIds.add(newId);
               mergedData.bookmarks.push(clone);
               mergedKeySet.add(pk);
               remoteOnlyAppended++;

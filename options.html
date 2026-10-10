@@ -154,6 +154,9 @@
         }
         .btn-mini:hover:not(:disabled) { background: #f9fafb; }
         .btn-mini:disabled { color: #9ca3af; background: #f9fafb; cursor: not-allowed; }
+        /* 「下载并安装」是个链接（手机上要能被长按、被浏览器按自己的方式打开），
+           外形必须和 .btn-mini 按钮一模一样 */
+        a.btn-mini, a.btn-mini:visited { color: #374151; text-decoration: none; }
         .diag-row {
             margin-top: 10px;
             display: flex;
@@ -581,6 +584,29 @@
              border-radius:8px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto;"></pre>
     </div>
 
+    <!-- 版本更新：只做「查发布页 → 与本机版本比对 → 把对应宿主形态的安装包交给浏览器下载/安装」。
+         ⚠️ WebExtensions 没有「安装扩展」的 API（chrome.runtime.reload() 只是把当前这份代码
+         重新加载一遍，并不会去下载新版本），所以这里【绝不能】写成「点一下就装好了」——
+         平台做不到，写了就是骗人。安装确认必须由宿主浏览器做，界面上如实说明这一步。
+         检查源、产物命名与宿主形态的对应关系见 lib/update.js。 -->
+    <div class="card" id="updateCard">
+        <div class="card-title">版本更新</div>
+        <div class="overview-row">
+            <span class="overview-label">当前版本</span>
+            <span class="overview-value" id="updateCurrent">--</span>
+        </div>
+        <div class="diag-row">
+            <button class="btn-mini" id="updateCheckBtn">检查更新</button>
+            <a class="btn-mini" id="updateDownloadBtn" href="#" target="_blank" rel="noopener" style="display:none;">下载并安装</a>
+            <span class="diag-hint" id="updateHint">点「检查更新」查询发布页有没有新版本</span>
+        </div>
+        <div id="updateDetail" style="display:none;margin-top:8px;font-size:11px;line-height:1.6;color:#6b7280;"></div>
+        <div class="diag-row" id="updateReleaseRow" style="display:none;">
+            <a class="view-all-btn" id="updateReleaseLink" href="https://github.com/xiaopeng66/Mini-bookmark-sync/releases"
+               target="_blank" rel="noopener" style="text-decoration:none;">打开发布页</a>
+        </div>
+    </div>
+
     <!-- 浏览器支持 -->
     <div class="card" id="browserCard" style="display:none;">
         <div class="card-title">浏览器支持</div>
@@ -732,6 +758,7 @@
 
     <script src="lib/constants.js"></script>
     <script src="lib/utils.js"></script>
+    <script src="lib/update.js"></script>
     <script src="options.js"></script>
 </body>
 </html>

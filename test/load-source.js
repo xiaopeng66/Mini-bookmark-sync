@@ -17,6 +17,7 @@ function loadFile(rel) {
 const ORDER = [
   'lib/constants.js',
   'lib/utils.js',
+  'lib/update.js',
   'model/xbel.js',
   'model/xbel-path.js',
   'model/tombstone.js',

@@ -4,10 +4,18 @@
 > 本仓库是 [原项目](https://github.com/jagshen/Mini-bookmark-sync) 的维护版：保留原项目的全部功能，
 > 并补上手机端支持、双向增量增删，以及一批跨端同步的一致性修复。
 
-[![Version](https://img.shields.io/badge/version-2.2.1-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
+[![Version](https://img.shields.io/badge/version-2.2.2-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
+
+## v2.2.2 发布说明
+
+- 修复同一文件夹内只调整书签或文件夹顺序时无法正确同步的问题，包含存在主页内容时的顶层换序。
+- 修复两端节点编号冲突导致子树遗漏、重复或顺序异常的问题。
+- 新增设置页「版本更新」：检查最新版并下载对应安装包，完善超时、版本识别和失败提示。
+
+安装仍由宿主浏览器确认；能否安装取决于其支持与签名要求。详见 [v2.2.2 发布说明](docs/release-v2.2.2.md)。
 
 ## v2.2.1 发布说明
 
@@ -42,6 +50,7 @@ v2.2.0 的内容仍有效：针对 v2.1.0 审查中的数据完整性、目标�
 - 💾 **配置导出 / 导入** — 换浏览器时导出配置文件再导入，不必重填 WebDAV
 - ✅ **同步结果更诚实** — 书签写入或手机桥接失败时报告失败/部分完成，不把主文件成功当作全部成功
 - 🩺 **后台诊断** — 设置页一键输出诊断报告并一键复制，连「这轮动了几个书签」都看得见
+- ⬆️ **检查更新** — 设置页检查最新版并下载当前扩展变体的安装包；安装由宿主浏览器确认，取决于其支持与签名要求
 
 ## 📸 界面预览
 

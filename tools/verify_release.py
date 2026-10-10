@@ -1,4 +1,4 @@
-"""Independently verify v2.2.1 release artifacts without building or reading signing keys.
+"""Independently verify v2.2.2 release artifacts without building or reading signing keys.
 
 Run from anywhere: python tools/verify_release.py
 To inspect older artifacts: python tools/verify_release.py --artifact chromium-zip=dist/old.zip
@@ -12,8 +12,8 @@ import sys
 import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
-EXPECTED_VERSION = '2.2.1'
-PERSISTENT_VERSION = '2.2.1.1'
+EXPECTED_VERSION = '2.2.2'
+PERSISTENT_VERSION = '2.2.2.1'
 DIRECTORIES = ('adapters', 'core', 'lib', 'model', 'icons')
 FILES = ('background.js', 'options.html', 'options.js', 'popup.html', 'popup.js',
          'images/nb.svg', 'images/nb-filled.svg')
