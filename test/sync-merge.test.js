@@ -228,8 +228,11 @@ describe('core 拆分结构 — 挂载正确性', () => {
     expect(M.mergeStrategy.mergeSync).toBe(M.orchestrator.mergeSync);
   });
 
-  test('orchestrator 透传 restoreLocalBackup / saveLocalSnapshot 来自 syncInput', () => {
-    expect(M.orchestrator.restoreLocalBackup).toBe(M.syncInput.restoreLocalBackup);
+  test('orchestrator restores the saved local backup through its public wrapper', async () => {
+    expect(await M.syncInput.backupLocalTree()).toBe(true);
+    const restored = await M.orchestrator.restoreLocalBackup({ targetParentId: '1' });
+    expect(restored.ok).toBe(true);
+    expect(restored.conflicts).toEqual([]);
     expect(M.orchestrator.saveLocalSnapshot).toBe(M.syncInput.saveLocalSnapshot);
   });
 

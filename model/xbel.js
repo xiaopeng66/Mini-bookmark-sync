@@ -252,9 +252,85 @@ function parseAttributes(attrStr) {
   const attrRegex = /([A-Za-z_:][\w:.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
   let match;
   while ((match = attrRegex.exec(attrStr)) !== null) {
-    attrs.set(match[1], match[2] == null ? match[3] : match[2]);
+    // ★ 属性值必须在解析边界完成一次实体解码：此前 href 原样保留 `&amp;`/`&apos;`，
+    //   而下游又各自做「HTML 解码」，同一串被解释两次 —— 用户书签里字面的 `&lt;`
+    //   往返后变成 `<`（地址被改写），`&amp;mode` 还会被错误当成 `&mode` 复用。
+    //   规则：实体只在 XML 边界解码一次，内部一律保存普通字符串。
+    attrs.set(match[1], unescapeXml(match[2] == null ? match[3] : match[2]));
   }
   return attrs;
+}
+
+// 跳过非元素内容（注释 / CDATA / 处理指令 / DOCTYPE）。
+// 扫描器按原始字符串找 `<bookmark`，若不跳过这些区段，`<desc><![CDATA[...<bookmark...>]]></desc>`
+// 里的文字会被当成真书签导入（审计 2026-10-11 复现 xbelCdataInjection）。
+function skipNonElement(xmlText, pos) {
+  let i = pos;
+  const len = xmlText.length;
+  while (i < len) {
+    const lt = xmlText.indexOf('<', i);
+    if (lt === -1) return len;
+    if (xmlText.startsWith('<!--', lt)) {
+      const end = xmlText.indexOf('-->', lt + 4);
+      i = end === -1 ? len : end + 3;
+      continue;
+    }
+    if (xmlText.startsWith('<![CDATA[', lt)) {
+      const end = xmlText.indexOf(']]>', lt + 9);
+      i = end === -1 ? len : end + 3;
+      continue;
+    }
+    if (xmlText.startsWith('<?', lt)) {
+      const end = xmlText.indexOf('?>', lt + 2);
+      i = end === -1 ? len : end + 2;
+      continue;
+    }
+    if (/^<!DOCTYPE/i.test(xmlText.slice(lt, lt + 10))) {
+      const end = xmlText.indexOf('>', lt + 9);
+      i = end === -1 ? len : end + 1;
+      continue;
+    }
+    return lt;
+  }
+  return len;
+}
+
+// 找指定标签的下一个开标签位置（必须处于标签名边界，避免 `<folders` 命中 `<folder`）。
+// 扫描途中跳过注释/CDATA/处理指令：它们的正文里可能出现字面 `<bookmark ...>`，
+// 若不跳过就会被当成真书签导入（审计复现 xbelCdataInjection）。
+function findOpenTag(xmlText, tagName, from) {
+  const prefix = '<' + tagName;
+  let pos = from;
+  const len = xmlText.length;
+  while (pos < len) {
+    const lt = xmlText.indexOf('<', pos);
+    if (lt === -1) return -1;
+    // 位于非元素区段（注释/CDATA/PI/DOCTYPE）→ 整段跳过再继续找
+    const skipped = skipNonElement(xmlText, lt);
+    if (skipped !== lt) { pos = skipped; continue; }
+    if (xmlText.startsWith(prefix, lt)) {
+      const nextCh = xmlText[lt + prefix.length];
+      if (nextCh === '>' || nextCh === '/' || /\s/.test(nextCh || '')) return lt;
+    }
+    pos = lt + 1;
+  }
+  return -1;
+}
+
+// 找配对闭标签，途中同样跳过注释 / CDATA（CDATA 里可能出现字面 `</bookmark>`）。
+function findCloseTag(xmlText, tagName, from) {
+  const closeTag = '</' + tagName + '>';
+  let pos = from;
+  const len = xmlText.length;
+  while (pos < len) {
+    const lt = xmlText.indexOf('<', pos);
+    if (lt === -1) return -1;
+    const skipped = skipNonElement(xmlText, lt);
+    if (skipped !== lt) { pos = skipped; continue; }
+    if (xmlText.startsWith(closeTag, lt)) return lt;
+    pos = lt + 1;
+  }
+  return -1;
 }
 
 /**
@@ -271,34 +347,49 @@ function extractXmlTags(xmlText, tagName) {
   const len = xmlText.length;
 
   while (pos < len) {
-    let startIdx = xmlText.indexOf(openPrefix, pos);
+    const startIdx = findOpenTag(xmlText, tagName, pos);
     if (startIdx === -1) break;
 
     const afterPrefix = startIdx + openPrefix.length;
-    if (afterPrefix < len) {
-      const nextCh = xmlText[afterPrefix];
-      if (nextCh !== '>' && nextCh !== ' ' && nextCh !== '\t' && nextCh !== '\n' && nextCh !== '/') {
-        pos = startIdx + 1;
-        continue;
+    let gtIdx = -1;
+    {
+      // 找开标签自己的 `>`（跳过带引号的属性值里的 `>`）
+      let i = afterPrefix;
+      let quote = null;
+      while (i < len) {
+        const ch = xmlText[i];
+        if (quote) { if (ch === quote) quote = null; }
+        else if (ch === '"' || ch === "'") quote = ch;
+        else if (ch === '>') { gtIdx = i; break; }
+        i++;
       }
     }
-
-    let gtIdx = xmlText.indexOf('>', startIdx);
     if (gtIdx === -1) break;
+    const selfClosing = xmlText[gtIdx - 1] === '/';
+    const tagHead = xmlText.slice(startIdx, gtIdx);
+
+    const attrStr = xmlText.substring(afterPrefix, selfClosing ? gtIdx - 1 : gtIdx);
+    const attrs = parseAttributes(attrStr);
+
+    if (selfClosing) {
+      results.push({ tagName, attrs, innerXml: '', fullText: tagHead + '/>', selfClosing: true });
+      pos = gtIdx + 1;
+      continue;
+    }
 
     let depth = 1;
     let searchPos = gtIdx + 1;
     let foundClose = -1;
 
     while (depth > 0 && searchPos < len) {
-      const nextOpen = xmlText.indexOf(openPrefix, searchPos);
-      const nextClose = xmlText.indexOf(closeTag, searchPos);
-
+      const nextOpen = findOpenTag(xmlText, tagName, searchPos);
+      const nextClose = findCloseTag(xmlText, tagName, searchPos);
       if (nextClose === -1) break;
-
-      if (nextOpen !== -1 && nextOpen < nextClose) {
+      // 开标签必须「真的先出现」才算加深一层；跳过区段（CDATA/注释）不算结构
+      const nextOpenReal = nextOpen !== -1 && nextOpen < nextClose ? nextOpen : -1;
+      if (nextOpenReal !== -1) {
         depth++;
-        searchPos = nextOpen + openPrefix.length;
+        searchPos = nextOpenReal + openPrefix.length;
       } else {
         depth--;
         if (depth === 0) foundClose = nextClose;
@@ -312,9 +403,6 @@ function extractXmlTags(xmlText, tagName) {
     const innerStart = gtIdx + 1;
     const innerXml = xmlText.substring(innerStart, foundClose);
 
-    const attrStr = xmlText.substring(afterPrefix, gtIdx);
-    const attrs = parseAttributes(attrStr);
-
     results.push({ tagName: tagName, attrs: attrs, innerXml: innerXml, fullText: fullText });
     pos = foundClose + closeTag.length;
   }
@@ -324,21 +412,41 @@ function extractXmlTags(xmlText, tagName) {
 
 /** 提取单个子标签的文本内容（如 <title>xxx</title>） */
 function extractChildText(parentInnerXml, childTag) {
-  const regex = new RegExp('<' + childTag + '>([\\s\\S]*?)<\\/' + childTag + '>', 'i');
+  // 标签名后允许空白/属性（`<title lang="zh">`），此前只认 `<title>` 字面量。
+  const regex = new RegExp('<' + childTag + '(?:\\s[^>]*)?>([\\s\\S]*?)<\\/' + childTag + '>', 'i');
   const m = regex.exec(parentInnerXml);
   if (!m) return '';
   return unescapeXml(m[1]);
 }
 
-/** 反转义 XML 实体 */
+// 命名实体表：&amp; 必须最后替换，否则 `&amp;lt;` 会被解成 `<`（双重解码）。
+const NAMED_XML_ENTITIES = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'"
+};
+
+/** 反转义 XML 实体（单次、完整：命名实体 + 数字实体） */
 function unescapeXml(str) {
   if (!str) return '';
-  return str
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'");
+  // ★ 单次扫描替换：一次性识别所有实体，替换结果不再参与后续匹配。
+  //   链式 replace 时代 `&amp;lt;` 会先变 `&lt;` 再变 `<` —— 用户书签里字面的
+  //   `&lt;` 往返一次就变成 `<`（地址被改写），数字实体也完全不受支持
+  //   （审计 2026-10-11 复现 urlEntity / url-entity-roundtrip）。
+  return String(str).replace(/&(?:#(\d+)|#[xX]([0-9A-Fa-f]+)|([A-Za-z][\w.:-]*));/g,
+    (match, dec, hex, name) => {
+      if (dec !== undefined) {
+        const code = Number(dec);
+        // 越界码点返回原样，避免 fromCharCode 截断（非 BMP 需 fromCodePoint）
+        return Number.isFinite(code) && code >= 0 && code <= 0x10FFFF
+          ? String.fromCodePoint(code) : match;
+      }
+      if (hex !== undefined) {
+        const code = parseInt(hex, 16);
+        return Number.isFinite(code) && code >= 0 && code <= 0x10FFFF
+          ? String.fromCodePoint(code) : match;
+      }
+      const mapped = NAMED_XML_ENTITIES[name];
+      return mapped === undefined ? match : mapped;
+    });
 }
 
 /** 提取 metadata 中的 prop 键值对 */
@@ -490,9 +598,9 @@ function xbelToJson(xmlString) {
     let siblingIndex = 0;
     
     while (pos < len) {
-      // 查找下一个 <folder 或 <bookmark
-      const nextFolderStart = folderInnerXml.indexOf('<folder', pos);
-      const nextBookmarkStart = folderInnerXml.indexOf('<bookmark ', pos);
+      // 查找下一个 <folder 或 <bookmark（用统一的标签边界/注释/CDATA 感知扫描器）
+      const nextFolderStart = findOpenTag(folderInnerXml, 'folder', pos);
+      const nextBookmarkStart = findOpenTag(folderInnerXml, 'bookmark', pos);
       
       // 确定哪个先出现
       let nextStart = -1;
@@ -515,20 +623,62 @@ function xbelToJson(xmlString) {
       } else {
         break; // 没有更多子节点
       }
+
+      // 标签名边界必须成立（避免 `<folders` / `<bookmarks` 被误认）
+      const openPrefix = isFolder ? '<folder' : '<bookmark';
+      const afterName = nextStart + openPrefix.length;
+      const boundary = folderInnerXml[afterName];
+      if (!(boundary === '>' || boundary === '/' || /\s/.test(boundary || ''))) {
+        pos = nextStart + 1;
+        continue;
+      }
+
+      // ★ 开标签的 `>` 不能用朴素 indexOf：属性值里可以出现 `>`。
+      //   同时必须识别自闭合 `<bookmark ... />` 与 `\n`/`\t` 分隔的属性写法 ——
+      //   合法 XML 的这些形态此前会被漏读成「零节点」，空设备合并随即把云端清空
+      //   （审计 2026-10-11 复现 xbelWhitespace / xbelScannerForms）。
+      let gtIdx = -1;
+      {
+        let i = afterName;
+        let quote = null;
+        while (i < len) {
+          const ch = folderInnerXml[i];
+          if (quote) { if (ch === quote) quote = null; }
+          else if (ch === '"' || ch === "'") quote = ch;
+          else if (ch === '>') { gtIdx = i; break; }
+          i++;
+        }
+      }
+      if (gtIdx === -1) { pos = nextStart + 1; continue; }
+      const isSelfClosing = folderInnerXml[gtIdx - 1] === '/';
       
       if (isFolder) {
-        // ★ 文件夹：提取完整的 <folder>...</folder> 块（含嵌套内容）
-        let gtIdx = folderInnerXml.indexOf('>', nextStart);
-        if (gtIdx === -1) { pos = nextStart + 1; continue; }
-        
+        const closeTag = '</folder>';
+
+        if (isSelfClosing) {
+          // 自闭合文件夹 = 空文件夹：仍然必须产生节点，否则它下面的内容与
+          // 「空文件夹」语义都会消失。
+          const attrStr = folderInnerXml.substring(afterName, gtIdx - 1);
+          const attrs = parseAttributes(attrStr);
+          const meta = attrs.size ? new Map() : new Map(); // 属性即 metadata（无 <info> 子元素）
+          const folderId = (attrs.get('id')) || ('folder_' + (idCounter++));
+          result.bookmarks.push({
+            id: folderId, title: attrs.get('title') || '', url: '', isFolder: true, parentId: parentId,
+            source: source, addedAt: Date.now(), color: null, favicon: null, customIcon: null,
+            _index: siblingIndex, _otherIndex: -1
+          });
+          pos = gtIdx + 1;
+          siblingIndex++;
+          continue;
+        }
+
         let depth = 1;
         let searchPos = gtIdx + 1;
         let foundClose = -1;
-        const closeTag = '</folder>';
-        
+
         while (depth > 0 && searchPos < len) {
-          const nextOpen = folderInnerXml.indexOf('<folder', searchPos);
-          const nextClose = folderInnerXml.indexOf(closeTag, searchPos);
+          const nextOpen = findOpenTag(folderInnerXml, 'folder', searchPos);
+          const nextClose = findCloseTag(folderInnerXml, 'folder', searchPos);
           
           if (nextClose === -1) break;
           
@@ -544,7 +694,6 @@ function xbelToJson(xmlString) {
         
         if (foundClose === -1) { pos = gtIdx + 1; continue; }
         
-        const folderFullText = folderInnerXml.substring(nextStart, foundClose + closeTag.length);
         const folderInnerStart = gtIdx + 1;
         const folderInnerXml_content = folderInnerXml.substring(folderInnerStart, foundClose);
         
@@ -604,34 +753,46 @@ function xbelToJson(xmlString) {
         pos = foundClose + closeTag.length;
         
       } else {
-        // ★ 书签：提取完整的 <bookmark ...>...</bookmark> 块
-        let gtIdx = folderInnerXml.indexOf('>', nextStart);
-        if (gtIdx === -1) { pos = nextStart + 1; continue; }
-        
+        // ★ 书签：提取完整的 <bookmark .../> 或 <bookmark ...>...</bookmark> 块。
+        //   gtIdx 已在上方按「引号感知」的方式算好并跳过注释/CDATA。
         const closeTag = '</bookmark>';
-        const bookmarkCloseIdx = folderInnerXml.indexOf(closeTag, gtIdx);
-        if (bookmarkCloseIdx === -1) { pos = gtIdx + 1; continue; }
-        
-        const bookmarkFullText = folderInnerXml.substring(nextStart, bookmarkCloseIdx + closeTag.length);
-        const bookmarkInnerStart = gtIdx + 1;
-        const bookmarkInner = folderInnerXml.substring(bookmarkInnerStart, bookmarkCloseIdx);
-        
-        // 提取属性和内容
-        const attrStr = folderInnerXml.substring(nextStart + 10, gtIdx); // '<bookmark '.length = 10
+
+        // 提取属性和内容（属性值里的实体已在 parseAttributes 内一次性解码）
+        const attrStr = folderInnerXml.substring(afterName, isSelfClosing ? gtIdx - 1 : gtIdx);
         const attrs = parseAttributes(attrStr);
 
+        if (!isSelfClosing) {
+          const bookmarkCloseIdx = findCloseTag(folderInnerXml, 'bookmark', gtIdx + 1);
+          if (bookmarkCloseIdx === -1) { pos = gtIdx + 1; continue; }
+
+          const bookmarkInner = folderInnerXml.substring(gtIdx + 1, bookmarkCloseIdx);
+          const href = attrs.get('href') || '';
+          const title = extractChildText(bookmarkInner, 'title') || href;
+          const meta = extractMetadata(bookmarkInner);
+
+          result.bookmarks.push({
+            id: meta.id || ('bm_' + (idCounter++)), title: title, url: href, isFolder: false,
+            parentId: parentId, source: source, addedAt: meta.addedAt || Date.now(), color: meta.color || null,
+            favicon: meta.favicon || null, customIcon: meta.customIcon || null,
+            _index: siblingIndex, _otherIndex: -1
+          });
+
+          pos = bookmarkCloseIdx + closeTag.length;
+          siblingIndex++;
+          continue;
+        }
+
+        // ★ 自闭合书签（合法 XBEL 写法）：必须产出节点。
+        //   旧实现把 `<bookmark href="..."/>` 整个漏读 —— 一条自闭合书签后面跟一条普通
+        //   书签时还会把前者的 URL 与后者的标题拼成一个节点（审计复现 xbelScannerForms）。
         const href = attrs.get('href') || '';
-        const title = extractChildText(bookmarkInner, 'title') || href;
-        const meta = extractMetadata(bookmarkInner);
-        
         result.bookmarks.push({
-          id: meta.id || ('bm_' + (idCounter++)), title: title, url: href, isFolder: false,
-          parentId: parentId, source: source, addedAt: meta.addedAt || Date.now(), color: meta.color || null,
-          favicon: meta.favicon || null, customIcon: meta.customIcon || null,
-          _index: siblingIndex, _otherIndex: -1
+          id: attrs.get('id') || ('bm_' + (idCounter++)),
+          title: attrs.get('title') || href, url: href, isFolder: false,
+          parentId: parentId, source: source, addedAt: Date.now(), color: null,
+          favicon: null, customIcon: null, _index: siblingIndex, _otherIndex: -1
         });
-        
-        pos = bookmarkCloseIdx + closeTag.length;
+        pos = gtIdx + 1;
       }
       
       siblingIndex++;
@@ -653,6 +814,51 @@ function xbelToJson(xmlString) {
     if (String(n.id) === String(HOME_FOLDER_ID)) continue;
     if (String(n.parentId) !== ROOT_ID) continue;
     if (n.source === 'other' || n.source === 'mobile') n.source = 'bar';
+  }
+
+  // ★ 重复 ID 必须重新编配，绝不能让后一个节点覆盖前一个（Map 语义）。
+  //   损坏或跨端拼接产生的 XBEL 里，两个不同 URL 的书签共用同一个 <prop key="id">
+  //   时，旧实现按 id 建索引 → 后者覆盖前者 ⇒ 一条书签从模型里消失，回写云端后
+  //   不可恢复（审计 2026-10-11 复现 xbelDuplicateLeafIds / xbelDuplicateIds）。
+  //   处理：保留第一个节点，后续重复者换成唯一内部 id，并把**它的子树**一并改挂到新 id
+  //   （节点按文档顺序深度优先产出：文件夹之后紧接它的子孙，用栈即可界定范围）。
+  //   结果：节点数不丢、引用不错位；重复文件夹的两棵子树各自独立。
+  {
+    const seen = new Set();
+    const stack = []; // { id, node }：当前处于哪个文件夹的子树范围内
+    let dupSeq = 0;
+    for (const n of result.bookmarks) {
+      // 回填：本节点的父若被改配过，按改配表迁移引用
+      const parentStackTop = stack.length ? stack[stack.length - 1] : null;
+      let key = String(n.id);
+      if (seen.has(key)) {
+        let fresh;
+        do { fresh = '__dup_' + (++dupSeq) + '_' + key; } while (seen.has(fresh));
+        n.id = fresh;
+        key = fresh;
+        // 该重复节点自己的子树（紧随其后、parentId 指向原 id 的节点）要改挂到新 id。
+        // 用栈记录「从本节点起、后续哪些节点属于它」：入栈后遇到同层或更浅的节点就出栈。
+        if (n.isFolder) {
+          stack.push({ originalId: String(key).replace(/^__dup_\d+_/, ''), newId: key, depth: stack.length });
+          continue;
+        }
+      }
+      seen.add(key);
+      if (n.isFolder && stack.length) {
+        // 普通文件夹：进入它的子树，出栈时恢复
+        stack.push({ originalId: key, newId: key, depth: stack.length });
+        continue;
+      }
+      // 非文件夹（叶子）：若其父正是被改配的重复文件夹，迁移 parentId
+      if (!n.isFolder && n.parentId && stack.length) {
+        for (let i = stack.length - 1; i >= 0; i--) {
+          if (String(n.parentId) === String(stack[i].originalId) && stack[i].newId !== String(stack[i].originalId)) {
+            n.parentId = stack[i].newId;
+            break;
+          }
+        }
+      }
+    }
   }
 
   // [ROOT-CAUSE CHECK] 检查"孤儿节点"：parentId 找不到对应父节点的节点
@@ -755,6 +961,18 @@ function chromeToXbel(tree, meta) {
   let otherBody = '';
 
   const bucketNode = bucket ? findFolder(rootChildren, bucket.id) : null;
+  let berryHomeNode = null;
+  for (const top of rootChildren) {
+    if (!top || top.url) continue;
+    if (isBerryHomeTitle(top.title) && (!bucketNode || String(top.id) !== String(bucketNode.id))) {
+      berryHomeNode = top;
+      break;
+    }
+    const hit = (top.children || []).find(c => c && !c.url && isBerryHomeTitle(c.title)
+      && (!bucketNode || String(c.id) !== String(bucketNode.id)));
+    if (hit) { berryHomeNode = hit; break; }
+  }
+  const homeId = berryHomeNode ? String(berryHomeNode.id) : null;
   if (bucketNode) {
     const bucketTitle = String(bucketNode.title || '');
     // legacy 嵌套包装折平（旧版每合并一轮就套一层 根目录/根目录）：
@@ -767,6 +985,7 @@ function chromeToXbel(tree, meta) {
         let changed = false;
         const next = [];
         for (const k of kids) {
+          if (homeId && String(k.id) === homeId) continue;
           if (k && !k.url && String(k.title || '') === bucketTitle) {
             for (const gc of (k.children || [])) next.push(gc);
             changed = true;
@@ -778,22 +997,13 @@ function chromeToXbel(tree, meta) {
         if (!changed) break;
       }
     }
-    for (const child of kids) barContent += renderNode(child, '    ') + '\n';
+    for (const child of kids) {
+      if (homeId && String(child.id) === homeId) continue;
+      barContent += renderNode(child, '    ') + '\n';
+    }
   }
 
   // Berry 主页：独立功能（自家 home 区），不是同步桶的内容，照旧写进「其他收藏夹」区。
-  // 它可能挂在根下，也可能是「其他收藏夹」的直接子文件夹（Chrome/Edge 的常见位置）。
-  let berryHomeNode = null;
-  for (const top of rootChildren) {
-    if (!top || top.url) continue;
-    if (isBerryHomeTitle(top.title) && (!bucketNode || String(top.id) !== String(bucketNode.id))) {
-      berryHomeNode = top;
-      break;
-    }
-    const hit = (top.children || []).find(c => c && !c.url && isBerryHomeTitle(c.title)
-      && (!bucketNode || String(c.id) !== String(bucketNode.id)));
-    if (hit) { berryHomeNode = hit; break; }
-  }
   if (berryHomeNode) {
     otherBody += `      <folder>\n        <title>${escapeXml(XBEL_FOLDER_NAMES.berryHome)}</title>\n`;
     for (const gc of (berryHomeNode.children || [])) otherBody += renderNode(gc, '        ') + '\n';

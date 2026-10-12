@@ -282,6 +282,11 @@ MARKERS = {
         # 本轮重排的真实代价落进台账（手机 console 读不到，台账是唯一证据）
         'movesAttempted',
         'movesSkippedParents',
+        # v2.3.0：公开恢复入口与上传/下载/合并共用同一把同步互斥锁排队，
+        # 避免恢复插进正在进行的清空/导入事务（内部回滚仍直调 IO，不重入同锁）。
+        'function restoreLocalBackup(options)',
+        'MiniSync.syncMutex.run(() => MiniSync.syncInput.restoreLocalBackup(options))',
+        'e.writeSet',
     ],
     'core/sync-merge.js': [
         "via: 'merge'",
@@ -290,7 +295,6 @@ MARKERS = {
         'mergeTargetId',
         'buildMergeMessage',
         'skippedNoParent',
-        'existingFolderIds',
         'crossZoneSkipped',
         '位置调整没落到位',
         'flatRootContainer',
@@ -325,6 +329,10 @@ MARKERS = {
         'idRemap',
         "__ro_",
         '撞号',
+        # v2.3.0：新父先落地再移动、父改名同轮的子移动换算、重叠目标归一化
+        'ensureMoveParent',
+        'refreshMoveView',
+        'canonicalOldPk',
     ],
     'lib/import.js': [
         'byBucket',
@@ -355,6 +363,11 @@ MARKERS = {
         'movesSkippedParents',
         '重排前读取当前顺序失败',
         '顺序已一致跳过的文件夹',
+        # v2.3.0：导入把「本轮新建的节点」登记进事务写集，回滚只撤这份写集；
+        # 异常路径把已完成的写集挂到 error.writeSet，供下载/合并回滚精确撤销。
+        'trackCreated',
+        'transaction.createdIds',
+        'error.writeSet',
     ],
     'lib/merge.js': [
         'zoneRoot',
@@ -391,6 +404,12 @@ MARKERS = {
         'buildTombstoneView',
         'prevSnapshotList',
         'topIds',
+        # v2.3.0：恢复可按备份祖先链重建容器、重叠目标归一化、写集白名单回滚
+        'resolveTarget',
+        'protectedPath',
+        'dropContainer',
+        'hasKeptDescendant',
+        'writeSet',
     ],
     'popup.html': [
         '增量：云端新增的导入本机',

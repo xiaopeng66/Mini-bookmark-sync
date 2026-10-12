@@ -12,6 +12,7 @@ function getBerryList(berryData) {
 function validateBerryList(list) {
   if (!Array.isArray(list)) throw new Error('Berry 文件格式无效');
   const ids = new Set();
+  const byId = new Map();
   for (const node of list) {
     if (!node || typeof node.id !== 'string' || !node.id || ids.has(node.id) ||
         typeof node.title !== 'string' || typeof node.parentId !== 'string' ||
@@ -19,6 +20,22 @@ function validateBerryList(list) {
       throw new Error('Berry 书签节点格式无效');
     }
     ids.add(node.id);
+    byId.set(node.id, node);
+  }
+  // ★ 环形父链必须当场拒绝：computePathKeys 沿父链会退化成 ROOT:cyclic，
+  //   而「路径集里一个都没有」会被删除检测读成「手机端删光了」——
+  //   受控输入即可触发本机与云端书签被整批删除（审计 2026-10-11 复现）。
+  //   格式非法不是空快照：这里抛错让读取判为不完整，删除检测与写回一并停下。
+  for (const node of list) {
+    const seen = new Set([node.id]);
+    let parentId = node.parentId;
+    while (parentId && parentId !== ROOT_ID) {
+      if (seen.has(parentId)) throw new Error('Berry 书签节点包含环形父链');
+      seen.add(parentId);
+      const parent = byId.get(parentId);
+      if (!parent) break; // 悬空父：不是环，交给 pathKey 兜底处理
+      parentId = parent.parentId;
+    }
   }
 }
 
@@ -198,15 +215,18 @@ async function mergeBerryDataWithChanges(currentList, preferLocalOrder = false, 
     return { list: currentList, deletedIds: [], deletedPathKeys: [], complete: false, errors: [e.message] };
   }
   const changes = { list: currentList, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] };
+  // ★ 删除快照绑定「它属于哪个远端文件」：只换手机目录时旧快照不得复用
+  //   （否则新文件里的书签被当成手机端删除，本地与主 XBEL 一起被删）。
+  const berryOwner = await MiniSync.utils.bridgeResourceUrl('berry');
   if (berryList.length === 0) {
-    const previous = (await chrome.storage.local.get(['berry_pathkey_snapshot'])).berry_pathkey_snapshot || [];
+    const previous = await MiniSync.utils.readScopedBridgeSnapshot('berry_pathkey_snapshot', berryOwner);
     const paths = computePathKeys(currentList);
     for (const n of currentList) {
       const pk = paths.get(n.id);
       if (pk && previous.includes(pk)) { changes.deletedIds.push(n.id); changes.deletedPathKeys.push(pk); }
     }
     changes.list = currentList.filter(n => !changes.deletedIds.includes(n.id));
-    changes.snapshotUpdates = { berry_pathkey_snapshot: [] };
+    changes.snapshotUpdates = MiniSync.utils.scopedBridgeSnapshotUpdate('berry_pathkey_snapshot', berryOwner, []);
     return changes;
   }
 
@@ -302,7 +322,7 @@ async function mergeBerryDataWithChanges(currentList, preferLocalOrder = false, 
   const berryFolderTitles = new Set(
     berryList.filter(n => n.isFolder).map(n => n.title)
   );
-  const berrySnapshotData = (await chrome.storage.local.get(['berry_pathkey_snapshot']))['berry_pathkey_snapshot'] || [];
+  const berrySnapshotData = await MiniSync.utils.readScopedBridgeSnapshot('berry_pathkey_snapshot', berryOwner);
   const berrySnapshotSet = new Set(berrySnapshotData);
   let berryDeletedCount = 0;
   if (berrySnapshotSet.size > 0) {
@@ -331,8 +351,8 @@ async function mergeBerryDataWithChanges(currentList, preferLocalOrder = false, 
     }
   }
 
-  // 保存 Berry pathKey 快照（用于下次检测删除）
-  changes.snapshotUpdates = { berry_pathkey_snapshot: [...berryPKSet] };
+  // 保存 Berry pathKey 快照（用于下次检测删除），连同所属文件一起写
+  changes.snapshotUpdates = MiniSync.utils.scopedBridgeSnapshotUpdate('berry_pathkey_snapshot', berryOwner, [...berryPKSet]);
 
   // 4. （已移除）原「Berry 主页权威过滤」：将不在 Berry 文件中的桌面 home 节点从合并列表移除。
   // 删除原因：Berry 的 bookmarks.json 本身不含 home 节点（主页数据在手机端自管），

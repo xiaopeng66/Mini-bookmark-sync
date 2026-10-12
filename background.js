@@ -1435,9 +1435,16 @@ async function handleBookmarkRemoved(id, removeInfo) {
     return;
   }
 
-  // 同步进行中的删除（由合并/下载落盘自身产生）不写墓碑，避免循环回写
+  // 同步进行中的删除：只忽略**本轮同步自己造成的**删除（落盘、墓碑裁剪经
+  // chrome.bookmarks.remove 触发），避免循环回写。
+  // ★ 不能再按「状态是不是 SYNCING」一刀切：那会把用户在同步期间手动删掉的书签也一并
+  //   忽略 —— 删除没有墓碑、成功快照又记下删除后的树，下一轮把云端旧书签当新增导回，
+  //   用户的删除被静默撤销（审计 2026-10-11 复现 deleteDuringGet / upload-delete-while-pending）。
+  //   精确判定依赖 lib/utils 的事务内删除登记：未登记的删除 = 真实用户操作，照常记墓碑。
   const curStatus = await MiniSync.storage.getSyncStatus();
-  if (curStatus.status === SYNCING) {
+  const isSyncDeletion = MiniSync.utils.isTransactionDeletion
+    ? MiniSync.utils.isTransactionDeletion(id) : false;
+  if (curStatus.status === SYNCING && isSyncDeletion) {
     return;
   }
 

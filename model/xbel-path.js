@@ -27,11 +27,25 @@ function computeJsonPathKeys(bookmarks) {
     return null;
   }
 
-  // URL 段：下载的 XBEL 中 & 被转义成 &amp;，本地 Chrome 是 &；
-  // 先解码实体再归一化，保证同一 URL 本地/远程指纹一致。
+  // URL 段：内部数据（本地 Chrome 与 XBEL 解析结果）现在都已是「解码一次的普通字符串」，
+  // 这里只做归一化（去尾斜杠、规范化 host）。此前额外做 `&amp;`→`&` 解码，是
+  // 「同一 URL 被多重解释」的一半来源（审计 2026-10-11 复现 urlEntity/url-entity-wrong-reuse）。
   function urlSeg(url) {
-    const decoded = (url || '').replace(/&amp;/g, '&');
-    return MiniSync.xbel.normalizeUrl(decoded);
+    return MiniSync.xbel.normalizeUrl(url);
+  }
+
+  // ★ 路径段转义：pathKey 用 '/' 分隔层级、用 'F:'/'L:' 标记类型，标题里的这些字符
+  //   会让不同拓扑塌成同一个 key —— 字面文件夹「A/F:B」与真实嵌套 A→B 都得到
+  //   `ROOT:bar/F:A/F:B`，合并时被判成同一节点，一棵树被另一棵吞掉
+  //   （审计 2026-10-11 复现 pathDelimiterCollision）。
+  //   ⚠️ 只对**文件夹标题**做转义，且只转义真的会歧义的 `/`：URL 段必须保持原样 ——
+  //   给 URL 加转义会改变所有既有 pathKey，令历史快照与墓碑键全部失效（升级即误删）。
+  //   含 `/` 的文件夹标题此前根本无法正确同步（键必然冲突），因此不存在需要兼容的旧键；
+  //   普通标题逐字节不变。
+  function escapeFolderTitle(value) {
+    const s = String(value == null ? '' : value);
+    if (!s.includes('/')) return s;
+    return s.replace(/\//g, '%2F');
   }
 
   function buildPath(node) {
@@ -83,7 +97,7 @@ function computeJsonPathKeys(bookmarks) {
       return folderSource === 'home' ? 'ROOT:home' : `ROOT:${folderSource}`;
     }
 
-    const seg = node.isFolder ? `F:${node.title}` : `L:${urlSeg(node.url)}`;
+    const seg = node.isFolder ? `F:${escapeFolderTitle(node.title)}` : `L:${urlSeg(node.url)}`;
     const parent = byId.get(node.parentId);
     if (!parent) {
       // 父节点缺失时（典型如 Berry bookmarks.json 没有根容器条目，子节点 parentId 指向一个不存在的 id），
@@ -115,8 +129,16 @@ function computeJsonPathKeys(bookmarks) {
     //   移动书签」文件夹会被整棵跳过：没有 pathKey ⇒ 合并端看不见它，它下面的书签
     //   还会因父路径缺失被判成 ROOT:unknown（表现为「漏几个文件夹」「书签乱跑」）。
     //   判定必须带位置条件（父为空/虚拟根/Chrome 根 '0'）。
+    // ★ 位置条件还不够（2026-10-11 审计）：用户在桶里自建的「其他书签」同样满足
+    //   「挂在虚拟根下 + 标题命中系统名」，于是被当成系统容器吃掉，层级与内容失真。
+    //   真正的系统容器由**生产者显式声明 source**（Via/Berry 适配器推入的 other/mobile
+    //   容器；xbelToJson 产出的桶内容 source 一律归一为 'bar'）。因此：
+    //     · 生产者没声明 source（老测试/旧数据）→ 沿用标题判定，保持向后兼容；
+    //     · 声明了 source 但与标题推断不一致 → 是用户自建的同名文件夹，不当容器。
     const isVirtualRootChild = !n.parentId || n.parentId === ROOT_ID || String(n.parentId) === '0';
-    const isZoneRootNode = n.zoneRoot || (!!detectFolderSource(n.title) && isVirtualRootChild);
+    const titleZone = detectFolderSource(n.title);
+    const sourceAgrees = !n.source || n.source === titleZone;
+    const isZoneRootNode = n.zoneRoot || (!!titleZone && isVirtualRootChild && sourceAgrees);
     if (isZoneRootNode) continue;
 
     map.set(n.id, buildPath(n));

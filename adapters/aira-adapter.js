@@ -258,6 +258,13 @@ function airaSnapshotToList(raw) {
   // 先建 id → 节点 索引，便于向上回溯 source
   const byId = new Map();
   const folders = snap.bookmarkFolders.filter(f => !f.type || f.type === 'bookmark-folder');
+  // ★ bookmarkItems 必须是数组：结构损坏（对象/字符串）不能被静默当成「空 items」——
+  //   那会让删除检测读到「手机端把书签都删了」，本机与云端书签被整批删除
+  //   （审计 2026-10-11 复现 aira-malformed-item-table-with-valid-roots...）。
+  //   抛错 = 读取不完整，调用方停掉删除检测与写回。
+  if (snap.bookmarkItems !== undefined && !Array.isArray(snap.bookmarkItems)) {
+    throw new Error('Aira 快照 bookmarkItems 格式无效');
+  }
   const items = (Array.isArray(snap.bookmarkItems) ? snap.bookmarkItems : []).filter(it => !it.type || it.type === 'bookmark-item');
   for (const f of folders) byId.set(f.id, f);
   for (const it of items) byId.set(it.id, it);
@@ -898,6 +905,8 @@ async function mergeAiraDataWithChanges(currentList, preferLocalOrder = false, t
 async function mergeAiraValidated(currentList, airaList, tombstoneKeys, changes) {
   const originalList = currentList;
   let homePKSet = null;
+  // ★ 删除快照绑定所属文件（同 Berry/Via）：只换 Aira 目录时不得复用旧快照。
+  const airaOwner = (await MiniSync.utils.airaResourceUrls()).g3;
 
   // 0. 从 Aira personalization（g2）读 home_shortcuts，合并回 Berry主页（source==='home'）
   try {
@@ -911,7 +920,8 @@ async function mergeAiraValidated(currentList, airaList, tombstoneKeys, changes)
         const node = { id: sc.id || ('shortcut-' + stableSuffix(sc.url)), title: sc.title || '', url: sc.url, isFolder: false, parentId: HOME_FOLDER_ID, source: 'home' };
         homePKSet.add(computePathKeys([node]).get(node.id));
       }
-      const previousHome = (await chrome.storage.local.get(['aira_home_pathkey_snapshot'])).aira_home_pathkey_snapshot || [];
+      const owner = await MiniSync.utils.airaResourceUrls();
+      const previousHome = await MiniSync.utils.readScopedBridgeSnapshot('aira_home_pathkey_snapshot', owner.g2);
       const currentHomePKs = computePathKeys(currentList);
       for (const n of currentList) {
         const pk = currentHomePKs.get(n.id);
@@ -921,7 +931,8 @@ async function mergeAiraValidated(currentList, airaList, tombstoneKeys, changes)
         }
       }
       if (changes.deletedIds.length) currentList = currentList.filter(n => !changes.deletedIds.includes(n.id));
-      changes.snapshotUpdates = { ...(changes.snapshotUpdates || {}), aira_home_pathkey_snapshot: [...homePKSet] };
+      changes.snapshotUpdates = { ...(changes.snapshotUpdates || {}),
+        ...MiniSync.utils.scopedBridgeSnapshotUpdate('aira_home_pathkey_snapshot', owner.g2, [...homePKSet]) };
       // ★ 归一化匹配：http/https、www.、尾斜杠差异视为同一主页书签。
       //   此前精确 toLowerCase 匹配导致 personalization 的历史条目（协议/斜杠略异）
       //   每次都被误判为「主页新增」注入，home 区数量逐轮膨胀（曾在手机端出现成对重复）。
@@ -1086,7 +1097,7 @@ async function mergeAiraValidated(currentList, airaList, tombstoneKeys, changes)
   const airaFolderTitles = new Set(
     airaList.filter(n => n.isFolder).map(n => n.title)
   );
-  const snapshotData = (await chrome.storage.local.get(['aira_pathkey_snapshot']))['aira_pathkey_snapshot'] || [];
+  const snapshotData = await MiniSync.utils.readScopedBridgeSnapshot('aira_pathkey_snapshot', airaOwner);
   const airaSnapshotSet = new Set(snapshotData);
   let airaDeletedCount = 0;
   if (changes.complete && airaSnapshotSet.size > 0) {
@@ -1111,7 +1122,8 @@ async function mergeAiraValidated(currentList, airaList, tombstoneKeys, changes)
       return true;
     });
   }
-  if (changes.complete) changes.snapshotUpdates = { ...(changes.snapshotUpdates || {}), aira_pathkey_snapshot: [...airaPKSet] };
+  if (changes.complete) changes.snapshotUpdates = { ...(changes.snapshotUpdates || {}),
+    ...MiniSync.utils.scopedBridgeSnapshotUpdate('aira_pathkey_snapshot', airaOwner, [...airaPKSet]) };
 
   // ===== 4. 组装结果（保持输入数组顺序，仅追加 Aira 新增） =====
   const combined = [...enriched];

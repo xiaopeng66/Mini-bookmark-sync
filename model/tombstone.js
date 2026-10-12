@@ -117,6 +117,42 @@ function cleanFakeTombstones(tombstones, currentTree, myDeviceId, prevSnapshotLi
 }
 
 /**
+ * 把「本事务期间新登记的墓碑」补进视图结果。
+ *
+ * 用途：合并/上传在流程开头读了一次墓碑，之后同步等待期间用户又删了书签（监听已经
+ * 写进 storage）。此刻若用流程开头那份快照视图去判，就会漏掉这次新删除 ——
+ * 提交阶段把它整份覆盖，用户的删除被静默撤销、下一轮云端旧节点又被导回
+ * （审计 2026-10-11 复现 deleteDuringGet / upload-delete-while-pending）。
+ *
+ * ⚠️ 只补「快照里还没有的 key」，且不动视图已经判掉的 key：
+ *   · 视图保留的 → 保留（含本端真删除、他端删除指令）
+ *   · 视图清掉的（假墓碑、对端已重新添加而撤销的）→ 仍然清掉，否则
+ *     「本端删了又加回来」会被旧墓碑永久拉黑（跨端回归用例正守护这一点）
+ *   · 视图没见过的 → 一定是本事务期间新登记的删除，补进来
+ */
+function mergeTombstonesPreservingNew(snapshotTombstones, viewTombstones, viewInputTombstones) {
+  const keyOf = item => (typeof item === 'string' ? item : (item && item.key ? item.key : null));
+  const out = (Array.isArray(viewTombstones) ? viewTombstones : []).slice();
+  const knownKeys = new Set();
+  for (const item of out) { const pk = keyOf(item); if (pk) knownKeys.add(pk); }
+  // 视图输入里**有**、视图结果里**没有**的 key ⇒ 视图判掉了它（真删除已消费、
+  // 假墓碑、或对端重新添加撤销）。这些必须尊重视图，不能又补回来 ——
+  // 否则「本端删了又加回来」会被旧墓碑永久拉黑。
+  const cleared = new Set();
+  for (const item of (Array.isArray(viewInputTombstones) ? viewInputTombstones : [])) {
+    const pk = keyOf(item);
+    if (pk && !knownKeys.has(pk)) cleared.add(pk);
+  }
+  for (const item of (Array.isArray(snapshotTombstones) ? snapshotTombstones : [])) {
+    const pk = keyOf(item);
+    if (!pk || knownKeys.has(pk) || cleared.has(pk)) continue;
+    knownKeys.add(pk);
+    out.push(item);
+  }
+  return out;
+}
+
+/**
  * 构建一次同步使用的完整「墓碑视图」——**上传 / 下载 / 合并三条路径必须共用同一份口径**。
  *
  * 为什么必须共用：三个按钮若各按各的规则消费墓碑，同一个删除在不同按钮上表现不同。
@@ -160,6 +196,54 @@ function buildTombstoneView(opts) {
     return pk && !bothPresentPKs.has(pk);
   });
 
+  // ★ 删除撤销（跨端重新添加）——审计 2026-10-11 复现 readdNonempty。
+  //   场景：A 删除并同步完成（双方都删掉了），B 之后明确重新添加并同步成功
+  //   （云端墓碑被清空、书签重新出现）。此时 A 若继续持有旧墓碑，就会把 B 的新副本
+  //   再删一次，B 也被反向带动 —— 重新添加永远传不出去。
+  //
+  //   判定必须**有决定性证据**，否则会破坏正常的删除传播。四个条件同时成立才撤销：
+  //     ① 本端持有该 key 的墓碑（有待传播或已传播的删除意图）
+  //     ② 云端此刻有该 key 的活节点（书签真的回来了）
+  //     ③ 云端墓碑列表里没有该 key（删除在共享状态里已被撤销）
+  //     ④ 上次成功同步的基线快照**没有**该 key（说明它是上次同步之后才重新出现的）
+  //
+  //   为什么④是决定性的：若本端刚删除、删除尚未传播，那么本端上次成功同步时该节点
+  //   还在（基线里有它）⇒ 条件④不成立 ⇒ 墓碑保留，删除照常传播（Case Y）。
+  //   而重新添加场景里，本端上次成功同步的正是「已删除」状态，基线里没有它 ⇒ 撤销。
+  //   基线为空（首次同步/无证据）时不撤销，宁可多留一轮墓碑也不误删。
+  const remoteTombstoneKeys = (() => {
+    const set = new Set();
+    for (const item of (Array.isArray(o.remoteTombstones) ? o.remoteTombstones : [])) {
+      const pk = typeof item === 'string' ? item : (item && item.key ? item.key : null);
+      if (pk) set.add(pk);
+    }
+    return set;
+  })();
+  const baselineKeys = (Array.isArray(o.prevSnapshotList) && o.prevSnapshotList.length > 0)
+    ? new Set(MiniSync.xbelPath.computeJsonPathKeys(o.prevSnapshotList).values()) : null;
+  //   ⚠️ 还必须有条件 ⑤：该 key 的墓碑**确实上过云**（ackTombstoneKeys 记录本端曾在云端
+  //   墓碑列表里见到它）。缺这条会把「本端刚删、墓碑刚记」误当成「对端重新添加」而
+  //   撤销删除 —— 实测：上传等待期间删掉的书签，墓碑刚补记，云端还留着旧副本、基线
+  //   也还没更新，前四条恰好都成立，删除结果被撤销、下一轮书签又被导回。
+  const ackedKeys = new Set(Array.isArray(o.ackTombstoneKeys) ? o.ackTombstoneKeys : []);
+  const revokedKeys = new Set();
+  if (baselineKeys) {
+    tombstones = tombstones.filter(item => {
+      const pk = typeof item === 'string' ? item : (item && item.key ? item.key : null);
+      if (!pk) return false;
+      if (remotePKSet.has(pk) && !remoteTombstoneKeys.has(pk) && !baselineKeys.has(pk)
+        && ackedKeys.has(pk)) {
+        revokedKeys.add(pk);
+        return false; // 对端在上次同步之后重新添加 → 撤销本端旧删除
+      }
+      return true;
+    });
+  }
+
+  // 本轮在云端墓碑里看到的 key ⇒ 记为「已确认上云」，供后续撤销判定使用（条件 ⑤）。
+  const nextAcked = new Set(ackedKeys);
+  for (const pk of remoteTombstoneKeys) nextAcked.add(pk);
+
   return {
     tombstones,
     tombstoneKeys: extractKeys(tombstones),
@@ -167,7 +251,10 @@ function buildTombstoneView(opts) {
     remotePKs,
     localPKSet,
     remotePKSet,
-    bothPresentPKs
+    bothPresentPKs,
+    revokedKeys,
+    // 调用方必须把 ackTombstoneKeys 落盘，否则撤销永远不成立
+    ackTombstoneKeys: nextAcked
   };
 }
 
@@ -177,6 +264,7 @@ return {
   mergeTombstones: mergeTombstones,
   mergeTombstoneSources: mergeTombstoneSources,
   cleanFakeTombstones: cleanFakeTombstones,
+  mergeTombstonesPreservingNew: mergeTombstonesPreservingNew,
   buildTombstoneView: buildTombstoneView
 };
 

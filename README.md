@@ -4,10 +4,20 @@
 > 本仓库是 [原项目](https://github.com/jagshen/Mini-bookmark-sync) 的维护版：保留原项目的全部功能，
 > 并补上手机端支持、双向增量增删，以及一批跨端同步的一致性修复。
 
-[![Version](https://img.shields.io/badge/version-2.2.2-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
+[![Version](https://img.shields.io/badge/version-2.3.0-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
+
+## v2.3.0 发布说明
+
+- 修复「父文件夹改名 + 另一端删除子书签」导致被删书签复活、「改名 + 另一端换序」导致顺序回退的问题。
+- 修复「移动到本轮新建的父文件夹」丢失一层目录、桶内主页被重复建出的问题。
+- 修复同步桶与主页互相嵌套时「下载重建」误删、失败回滚无法还原的问题。
+- 失败回滚只撤销本次同步新建的内容，不再删除同步期间你手动新增的书签。
+- 手动恢复与下载/合并改为排队执行，不再互相打断。
+
+安装仍由宿主浏览器确认；能否安装取决于其支持与签名要求。详见 [v2.3.0 发布说明](docs/release-v2.3.0.md)。
 
 ## v2.2.2 发布说明
 

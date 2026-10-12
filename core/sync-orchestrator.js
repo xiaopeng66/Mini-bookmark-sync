@@ -56,6 +56,12 @@ async function doUploadBookmarks(options) {
     }
 
     if (!config.url) throw new Error('请先配置 WebDAV 信息');
+    // ★ 锁住本轮远端目标：桥接读写与主文件写入必须指向同一个账户/文件。
+    //   不锁的话，同步中途改设置会让手机桥接写到新账户，而主文件仍在旧账户，
+    //   旧列表覆盖新账户内容且报告全成功（审计复现 upload-switch-remote-bridge）。
+    MiniSync.utils.setTransactionWebDAVConfig(config);
+    // 本轮同步自身造成的删除都要登记，供 background 监听精确跳过
+    if (MiniSync.utils.beginTransactionDeletionTracking) MiniSync.utils.beginTransactionDeletionTracking();
 
     // Read body and ETag together; HEAD timestamps cannot protect a later PUT.
     const remoteVersion = await MiniSync.webdav.getFileVersion(config.url, config.username, config.password, config.filename);
@@ -168,8 +174,41 @@ async function doUploadBookmarks(options) {
       writeCondition);
     mainCommitted = true;
     uploadNote += MiniSync.webdav.writeProtectionNote(putResult.protection);
+    // ★ 本端把墓碑成功写上了云 ⇒ 这些 key 就是「已确认上云」（撤销判定的条件 ⑤）。
+    try {
+      const acked = new Set([
+        ...((await MiniSync.storage.getLocal(['sync_tombstone_acked'])).sync_tombstone_acked || []),
+        ...(Array.isArray(meta.tombstones) ? meta.tombstones : []).map(t => (typeof t === 'string' ? t : (t && t.key) || '')).filter(Boolean)
+      ]);
+      await MiniSync.storage.setLocal({ sync_tombstone_acked: [...acked] });
+    } catch (e) { console.warn('[sync] 记录已上云墓碑失败（忽略）:', e.message); }
     // 记录云端 lastModified，供下次上传冲突检测使用
     await MiniSync.storage.setLocal({ [STORAGE_KEYS.CLOUD_LAST_MODIFIED]: putResult.lastModified || Date.now() });
+
+    // ★ 提交后对账：写出去的是 PUT 之前那一刻的树。若用户在这次 PUT 等待期间删了书签，
+    //   它此刻已不在本机树上，却**刚刚被写进了云端**。不补墓碑的话，下一轮会把云端那条
+    //   当成「云端新增」重新导回 —— 用户的删除被静默撤销
+    //   （审计 2026-10-11 复现 upload-delete-while-pending）。
+    //   判据只用「已上传的 pathKey 现在本机没有」：本机新增的节点不在此列，不会误伤。
+    try {
+      const afterPKs = new Set(MiniSync.xbelPath
+        .computeJsonPathKeys(MiniSync.merger.chromeTreeToList(await MiniSync.syncInput.getChromeTree())).values());
+      const uploadedPKs = new Set(MiniSync.xbelPath
+        .computeJsonPathKeys(MiniSync.merger.chromeTreeToList(xbelTree)).values());
+      const vanishedPKs = [...uploadedPKs].filter(pk => !afterPKs.has(pk));
+      if (vanishedPKs.length > 0) {
+        const devId = await MiniSync.storage.getDeviceId();
+        const cur = await MiniSync.storage.getLocal(['sync_tombstones']);
+        await MiniSync.storage.setLocal({
+          sync_tombstones: MiniSync.tombstone.mergeTombstones(
+            cur.sync_tombstones || [], new Set(vanishedPKs), null, devId)
+        });
+        console.warn(`[sync] 上传期间本机删除了 ${vanishedPKs.length} 项，已补记墓碑以免被复活`);
+        uploadNote += `（上传期间本机删除的 ${vanishedPKs.length} 项已记录为删除，不会被重新导回）`;
+      }
+    } catch (e) {
+      console.warn('[sync] 上传后删除对账失败（忽略）:', e.message);
+    }
 
     // 上传后 Berry/Via 桥接写回（先读入变更，再写回；受开关约束）
     // ★ 关键：上传用 flatList 保持纯 Chrome 数据；bridgeList 用于桥接文件写回
@@ -217,14 +256,25 @@ async function doUploadBookmarks(options) {
       partial: !!bridgeOutcome.partial, bridgeResults: bridgeOutcome.bridgeResults,
       error: bridgeOutcome.partial ? '主文件已上传，手机桥接部分失败' : '' });
 
-    // 同步成功后刷新本地快照（供删除监听回溯被删节点 pathKey）
+    // 同步成功后刷新本地快照（供删除监听回溯被删节点 pathKey），并检查基线是否完整。
+    // ★ 先算基线结果再写状态/返回值：基线没写成必须如实进 partial 与 message，
+    //   否则用户以为「同步成功」，而之后删除的书签其实拿不到 pathKey、无法传播
+    //   （审计 2026-10-11 复现 snapshot-write-failure）。
     await MiniSync.syncInput.saveLocalSnapshot();
-    await MiniSync.syncInput.saveLocalTreeSnapshot();
+    const baselineRepair = await MiniSync.syncInput.repairBaselineIfNeeded();
+    const baselineSave = await MiniSync.syncInput.saveLocalTreeSnapshot();
+    const baselineIncomplete = !baselineSave.ok || baselineRepair.ok === false;
+    if (baselineIncomplete) {
+      await MiniSync.storage.setSyncStatus({ status: 'partial', partial: true,
+        bridgeResults: bridgeOutcome.bridgeResults,
+        error: '本地基线快照写入失败：期间删除的书签可能无法传播，下次同步会自动重试' });
+    }
     return {
       success: true,
-      partial: !!bridgeOutcome.partial,
+      partial: !!bridgeOutcome.partial || baselineIncomplete,
       bridgeResults: bridgeOutcome.bridgeResults || {},
-      message: (bridgeOutcome.partial ? '主文件已上传，手机桥接部分失败' : '上传成功') + uploadNote,
+      message: (bridgeOutcome.partial ? '主文件已上传，手机桥接部分失败'
+        : (baselineIncomplete ? '上传成功，但本地基线快照写入失败（删除传播可能延迟）' : '上传成功')) + uploadNote,
       endpointKey: endpointKey,
       count: totalCount,
       bookmarkCount: bmCount,
@@ -238,7 +288,15 @@ async function doUploadBookmarks(options) {
     console.error('[sync] 上传失败:', error.message);
     let recovery = null;
     if (backupReady && !mainCommitted) {
-      try { recovery = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true, targetParentId: recoveryBucketId }); }
+      // ★ 上传路径本机只做**删除**（按云端墓碑删本地，含主页区），从不新建内容节点，
+      //   所以它的回滚只需把被删的补回来 —— 用替换式（replaceCurrent）会把同步等待期间
+      //   用户手动新增的书签当成「备份之外的多余项」删掉，而备份里没有它 ⇒ 永久丢失
+      //   （审计 2026-10-11 复现 concurrent-local-edit-rollback）。
+      //   叠加式恢复只新增缺失节点、绝不删除，正是上传场景的正确语义；
+      //   同时必须覆盖主页区，否则墓碑删掉的主页内容留在已删状态
+      //   （同批审计复现 home-rollback-upload）。
+      try { recovery = await MiniSync.syncInput.restoreLocalBackup({ targetParentId: recoveryBucketId,
+        includeHome: true, recreateMissingHome: true }); }
       catch (e) { recovery = { ok: false, reason: e.message }; }
     }
     await MiniSync.storage.setSyncStatus({ status: FAILED, error: error.message });
@@ -246,6 +304,10 @@ async function doUploadBookmarks(options) {
     //   条件写入在 PUT 阶段被拒（412/409）时如果不带 code，用户只会看到「上传失败」，
     //   既不知道是并发冲突，也没有任何可走的下一步。
     return { success: false, message: `上传失败: ${error.message}`, code: error.code, recovery };
+  } finally {
+    // 事务结束必须解锁：后续同步按当时最新设置重新锁定目标。
+    if (MiniSync.utils.clearTransactionWebDAVConfig) MiniSync.utils.clearTransactionWebDAVConfig();
+    if (MiniSync.utils.endTransactionDeletionTracking) MiniSync.utils.endTransactionDeletionTracking();
   }
 }
 
@@ -299,6 +361,9 @@ async function doDownloadBookmarks(options) {
     }
 
     if (!config.url) throw new Error('请先配置 WebDAV 信息');
+    // 下载同样会删本地节点（清空重建、按墓碑删除），必须登记本事务删除，
+    // 否则 background 监听无法区分「扩展删的」与「用户删的」（审计修复配套）。
+    if (MiniSync.utils.beginTransactionDeletionTracking) MiniSync.utils.beginTransactionDeletionTracking();
 
     const remoteVersion = await MiniSync.webdav.getFileVersion(config.url, config.username, config.password, config.filename);
     const content = remoteVersion.content;
@@ -354,14 +419,17 @@ async function doDownloadBookmarks(options) {
     // 下载落点与上传来源：桶的子节点全集 = 同步内容，桶外一律不读不写。
     let targetParentId = null;
     let clearLocalFirst = false;
+    // ★ 落点必须复用本轮**已锁定**的桶（bucketInfo），不能再解析一次：
+    //   旧实现在这里第二次读设置，用户在备用清空与导入之间改了目标 A→B，
+    //   就会出现「清空/导入 B、回滚 A」，B 的原内容丢失而界面还说「已回滚」
+    //   （审计 2026-10-11 复现 download-switch-bucket）。
+    targetParentId = bucketInfo.id;
     try {
-      const info = await MiniSync.syncInput.resolveSyncBucketSetting();
-      targetParentId = info.id;
       const t = await MiniSync.storage.getLocal(['download_clear']);
       clearLocalFirst = !!(t && t.download_clear);
       restoreHome = clearLocalFirst;
     } catch (e) {
-      console.warn('[sync] 解析同步文件夹失败（继续按自动处理）:', e.message);
+      console.warn('[sync] 读取下载清空开关失败（继续按自动处理）:', e.message);
     }
     try {
       result = await MiniSync.importer.importBookmarksFromData(
@@ -372,7 +440,13 @@ async function doDownloadBookmarks(options) {
     } catch (e) {
       // 4a. 导入异常 → 从备份恢复
       console.error('[sync] 增量导入失败，尝试回滚:', e.message);
-      const restored = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true, targetParentId: bucketInfo.id, includeHome: restoreHome });
+      // ★ 把 importer 已经落地的新建节点写集带进回滚：异常发生在导入中途时，本地可能
+      //   已经建了 home 容器等半成品，而同步等待期间用户手动新增的书签不在写集里。
+      //   不带写集会退回「备份之外全删」的替换式语义，把用户并发新增一起删掉
+      //   （审计复现：download-exception-write-set 的 LateUser 被回滚误删）。
+      const restored = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true, targetParentId: bucketInfo.id,
+        // 下载的删除阶段也覆盖 home 区；失败回滚必须一起恢复（含容器被整棵删除的情形）。
+        includeHome: true, recreateMissingHome: true, createdIds: e.writeSet || [] });
       await MiniSync.storage.setSyncStatus({ status: FAILED, error: e.message });
       return {
         success: false,
@@ -397,7 +471,10 @@ async function doDownloadBookmarks(options) {
     }
     if (failedWrites > 0 || result.moveFailed > 0) {
       const failureCount = failedWrites + (result.moveFailed || 0);
-      const restored = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true, targetParentId: bucketInfo.id, includeHome: restoreHome });
+      // 只撤销本事务新建的节点：同步期间用户手动新增的书签不在写集里，必须保留
+      // （审计 2026-10-11 复现 concurrent-local-edit-rollback）。
+      const restored = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true, targetParentId: bucketInfo.id,
+        includeHome: true, recreateMissingHome: true, createdIds: result.createdIds });
       await MiniSync.storage.setSyncStatus({ status: FAILED, error: '下载写入未完整落地' });
       return { success: false, partial: true, conflictCount: failureCount, conflicts: result.conflicts || [],
         restored: restored.restored,
@@ -442,10 +519,20 @@ async function doDownloadBookmarks(options) {
 
     // 同步成功后刷新本地快照（供删除监听回溯被删节点 pathKey）
     await MiniSync.syncInput.saveLocalSnapshot();
-    await MiniSync.syncInput.saveLocalTreeSnapshot();
+    // 基线快照是删除传播的必要状态：写失败会被记录，先尝试补交上次欠的，
+    // 再把本次结果如实并入 partial（见 core/sync-input.js saveLocalTreeSnapshot）。
+    const baselineRepair = await MiniSync.syncInput.repairBaselineIfNeeded();
+    const baselineSave = await MiniSync.syncInput.saveLocalTreeSnapshot();
+    const baselineIncomplete = !baselineSave.ok || baselineRepair.ok === false;
+    if (baselineIncomplete) {
+      await MiniSync.storage.setSyncStatus({ status: 'partial', partial: true,
+        error: '本地基线快照写入失败：期间删除的书签可能无法传播，下次同步会自动重试' });
+    }
     const message = failedWrites > 0
       ? `下载完成，但有 ${failedWrites} 条没能写入本地（云端数据未丢）：${conflictSamples.join('；')}`
-      : (cleanedNotes.length > 0 ? `下载成功（${cleanedNotes.join('，')}）` : '下载成功');
+      : (baselineIncomplete
+        ? '下载成功，但本地基线快照写入失败（删除传播可能延迟）'
+        : (cleanedNotes.length > 0 ? `下载成功（${cleanedNotes.join('，')}）` : '下载成功'));
     // 台账：消息通道坏的宿主（可拓/雨见）也能靠 storage 读到「这次到底写了什么」
     try {
       await MiniSync.storage.setLocal({
@@ -489,6 +576,7 @@ async function doDownloadBookmarks(options) {
     }
     return {
       success: true,
+      partial: baselineIncomplete || undefined,
       message,
       importedCount: result.importedCount,
       totalCount: cloudTotal,
@@ -509,23 +597,39 @@ async function doDownloadBookmarks(options) {
     console.error('[sync] 下载失败:', error.message);
     let recovery = null;
     if (backupReady && recoveryBucketId && !localCommitted) {
-      try { recovery = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true, targetParentId: recoveryBucketId, includeHome: restoreHome }); }
+      try { recovery = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true, targetParentId: recoveryBucketId,
+        includeHome: true, recreateMissingHome: true }); }
       catch (e) { recovery = { ok: false, reason: e.message }; }
     }
     await MiniSync.storage.setSyncStatus({ status: FAILED, error: error.message });
     return { success: false, message: `下载失败: ${error.message}`, recovery };
+  } finally {
+    // 下载路径不写云端，但同样要清掉可能残留的锁定（防御性：正常不会设置）。
+    if (MiniSync.utils.clearTransactionWebDAVConfig) MiniSync.utils.clearTransactionWebDAVConfig();
+    if (MiniSync.utils.endTransactionDeletionTracking) MiniSync.utils.endTransactionDeletionTracking();
   }
 }
 
 // 合并路径已迁移至 core/sync-merge.js（MiniSync.mergeStrategy.mergeSync）
 const mergeSync = MiniSync.mergeStrategy.mergeSync;
 
+/**
+ * 公开恢复入口（用户点「恢复」/后台消息 restoreFromBackup 走这里）：
+ * 必须与上传/下载/合并共用同一把同步互斥锁排队 —— 否则恢复会插进正在执行的
+ * 清空/导入事务中间，和它互相删对方刚写的节点（审计复现：restore-races-download-clear）。
+ * ⚠️ 同步路径内部失败回滚**不能**走这里：它已经在锁内，再取一次同一把锁会死锁，
+ *   那些调用点继续直接用 MiniSync.syncInput.restoreLocalBackup。
+ */
+function restoreLocalBackup(options) {
+  return MiniSync.syncMutex.run(() => MiniSync.syncInput.restoreLocalBackup(options));
+}
+
 return {
   uploadBookmarks,
   downloadBookmarks,
   mergeSync,
   // 透传：供 background.js 直接调用（原 orchestrator 暴露的能力）
-  restoreLocalBackup: MiniSync.syncInput.restoreLocalBackup,
+  restoreLocalBackup,
   saveLocalSnapshot: MiniSync.syncInput.saveLocalSnapshot
 };
 

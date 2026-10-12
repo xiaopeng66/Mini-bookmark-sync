@@ -23,13 +23,34 @@ function hashId(title, parentId) {
 function decodeHtmlEntities(str) {
   if (str === null || str === undefined) return '';
   return String(str)
-    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)))
-    .replace(/&#[xX]([0-9a-fA-F]+);/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, d) => {
+      const code = Number(d);
+      // ★ 非 BMP 码点必须用 fromCodePoint：旧实现 fromCharCode(128512) 会截断成 \uF600，
+      //   emoji 标题在往返后变成乱码（审计 2026-10-11 复现）。
+      return Number.isFinite(code) && code >= 0 && code <= 0x10FFFF ? String.fromCodePoint(code) : _;
+    })
+    .replace(/&#[xX]([0-9a-fA-F]+);/g, (_, h) => {
+      const code = parseInt(h, 16);
+      return Number.isFinite(code) && code >= 0 && code <= 0x10FFFF ? String.fromCodePoint(code) : _;
+    })
     .replace(/&quot;/g, '"')
     .replace(/&apos;/g, "'")
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&amp;/g, '&');
+}
+
+// 存储用的 URL 规范化：去首尾空白 + 剥路径尾部斜杠（沿用既有存储口径），
+// 但**保留 fragment**。
+// ★ 不能在这里剥 fragment：`https://app.invalid/#/inbox` 是完整地址，旧实现的
+//   `obj.hash = ''` 把用户书签改写成 `https://app.invalid`（审计复现 via-fragment-url...）。
+//   带 fragment 时不做尾斜杠裁剪，避免把 `.../#/` 这类地址截成另一种写法。
+//   去重/身份比较另有 normalizeUrlForDedup，两者不要混用。
+function normalizeStoredUrl(url) {
+  if (!url) return '';
+  const trimmed = String(url).trim();
+  if (!trimmed || /#/.test(trimmed)) return trimmed;
+  return trimmed.replace(/\/+$/, '');
 }
 
 // ========== HTML → 扁平列表 ==========
@@ -73,15 +94,28 @@ function parseHtmlToBookmarks(html) {
     return { content: text.slice(startAfterDLp), end: text.length };
   }
 
+  // 从一个标签串里取属性值（双引号/单引号/无引号都认，属性顺序无关）。
+  // ★ 旧实现在大正则里写死 `<A\s+HREF="..."`：属性顺序一变（合法 HTML）或写成单引号，
+  //   整条书签读不到，而文件仍被判为「读取完整」→ 上一轮快照里的书签被当成手机端删除，
+  //   本地与主 XBEL 一起被删（审计 2026-10-11 复现）。这里对合法书写形式一视同仁。
+  function attrValue(tagText, name) {
+    if (!tagText) return '';
+    const re = new RegExp('\\b' + name + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\'|([^\\s>]+))', 'i');
+    const m = re.exec(tagText);
+    if (!m) return '';
+    return m[1] !== undefined ? m[1] : (m[2] !== undefined ? m[2] : (m[3] || ''));
+  }
+
   function parseDL(block, parentId, source) {
-    // 逐项扫描：匹配 <DT> 开头的文件夹或书签
-    const dtRegex = /<DT>\s*<H3[^>]*?(?:ADD_DATE="(\d*)")?[^>]*>([\s\S]*?)<\/H3>\s*<DL><p>|<DT>\s*<A\s+HREF="([^"]*)"[^>]*?(?:ADD_DATE="(\d*)")?[^>]*>([\s\S]*?)<\/A>/gi;
+    // 逐项扫描：按 <DT> 切分后再判断这一项是文件夹还是书签。
+    // 属性解析交给 attrValue —— 不再依赖固定书写顺序与引号风格（两者都是合规 HTML）。
+    const dtRegex = /<DT>\s*(?:<H3\b([^>]*)>([\s\S]*?)<\/H3>\s*<DL\b[^>]*>|<A\b([^>]*)>([\s\S]*?)<\/A>)/gi;
     let match;
     while ((match = dtRegex.exec(block)) !== null) {
       if (match[2] !== undefined) {
         // 文件夹：用栈计数方式提取完整的子 DL 内容
         const title = decodeHtmlEntities(match[2].replace(/<[^>]*>/g, '').trim());
-        const addDate = parseAddDate(match[1]);
+        const addDate = parseAddDate(attrValue(match[1], 'ADD_DATE'));
         const folderId = hashId(title, parentId);
 
         // 从 match 结束位置提取配对的 DL 块
@@ -155,11 +189,11 @@ function parseHtmlToBookmarks(html) {
         // ★ 实体解码必须发生在 normalizeUrl 之前：写端把 & 写成 &#38; 时，
         //   其中的 '#' 会被 new URL() 当成 fragment 起点，查询串被整段丢弃
         //   （实测 ?q=a&b=c → ?q=a&，等于篡改书签地址）。
-        const url = decodeHtmlEntities(match[3]);
+        const url = decodeHtmlEntities(attrValue(match[3], 'HREF'));
         // 标题：必须先去标签再解码（顺序反了会把 &lt;b&gt; 变成真标签后误删）
-        const title = decodeHtmlEntities((match[5] || '').replace(/<[^>]*>/g, '').trim());
-        const addDate = parseAddDate(match[4]);
-        const fixedUrl = normalizeUrl(url);
+        const title = decodeHtmlEntities((match[4] || '').replace(/<[^>]*>/g, '').trim());
+        const addDate = parseAddDate(attrValue(match[3], 'ADD_DATE'));
+        const fixedUrl = normalizeStoredUrl(url);
         if (!fixedUrl) continue;
         const bookmarkId = hashId(fixedUrl + '\x01' + title, parentId);
         bookmarks.push({
@@ -366,6 +400,9 @@ async function mergeViaData(currentList, tombstoneKeys = null) {
 
 async function mergeViaDataWithChanges(currentList, tombstoneKeys = null) {
   const changes = { list: currentList, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] };
+  // ★ 删除快照绑定「它属于哪个远端文件」（同 Berry）：只换手机目录时不得复用旧快照，
+  //   否则新文件里的书签会被当成手机端删除（审计复现三个 folder-switch 场景）。
+  const viaOwner = await MiniSync.utils.bridgeResourceUrl('via');
   // 计数：供末尾「处理完成」日志展示差异构成（声明在函数级，块内赋值）
   let viaNewCount = 0, homeNewCount = 0;
   // ★ 收集所有"来自 Via 文件"的 pathKey（HTML + favorites），
@@ -387,6 +424,16 @@ async function mergeViaDataWithChanges(currentList, tombstoneKeys = null) {
 
   if (changes.complete && html) {
     viaList = parseHtmlToBookmarks(html);
+    // ★ fail-closed：文件里明明有书签/文件夹标签，却一条都没解析出来 ⇒ 判为读取不完整，
+    //   交给调用方停掉删除检测与写回。旧行为把「解析器读不懂」当成「手机端删光了」，
+    //   用户书签在本地与主 XBEL 一起消失（审计 2026-10-11 复现）。
+    //   只有「确实是空书签文件」才允许走空列表（那才代表手机端删空）。
+    const hasAnyItemTag = /<(?:A|H3)\b/i.test(html);
+    if (viaList.length === 0 && hasAnyItemTag) {
+      changes.complete = false;
+      changes.errors.push('Via bookmarks.html 内容无法解析（格式不兼容）');
+      return changes;
+    }
     if (viaList.length > 0) {
       const currentPKs = computePathKeys(currentList);
       const viaPKs = computePathKeys(viaList);
@@ -490,12 +537,17 @@ async function mergeViaDataWithChanges(currentList, tombstoneKeys = null) {
   let txt;
   try {
     txt = await downloadViaFavorites();
-    if (txt === null) throw new Error('Via favorites.txt 不存在');
+    // ★ 文件不存在（404）按「主页区为空」处理，不再判整份 Via 读取失败：
+    //   主页文件是手机端首次使用后才创建的，缺它就把 HTML 里的合法书签一起丢掉，
+    //   随后写回还会覆盖掉手机端唯一副本（审计 2026-10-11 复现
+    //   via-missing-favorites-discards-valid-bookmarks-then-overwrites-them）。
+    //   注意：内容损坏（JSON 解析失败）仍必须 fail-closed，见下面的 catch。
+    if (txt === null) txt = '';
     if (typeof txt !== 'string') throw new Error('Via favorites.txt 格式无效');
     for (const line of txt.split('\n').filter(value => value.trim())) {
       const row = JSON.parse(line);
       if (!row || typeof row !== 'object' || typeof row.url !== 'string' || !row.url.trim() ||
-          (row.title !== undefined && typeof row.title !== 'string') || !normalizeUrl(row.url)) {
+          (row.title !== undefined && typeof row.title !== 'string') || !normalizeStoredUrl(row.url)) {
         throw new Error('Via favorites.txt 书签节点格式无效');
       }
     }
@@ -589,7 +641,7 @@ async function mergeViaDataWithChanges(currentList, tombstoneKeys = null) {
   const viaFolderTitles = new Set(
     viaList.filter(n => n.isFolder).map(n => n.title)
   );
-  const viaSnapshotData = (await chrome.storage.local.get(['via_pathkey_snapshot']))['via_pathkey_snapshot'] || [];
+  const viaSnapshotData = await MiniSync.utils.readScopedBridgeSnapshot('via_pathkey_snapshot', viaOwner);
   const viaSnapshotSet = new Set(viaSnapshotData);
   let viaDeletedCount = 0;
   if (changes.complete && viaSnapshotSet.size > 0) {
@@ -615,8 +667,8 @@ async function mergeViaDataWithChanges(currentList, tombstoneKeys = null) {
     }
   }
 
-  // 保存 Via pathKey 快照（用于下次检测 Via 删除）
-  if (changes.complete) changes.snapshotUpdates = { via_pathkey_snapshot: [...viaPKSet] };
+  // 保存 Via pathKey 快照（用于下次检测 Via 删除），连同所属文件一起写
+  if (changes.complete) changes.snapshotUpdates = MiniSync.utils.scopedBridgeSnapshotUpdate('via_pathkey_snapshot', viaOwner, [...viaPKSet]);
 
   // Via 新增节点（来自 html/favorites 解析）无 _index → 补到同父已有节点之后
   MiniSync.utils.fillMissingSiblingIndex(currentList);
@@ -635,7 +687,7 @@ function parseFavoritesTxt(txt) {
     try {
       const obj = JSON.parse(line);
       if (!obj.url) continue;
-      const fixedUrl = normalizeUrl(obj.url);
+      const fixedUrl = normalizeStoredUrl(obj.url);
       if (!fixedUrl) continue;
       const title = (obj.title || '').trim();
       // 用与 hashId 相同的逻辑，但前缀改为 via_home_

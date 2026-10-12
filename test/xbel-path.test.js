@@ -98,11 +98,35 @@ describe('computeJsonPathKeys — pathKey 指纹', () => {
   });
 
   test('URL 中 &amp; 与本地 & 归一化后 pathKey 一致', () => {
-    const local = [{ id: 'b1', parentId: 'root', title: '搜索', url: 'https://x.com/s?a=1&b=2' }];
-    const remote = [{ id: 'r1', parentId: 'root', title: '搜索', url: 'https://x.com/s?a=1&amp;b=2' }];
+    // ★ 契约（2026-10-11 起）：实体只在 XML 边界解码一次，内部一律普通字符串。
+    //   所以断言必须走真实解析路径 —— 云端 XBEL 里的 &amp; 解析后与本地 Chrome 的 &
+    //   完全一致；直接把手写 `&amp;` 串喂进来已不再是合法输入形态
+    //   （那代表「URL 里字面含有 &amp; 五个字符」，与真正的 & 语义不同）。
+    const xml = '<xbel version="1.0"><folder><title>书签栏</title>'
+      + '<bookmark href="https://x.com/s?a=1&amp;b=2"><title>搜索</title></bookmark>'
+      + '</folder><folder><title>其他收藏夹</title></folder>'
+      + '<folder><title>移动收藏夹</title></folder></xbel>';
+    const parsed = global.MiniSync.xbel.parseXbelFromString(xml);
+    expect(parsed.bookmarks[0].url).toBe('https://x.com/s?a=1&b=2');
+
+    const local = [
+      { id: 'bar', parentId: 'root', title: '书签栏', isFolder: true },
+      { id: 'b1', parentId: 'bar', title: '搜索', url: 'https://x.com/s?a=1&b=2' }
+    ];
     const m1 = computeJsonPathKeys(local);
-    const m2 = computeJsonPathKeys(remote);
-    expect(m1.get('b1')).toBe(m2.get('r1'));
+    const m2 = computeJsonPathKeys(parsed.bookmarks);
+    expect(m1.get('b1')).toBe(m2.get(parsed.bookmarks[0].id));
+  });
+
+  test('字面实体不再被二次解码：URL 里的 &lt; 保持原样', () => {
+    // 回归（审计 urlEntity / url-entity-roundtrip）：旧实现链式 replace 会把
+    // `&amp;lt;` 解成 `&lt;` 再解成 `<`，用户地址被改写。
+    const xml = '<xbel version="1.0"><folder><title>书签栏</title>'
+      + '<bookmark href="https://q.invalid/p?literal=&amp;lt;mode"><title>X</title></bookmark>'
+      + '</folder><folder><title>其他收藏夹</title></folder>'
+      + '<folder><title>移动收藏夹</title></folder></xbel>';
+    const parsed = global.MiniSync.xbel.parseXbelFromString(xml);
+    expect(parsed.bookmarks[0].url).toBe('https://q.invalid/p?literal=&lt;mode');
   });
 
 });
