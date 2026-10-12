@@ -244,6 +244,7 @@ async function doMergeSync(options) {
   const warnings = [];
   try {
     await MiniSync.storage.setSyncStatus({ status: SYNCING, action: 'merge' });
+    await MiniSync.syncInput.assertLocalRecoveryReady();
 
     // ★ 单同步桶：先把「同步文件夹」定下来（用户指定或自动探测并固化）。
     //   本机识别自己是扁平根宿主（手机）只能给出容器名，所以先 prime 名字，
@@ -297,7 +298,7 @@ async function doMergeSync(options) {
     //   坚果云这类不返回强 ETag 的服务因此完全无法合并（v2.2.0 实测回归）。
     const remoteWriteCondition = MiniSync.webdav.versionWriteCondition(remoteVersion);
     if (remoteVersion.exists && !MiniSync.webdav.isStrongETag(remoteVersion.etag)) {
-      console.warn(`[sync] 云端未提供强 ETag（etag=${JSON.stringify(remoteVersion.etag)}，`
+      console.info(`[sync] 云端未提供强 ETag（etag=${JSON.stringify(remoteVersion.etag)}，`
         + `Last-Modified=${remoteVersion.serverModified || '(无)'}），本次写入保护级别：`
         + MiniSync.webdav.describeWriteProtection(remoteWriteCondition));
     }

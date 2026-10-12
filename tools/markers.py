@@ -287,7 +287,10 @@ MARKERS = {
         # v2.3.0：公开恢复入口与上传/下载/合并共用同一把同步互斥锁排队，
         # 避免恢复插进正在进行的清空/导入事务（内部回滚仍直调 IO，不重入同锁）。
         'function restoreLocalBackup(options)',
-        'MiniSync.syncMutex.run(() => MiniSync.syncInput.restoreLocalBackup(options))',
+        'MiniSync.syncMutex.run(async () => {',
+        'MiniSync.syncInput.restoreLocalBackup(options)',
+        'assertLocalRecoveryReady',
+        'exportLocalRecovery',
         'e.writeSet',
     ],
     'core/sync-merge.js': [

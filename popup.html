@@ -239,6 +239,11 @@
         .progress-line.ok { color: #047857; }
         .progress-line.err { color: #b91c1c; }
 
+        .recovery-entry { margin-top: 10px; padding: 10px; border: 1px solid #fcd34d; border-radius: 6px; background: #fffbeb; }
+        .recovery-entry p { margin: 0 0 8px; font-size: 12px; line-height: 1.5; color: #92400e; }
+        .recovery-entry .btn { width: 100%; justify-content: center; }
+        .recovery-entry .btn:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+
         /* 支持按钮 */
         .sponsor-wrap {
             position: relative;
@@ -614,6 +619,10 @@
             </div>
 
             <div id="progressLine" class="progress-line hide">进度：—</div>
+            <div id="localRecoveryEntry" class="recovery-entry hide">
+                <p>有未完成的本地事务。旧备份已保留，请检查后再同步。</p>
+                <button type="button" id="openRecoveryBtn" class="btn">打开本地书签恢复</button>
+            </div>
 
             <div id="sponsorArea" class="sponsor-area">
                 <div id="sponsorText" class="sponsor-text">💖 喜欢这个工具？支持作者继续改进<br><a href="https://jagshen.github.io/Mini-bookmark-sync/support.html" target="_blank" style="color:#f59e0b;text-decoration:underline;">支持作者 →</a></div>

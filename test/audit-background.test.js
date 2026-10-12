@@ -100,7 +100,8 @@ test('startup restores the actual saved backup and preserves it when recovery ha
 });
 
 function backgroundMessageCase(action, extras = {}) {
-  const ctx = { URL, setTimeout, clearTimeout, chrome: { runtime: { id: 'test', getManifest() { return { version: '2.2.0', manifest_version: 3 }; } } },
+  const ctx = { URL, setTimeout, clearTimeout, message: { action },
+    chrome: { runtime: { id: 'test', getManifest() { return { version: '2.2.0', manifest_version: 3 }; } } },
     MiniSync: { storage: { async getLocal() { return { webdav_url: 'https://user:password@dav.invalid/path?token=secret#private' }; } },
       utils: { async hasHostPermission() { return { ok: true }; } },
       orchestrator: { async restoreLocalBackup() { return { ok: false, restored: 1, conflicts: ['failed'] }; } } },
@@ -158,10 +159,11 @@ test('reopened popup retains persisted bridge partial warning instead of paintin
       runtime: { async sendMessage() { probes++; return { ok: true }; } } },
     setStatus(text, level) { statuses.push({ text, level }); }, renderProgressLine() {},
     statusProbeKey() { return 'key'; }, _statusProbe: { async run(key, fn) { return fn(); } },
-    MiniSync: { utils: { pickConnStatus() { return { text: 'Connected', level: 'ok' }; },
-      async raceHardTimeout(p) { return p; }, async syncStatusConfigKey() { return 'current'; }, connCacheFromResult() { return null; } } },
-    CONN_PROBE_HARD_MS: 1, renderBusySync() {} };
+    CONN_PROBE_HARD_MS: 1, renderBusySync() {}, URL };
   vm.createContext(ctx);
+  vm.runInContext(source('lib/utils.js'), ctx);
+  Object.assign(ctx.MiniSync.utils, { pickConnStatus() { return { text: 'Connected', level: 'ok' }; },
+    async raceHardTimeout(p) { return p; }, async syncStatusConfigKey() { return 'current'; }, connCacheFromResult() { return null; } });
   const popup = source('popup.js');
   vm.runInContext(popup.slice(popup.indexOf('async function updateHomeStatus()'), popup.indexOf('// 显示/隐藏操作记录行')), ctx);
   await ctx.updateHomeStatus();

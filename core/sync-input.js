@@ -68,10 +68,119 @@ async function clearAllBookmarks() {
 }
 
 const LOCAL_BACKUP_META = 'local_bookmark_backup_meta';
+const LOCAL_BACKUP_COMMIT = 'local_bookmark_backup_commit';
+const LOCAL_RECOVERY_CHECKPOINT = 'local_bookmark_recovery_checkpoint';
+const RECOVERY_REQUIRED_MESSAGE = '上次本地事务尚未完成，请打开「本地书签恢复」检查备份后再同步';
 let activeLocalBackupId = null;
+let acceptedLocalBackup = null;
 let localBackupFailure = null;
-const backupNeedsRecovery = meta => !!meta && ['pending', 'restoring', 'failed'].includes(meta.status);
+const backupNeedsRecovery = meta => MiniSync.utils.localBackupNeedsRecovery(meta);
 const newBackupId = () => Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+
+function matchingCommit(meta, receipt) {
+  return !!meta && meta.status === 'pending' && !!meta.id && !!receipt && receipt.version === 1
+    && receipt.backupId === meta.id && receipt.backupCreatedAt === meta.createdAt
+    && receipt.sourceBucketId === meta.sourceBucketId
+    && receipt.relationshipKey === (meta.relationshipKey || null)
+    && Number.isFinite(receipt.completedAt) && receipt.completedAt >= meta.createdAt;
+}
+
+async function repairLocalBackupCompletion() {
+  try {
+    const data = await MiniSync.storage.getLocal([LOCAL_BACKUP_META, LOCAL_BACKUP_COMMIT]);
+    const meta = data[LOCAL_BACKUP_META];
+    if (!backupNeedsRecovery(meta)) return { ok: true, skipped: true };
+    const receipt = matchingCommit(meta, acceptedLocalBackup) ? acceptedLocalBackup : data[LOCAL_BACKUP_COMMIT];
+    if (!matchingCommit(meta, receipt)) return { ok: false, code: 'RECOVERY_REQUIRED', error: RECOVERY_REQUIRED_MESSAGE };
+    await MiniSync.storage.setLocal({ [LOCAL_BACKUP_META]: { ...meta, status: 'committed', completedAt: receipt.completedAt } });
+    const saved = (await MiniSync.storage.getLocal([LOCAL_BACKUP_META]))[LOCAL_BACKUP_META];
+    if (saved?.id !== meta.id || saved.status !== 'committed') throw new Error('备份完成状态校验失败');
+    if (activeLocalBackupId === meta.id) activeLocalBackupId = null;
+    acceptedLocalBackup = null;
+    return { ok: true, repaired: true };
+  } catch (e) {
+    return { ok: false, code: 'LOCAL_BACKUP_FAILED', error: e.message };
+  }
+}
+
+async function assertLocalRecoveryReady() {
+  const result = await repairLocalBackupCompletion();
+  if (!result.ok) throw Object.assign(new Error(RECOVERY_REQUIRED_MESSAGE), {
+    code: 'RECOVERY_REQUIRED', retryable: false
+  });
+}
+
+function findBackupNode(node, id) {
+  if (!node) return null;
+  if (String(node.id) === String(id)) return node;
+  for (const child of node.children || []) {
+    const hit = findBackupNode(child, id);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function countBackupBookmarks(node) {
+  if (!node) return 0;
+  return (node.url ? 1 : 0) + (node.children || []).reduce((n, child) => n + countBackupBookmarks(child), 0);
+}
+
+async function getLocalRecoveryStatus() {
+  const data = await MiniSync.storage.getLocal(['local_bookmark_backup', LOCAL_BACKUP_META, LOCAL_BACKUP_COMMIT,
+    'bookmark_target_id', 'sync_relationship_key', 'webdav_config', 'webdav_url', 'webdav_user',
+    'webdav_password', 'webdav_bookmark_path']);
+  const summary = MiniSync.utils.localRecoverySummary(data);
+  const meta = data[LOCAL_BACKUP_META];
+  const tree = await getChromeTree();
+  const source = summary.sourceBucketId || String(data.bookmark_target_id || MiniSync.utils.getSyncBucketId() || '');
+  const current = summary.currentBucketId || source;
+  const savedBucket = findBackupNode(data.local_bookmark_backup?.[0], source);
+  const currentBucket = findBackupNode(tree[0], current);
+  let relationshipMatches = null;
+  if (meta?.relationshipKey) {
+    try {
+      const config = MiniSync.utils.resolveWebDAVConfigData(data);
+      relationshipMatches = meta.relationshipKey === MiniSync.utils.syncRelationshipKey(config, source);
+    } catch (_) { relationshipMatches = false; }
+  }
+  const available = summary.available && !!savedBucket && !savedBucket.url;
+  const receipt = matchingCommit(meta, acceptedLocalBackup) ? acceptedLocalBackup : data[LOCAL_BACKUP_COMMIT];
+  const canRepairCompletion = matchingCommit(meta, receipt);
+  const busy = !!MiniSync.syncMutex.active;
+  return { ...summary, ok: true, available, busy, backupId: meta?.id || null, relationshipMatches,
+    targetTitle: String(savedBucket?.title || currentBucket?.title || ''),
+    targetExists: !!currentBucket && !currentBucket.url,
+    backupBookmarkCount: countBackupBookmarks(savedBucket), currentBookmarkCount: countBackupBookmarks(currentBucket),
+    canRepairCompletion,
+    canRestore: !busy && available && summary.needsRecovery && summary.status !== 'unknown'
+      && summary.targetMatches && relationshipMatches !== false && !canRepairCompletion,
+    restoreMode: meta?.restoreOptions?.replaceCurrent ? 'rollback' : 'supplement',
+    includeHome: meta?.restoreOptions?.includeHome !== false,
+    lastRecovery: summary.lastRecovery };
+}
+
+async function saveRecoveryCheckpoint(meta) {
+  const data = await MiniSync.storage.getLocal([LOCAL_RECOVERY_CHECKPOINT]);
+  const existing = data[LOCAL_RECOVERY_CHECKPOINT];
+  if (existing?.backupId === meta.id && existing.backupCreatedAt === meta.createdAt && Array.isArray(existing.tree)) return;
+  const checkpoint = { version: 1, backupId: meta.id, backupCreatedAt: meta.createdAt,
+    at: Date.now(), tree: await getChromeTree() };
+  await MiniSync.storage.setLocal({ [LOCAL_RECOVERY_CHECKPOINT]: checkpoint });
+  const saved = (await MiniSync.storage.getLocal([LOCAL_RECOVERY_CHECKPOINT]))[LOCAL_RECOVERY_CHECKPOINT];
+  if (JSON.stringify(saved) !== JSON.stringify(checkpoint)) throw new Error('恢复前副本校验失败');
+}
+
+async function exportLocalRecovery() {
+  const data = await MiniSync.storage.getLocal(['local_bookmark_backup', LOCAL_BACKUP_META, LOCAL_RECOVERY_CHECKPOINT]);
+  const checkpoint = data[LOCAL_RECOVERY_CHECKPOINT];
+  const meta = data[LOCAL_BACKUP_META];
+  return { format: 'minibookmark-sync-local-recovery', version: 1, exportedAt: Date.now(),
+    currentTree: await getChromeTree(), originalBackup: data.local_bookmark_backup || null,
+    backup: meta ? { id: meta.id, status: meta.status, createdAt: meta.createdAt,
+      sourceBucketId: meta.sourceBucketId, currentBucketId: meta.currentBucketId,
+      restoredIds: meta.restoredIds || {}, restoreOptions: meta.restoreOptions || null } : null,
+    recoveryCheckpoint: checkpoint ? { backupId: checkpoint.backupId, at: checkpoint.at, tree: checkpoint.tree } : null };
+}
 
 // 备份与事务状态一起落盘。未完成的恢复副本不能被重试时的空树/半成品覆盖。
 async function backupLocalTree(tree) {
@@ -79,16 +188,19 @@ async function backupLocalTree(tree) {
   try {
     const data = await MiniSync.storage.getLocal([LOCAL_BACKUP_META, 'sync_relationship_key', 'bookmark_target_id']);
     if (backupNeedsRecovery(data[LOCAL_BACKUP_META])) {
-      localBackupFailure = { code: 'RECOVERY_REQUIRED', retryable: false,
-        message: '上次本地恢复尚未完成，请先恢复备份后再同步' };
-      return false;
+      const repair = await repairLocalBackupCompletion();
+      if (!repair.ok) {
+        localBackupFailure = { code: 'RECOVERY_REQUIRED', retryable: false, message: RECOVERY_REQUIRED_MESSAGE };
+        return false;
+      }
     }
     if (!tree) tree = await getChromeTree();
     const bucketId = String((MiniSync.utils.getSyncBucketId && MiniSync.utils.getSyncBucketId()) || data.bookmark_target_id || '');
     const meta = { version: 1, id: newBackupId(), status: 'pending', createdAt: Date.now(),
       relationshipKey: data.sync_relationship_key || null, sourceBucketId: bucketId,
       currentBucketId: bucketId, restoredIds: {} };
-    await MiniSync.storage.setLocal({ local_bookmark_backup: tree, [LOCAL_BACKUP_META]: meta });
+    await MiniSync.storage.setLocal({ local_bookmark_backup: tree, [LOCAL_BACKUP_META]: meta, [LOCAL_BACKUP_COMMIT]: null });
+    acceptedLocalBackup = null;
     const saved = await MiniSync.storage.getLocal(['local_bookmark_backup', LOCAL_BACKUP_META]);
     if (!Array.isArray(saved.local_bookmark_backup) || JSON.stringify(saved.local_bookmark_backup) !== JSON.stringify(tree)
         || saved[LOCAL_BACKUP_META]?.id !== meta.id) throw new Error('备份校验失败');
@@ -115,9 +227,13 @@ async function completeLocalBackup() {
     if (meta.id !== activeLocalBackupId || meta.status !== 'pending') {
       return { ok: false, code: 'RECOVERY_REQUIRED', error: '不能提交其他事务或尚未完成恢复的备份' };
     }
-    await MiniSync.storage.setLocal({ [LOCAL_BACKUP_META]: { ...meta, status: 'committed', completedAt: Date.now() } });
-    activeLocalBackupId = null;
-    return { ok: true };
+    const receipt = { version: 1, backupId: meta.id, backupCreatedAt: meta.createdAt,
+      sourceBucketId: meta.sourceBucketId, relationshipKey: meta.relationshipKey || null, completedAt: Date.now() };
+    acceptedLocalBackup = receipt;
+    // 只有编排层确认提交后才产生凭据；独立保存，避免完成标记失败后误回滚已提交的书签。
+    try { await MiniSync.storage.setLocal({ [LOCAL_BACKUP_COMMIT]: receipt }); }
+    catch (e) { console.warn('[sync] 提交凭据保存失败:', e.message); }
+    return await repairLocalBackupCompletion();
   } catch (e) {
     return { ok: false, code: 'LOCAL_BACKUP_FAILED', error: e.message };
   }
@@ -136,7 +252,25 @@ async function restoreLocalBackup(options) {
   options = { ...(options || {}) };
   const data = await MiniSync.storage.getLocal(['local_bookmark_backup', LOCAL_BACKUP_META, 'bookmark_target_id', 'sync_relationship_key']);
   const backup = data.local_bookmark_backup;
-  if (!Array.isArray(backup) || !backup.length) return { ok: false, restored: 0, conflicts: [], reason: 'no_backup' };
+  const storedMeta = data[LOCAL_BACKUP_META];
+  if (options.preserveCurrent && (typeof options.backupId !== 'string' || !options.backupId
+      || !['pending', 'restoring', 'failed'].includes(options.expectedStatus))) {
+    return { ok: false, restored: 0, conflicts: [], code: 'BACKUP_CHANGED', reason: 'confirmation_required' };
+  }
+  if (options.backupId !== undefined && (storedMeta?.id !== options.backupId
+      || (options.expectedStatus && storedMeta?.status !== options.expectedStatus))) {
+    return { ok: false, restored: 0, conflicts: [], code: 'BACKUP_CHANGED', reason: 'backup_changed' };
+  }
+  if (matchingCommit(storedMeta, acceptedLocalBackup)
+      || matchingCommit(storedMeta, (await MiniSync.storage.getLocal([LOCAL_BACKUP_COMMIT]))[LOCAL_BACKUP_COMMIT])) {
+    const completion = await repairLocalBackupCompletion();
+    return { ok: completion.ok, completionRepaired: completion.ok, restored: 0, conflicts: [],
+      code: completion.ok ? undefined : 'RECOVERY_METADATA_FAILED', reason: completion.error };
+  }
+  if (options.repairOnly) {
+    return { ok: false, restored: 0, conflicts: [], code: 'BACKUP_CHANGED', reason: 'commit_receipt_changed' };
+  }
+  if (!Array.isArray(backup) || !backup.length) return { ok: false, restored: 0, conflicts: [], code: 'BACKUP_MISSING', reason: 'no_backup' };
   const requested = String(options.targetParentId || data.bookmark_target_id
     || (MiniSync.utils.getSyncBucketId && MiniSync.utils.getSyncBucketId()) || '');
   const meta = data[LOCAL_BACKUP_META] || { version: 1, id: newBackupId(), sourceBucketId: requested,
@@ -144,15 +278,36 @@ async function restoreLocalBackup(options) {
   const sourceId = String(meta.sourceBucketId || requested);
   const currentId = String((meta.restoredIds || {})[sourceId] || meta.currentBucketId || sourceId);
   if (requested && requested !== sourceId && requested !== currentId) {
-    return { ok: false, restored: 0, conflicts: [], reason: 'backup_target_mismatch' };
+    return { ok: false, restored: 0, conflicts: [], code: 'BACKUP_TARGET_MISMATCH', reason: 'backup_target_mismatch' };
+  }
+  if (options.preserveCurrent) {
+    if (meta.relationshipKey) {
+      let relationshipMatches = false;
+      try {
+        const config = await MiniSync.storage.getWebdavConfig();
+        relationshipMatches = meta.relationshipKey === MiniSync.utils.syncRelationshipKey(config, sourceId);
+      } catch (_) { /* 无法确认目标时，不允许改树。 */ }
+      if (!relationshipMatches) return { ok: false, restored: 0, conflicts: [],
+        code: 'BACKUP_RELATIONSHIP_MISMATCH', reason: 'backup_relationship_mismatch' };
+    }
+    try { await saveRecoveryCheckpoint(meta); }
+    catch (e) { return { ok: false, restored: 0, conflicts: [], code: 'RECOVERY_CHECKPOINT_FAILED', reason: e.message }; }
   }
   // 默认公开重试继续尚未完成的恢复范围/写集，而不是把只补回桶误报为完整回滚。
+  const { backupId, expectedStatus, preserveCurrent, repairOnly, ...restoreOptions } = options;
+  options = restoreOptions;
   if (backupNeedsRecovery(meta) && meta.restoreOptions) options = { ...meta.restoreOptions, ...options };
+  if (preserveCurrent) {
+    options = { includeHome: true, recreateMissingHome: true, ...options };
+    // 缺失写集不能证明哪些新增项属于事务；手动恢复不得猜测删除范围。
+    if (!Array.isArray(options.createdIds)) options.createdIds = [];
+  }
   options.targetParentId = sourceId;
   meta.sourceBucketId = sourceId;
   meta.restoredIds = meta.restoredIds || {};
   meta.status = 'restoring';
   meta.restoreOptions = { ...options };
+  meta.lastRecovery = { at: Date.now(), code: 'RECOVERY_RUNNING', restored: 0, conflictCount: 0 };
   let result;
   try {
     // 必须在改树前落盘：失败/worker 回收后的下一轮仍能看到恢复未完成。
@@ -163,11 +318,16 @@ async function restoreLocalBackup(options) {
   }
   try {
     meta.status = result.ok ? 'restored' : 'failed';
+    if (!result.ok && !result.code) result.code = result.reason === 'bucket_not_found' ? 'BACKUP_TARGET_MISSING' : 'RECOVERY_FAILED';
+    meta.lastRecovery = { at: Date.now(), code: result.ok ? 'RECOVERY_COMPLETE' : result.code,
+      restored: result.restored || 0, conflictCount: (result.conflicts || []).length };
     if (result.ok) meta.completedAt = Date.now();
     await MiniSync.storage.setLocal({ [LOCAL_BACKUP_META]: meta });
+    const saved = (await MiniSync.storage.getLocal([LOCAL_BACKUP_META]))[LOCAL_BACKUP_META];
+    if (saved?.id !== meta.id || saved.status !== meta.status) throw new Error('恢复完成状态校验失败');
     if (result.ok && activeLocalBackupId === meta.id) activeLocalBackupId = null;
   } catch (e) {
-    result = { ...result, ok: false, reason: e.message,
+    result = { ...result, ok: false, code: 'RECOVERY_METADATA_FAILED', reason: e.message,
       conflicts: [...(result.conflicts || []), { type: 'metadata', error: e.message }] };
   }
   return result;
@@ -190,6 +350,7 @@ async function restoreLocalBackupTree(backup, options, meta) {
     ? new Set(options.createdIds.map(String)) : null;
   let restored = 0;
   const call = (method, ...args) => new Promise((resolve, reject) => {
+    if (method === 'remove' || method === 'removeTree') MiniSync.utils.noteTransactionDeletion(args[0]);
     chrome.bookmarks[method](...args, value => {
       if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
       else resolve(value);
@@ -565,9 +726,7 @@ function _treeToFlatList(tree) {
 
 // Identity is origin/account/file/local bucket; legacy unbound state is never inherited.
 async function ensureSyncRelationship(config, bucketId) {
-  const url = new URL(config.url);
-  const file = MiniSync.utils.joinWebDAVUrl(config.url, config.filename || DEFAULT_FILENAME);
-  const key = JSON.stringify([url.origin.toLowerCase(), String(config.username || ''), file, String(bucketId || '')]);
+  const key = MiniSync.utils.syncRelationshipKey(config, bucketId);
   const data = await MiniSync.storage.getLocal(['sync_relationship_key', 'sync_relationship_states', 'sync_baseline_repair_needed', STORAGE_KEYS.TOMBSTONES, STORAGE_KEYS.SNAPSHOTS, STORAGE_KEYS.CLOUD_LAST_MODIFIED]);
   if (data.sync_relationship_key === key) return { changed: false, key };
   const states = data.sync_relationship_states || {};
@@ -911,6 +1070,10 @@ return {
   clearAllBookmarks,
   backupLocalTree,
   completeLocalBackup,
+  repairLocalBackupCompletion,
+  assertLocalRecoveryReady,
+  getLocalRecoveryStatus,
+  exportLocalRecovery,
   getLocalBackupFailure,
   getLocalBackup,
   restoreLocalBackup,

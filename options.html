@@ -355,6 +355,13 @@
         }
         .backup-result.ok { color: #047857; }
         .backup-result.err { color: #b91c1c; }
+        .backup-result.warn { color: #92400e; }
+        .recovery-summary { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: #92400e; }
+        .recovery-detail { margin: 0 0 12px; font-size: 12px; line-height: 1.6; white-space: pre-line; overflow-wrap: anywhere; }
+        .recovery-confirm { margin-top: 12px; padding: 12px; border: 1px solid #fcd34d; border-radius: 6px; background: #fffbeb; }
+        .recovery-confirm p { margin: 0 0 10px; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+        .recovery-private { margin: 10px 0 0; font-size: 11px; line-height: 1.5; color: #6b7280; }
+        [hidden] { display: none !important; }
 
         /* 备份与迁移的按钮：之前 options.html 里根本没有 .btn 规则 ⇒ 落到浏览器原生按钮外观，
            灰底凸边跟卡片主题完全不像。这里与弹窗（popup.html）用同一套令牌：白底 + #d1d5db 描边 +
@@ -583,6 +590,26 @@
         <pre id="diagOut" style="display:none;margin-top:8px;padding:10px;background:#f9fafb;border:1px solid #e5e7eb;
              border-radius:8px;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-all;max-height:320px;overflow:auto;"></pre>
     </div>
+
+    <section class="card" id="recoveryCard" aria-labelledby="recoveryHeading">
+        <div class="card-title" id="recoveryHeading">本地书签恢复</div>
+        <p class="recovery-summary" id="recoverySummary" role="status">正在读取备份状态…</p>
+        <p class="recovery-detail" id="recoveryDetail">检查和导出不会修改书签，恢复需要单独确认。</p>
+        <div class="backup-row">
+            <button type="button" class="btn" id="recoveryCheckBtn">重新检查</button>
+            <button type="button" class="btn" id="recoveryExportBtn">导出当前书签与备份</button>
+            <button type="button" class="btn btn-primary" id="recoveryRestoreBtn" disabled>检查并恢复备份</button>
+        </div>
+        <p class="recovery-private">导出文件包含书签标题和网址，仅供本地保全与排查，不是配置迁移文件。请妥善保管，不要公开分享。</p>
+        <div class="recovery-confirm" id="recoveryConfirm" hidden>
+            <p id="recoveryConfirmText"></p>
+            <div class="backup-row">
+                <button type="button" class="btn" id="recoveryCancelBtn">取消</button>
+                <button type="button" class="btn btn-primary" id="recoveryConfirmBtn">确认恢复</button>
+            </div>
+        </div>
+        <div class="backup-result" id="recoveryResult" role="status" aria-live="polite"></div>
+    </section>
 
     <!-- 版本更新：只做「查发布页 → 与本机版本比对 → 把对应宿主形态的安装包交给浏览器下载/安装」。
          ⚠️ WebExtensions 没有「安装扩展」的 API（chrome.runtime.reload() 只是把当前这份代码

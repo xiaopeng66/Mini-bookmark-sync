@@ -4,10 +4,21 @@
 > 本仓库是 [原项目](https://github.com/jagshen/Mini-bookmark-sync) 的维护版：保留原项目的全部功能，
 > 并补上手机端支持、双向增量增删，以及一批跨端同步的一致性修复。
 
-[![Version](https://img.shields.io/badge/version-2.3.0-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
+[![Version](https://img.shields.io/badge/version-2.3.1-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
+
+## v2.3.1 发布说明
+
+修复「上次本地事务尚未完成」把同步拦住、却无处恢复的问题，并清理操作记录里的误报。
+
+- 设置页新增「本地书签恢复」：查看未完成的事务备份、导出当前书签与备份、确认后再恢复；弹窗与设置页在同步被拦时给出这个入口。
+- 检查后确认无需补回任何书签时按成功处理，不再显示失败；确认恢复后即可继续同步。
+- 书签已经同步完成、只有完成状态没保存上的情况只补记状态，不用旧备份覆盖当前书签，也不撤销之后的新增和删除。
+- 「云端未提供强 ETag」的能力提示不再显示成「操作失败」；真正的同步失败与云端冲突仍会显示。
+
+910 条 JavaScript 回归与 6 条打包工具测试通过。验证使用隔离模拟数据，没有完成真实手机、浏览器 GUI 或生产 WebDAV 验收。安装仍由宿主浏览器确认。详见 [完整发布说明](docs/release-v2.3.1.md)。
 
 ## v2.3.0 发布说明
 

@@ -26,6 +26,7 @@ async function doUploadBookmarks(options) {
   let mainCommitted = false;
   try {
     await MiniSync.storage.setSyncStatus({ status: SYNCING, action: 'upload' });
+    await MiniSync.syncInput.assertLocalRecoveryReady();
 
     // ★ 顺序很要紧：本机的树与 deviceId 都要**等云端读过、墓碑消费过之后**再取。
     //   ① 「同步文件夹」只能靠云端那份 flatRootContainer 声明才能认出来（桌面 Edge 必须
@@ -72,7 +73,7 @@ async function doUploadBookmarks(options) {
     //   坚果云这类不返回强 ETag 的服务就此彻底不可用（v2.2.0 实测回归）。
     const writeCondition = MiniSync.webdav.versionWriteCondition(remoteVersion);
     if (remoteVersion.exists && !MiniSync.webdav.isStrongETag(remoteVersion.etag)) {
-      console.warn(`[sync] 云端未提供强 ETag（etag=${JSON.stringify(remoteVersion.etag)}，`
+      console.info(`[sync] 云端未提供强 ETag（etag=${JSON.stringify(remoteVersion.etag)}，`
         + `Last-Modified=${remoteVersion.serverModified || '(无)'}），本次写入保护级别：`
         + MiniSync.webdav.describeWriteProtection(writeCondition));
     }
@@ -352,6 +353,7 @@ async function doDownloadBookmarks(options) {
 
   try {
     await MiniSync.storage.setSyncStatus({ status: SYNCING, action: 'download' });
+    await MiniSync.syncInput.assertLocalRecoveryReady();
 
     // B: WebDAV GET → XBEL XML 字符串
     let config;
@@ -648,7 +650,26 @@ const mergeSync = MiniSync.mergeStrategy.mergeSync;
  *   那些调用点继续直接用 MiniSync.syncInput.restoreLocalBackup。
  */
 function restoreLocalBackup(options) {
-  return MiniSync.syncMutex.run(() => MiniSync.syncInput.restoreLocalBackup(options));
+  return MiniSync.syncMutex.run(async () => {
+    if (!options?.preserveCurrent) return MiniSync.syncInput.restoreLocalBackup(options);
+    let result;
+    try {
+      await MiniSync.storage.setSyncStatus({ status: SYNCING, action: 'restore' });
+      MiniSync.utils.beginTransactionDeletionTracking();
+      result = await MiniSync.syncInput.restoreLocalBackup(options);
+      return result;
+    } finally {
+      MiniSync.utils.endTransactionDeletionTracking();
+      try {
+        await MiniSync.storage.setSyncStatus({ status: result?.ok ? IDLE : FAILED,
+          error: result?.ok ? '' : '备份恢复未完成，请在「本地书签恢复」中检查', action: 'restore' });
+      } catch (_) { /* 恢复结果以备份元数据为准，不用界面状态推断成功。 */ }
+    }
+  });
+}
+
+function exportLocalRecovery() {
+  return MiniSync.syncMutex.run(() => MiniSync.syncInput.exportLocalRecovery());
 }
 
 return {
@@ -657,6 +678,7 @@ return {
   mergeSync,
   // 透传：供 background.js 直接调用（原 orchestrator 暴露的能力）
   restoreLocalBackup,
+  exportLocalRecovery,
   saveLocalSnapshot: MiniSync.syncInput.saveLocalSnapshot
 };
 

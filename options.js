@@ -703,11 +703,19 @@ async function checkAiraFile(force) {
 }
 
 // 最近一次操作
+function visibleSyncLogs(logs) {
+  if (!Array.isArray(logs)) return [];
+  return logs.filter(log => !(log?.type === 'warn'
+    && log.success === undefined
+    && typeof log.action === 'string'
+    && /^\[sync\] 云端未提供强 ETag（etag=(?:null|"(?:[^"\\]|\\.)*")，Last-Modified=(?:\(无\)|\d+)），本次写入保护级别：(?:none|last-modified)$/.test(log.action)));
+}
+
 async function loadLastAction() {
   const el = document.getElementById('lastActionInfo');
   if (!el) return;
   const r = await chrome.storage.local.get(['sync_log']);
-  const logs = r.sync_log || [];
+  const logs = visibleSyncLogs(r.sync_log);
   if (logs.length === 0) {
     el.textContent = '暂无记录';
     return;
@@ -798,7 +806,7 @@ if (viewAllBtn) {
       return;
     }
     const r = await chrome.storage.local.get(['sync_log']);
-    const logs = r.sync_log || [];
+    const logs = visibleSyncLogs(r.sync_log);
 
     if (logs.length === 0) {
       logExpand.innerHTML = '<div class="log-empty">暂无记录</div>';
@@ -1059,6 +1067,155 @@ async function initDownloadClearToggle() {
     await chrome.storage.local.set({ download_clear: !!box.checked });
     paint();
   });
+}
+
+// ========== 本地书签恢复 ==========
+let localRecoveryState = null;
+let localRecoveryBusy = false;
+let localRecoveryGeneration = 0;
+let localRecoveryConfirmation = null;
+let localRecoveryInitialized = false;
+
+function localRecoveryElements() {
+  const el = id => document.getElementById(id);
+  return { summary: el('recoverySummary'), detail: el('recoveryDetail'), check: el('recoveryCheckBtn'),
+    export: el('recoveryExportBtn'), restore: el('recoveryRestoreBtn'), confirm: el('recoveryConfirm'),
+    confirmText: el('recoveryConfirmText'), confirmBtn: el('recoveryConfirmBtn'),
+    cancel: el('recoveryCancelBtn'), result: el('recoveryResult') };
+}
+
+function setLocalRecoveryResult(text, level) {
+  const el = localRecoveryElements().result;
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = 'backup-result' + (level ? ' ' + level : '');
+}
+
+function renderLocalRecovery() {
+  const els = localRecoveryElements(), state = localRecoveryState;
+  if (!els.summary) return;
+  const labels = { pending: '本地事务未完成', restoring: '上次恢复尚未完成', failed: '上次恢复未完成',
+    committed: '上次同步已完成', restored: '备份恢复已完成', none: '没有待处理的本地事务', unknown: '备份状态无法识别' };
+  els.summary.textContent = !state ? '无法读取备份状态，请重新检查'
+    : state.busy ? '本地操作进行中，请稍候'
+    : state.canRepairCompletion ? '同步已提交，完成状态待补记' : labels[state.status] || labels.unknown;
+  if (els.detail) {
+    const lines = [];
+    if (state?.createdAt) lines.push('备份时间：' + new Date(state.createdAt).toLocaleString());
+    if (state?.targetTitle) lines.push('同步文件夹：' + state.targetTitle);
+    if (state?.available) lines.push(`备份内 ${state.backupBookmarkCount} 条书签；当前文件夹内 ${state.currentBookmarkCount} 条`);
+    if (state?.needsRecovery && !state.available) lines.push('缺少可用的恢复备份，已保留同步保护。请先导出当前数据检查。');
+    if (state?.needsRecovery && !state.targetMatches) lines.push('当前同步文件夹与备份不一致，不能直接恢复到新位置。');
+    if (state?.needsRecovery && state.relationshipMatches === false) lines.push('当前账户或云端文件与备份不一致，请先恢复原设置。');
+    if (state?.lastRecovery?.code && !['RECOVERY_COMPLETE', 'RECOVERY_RUNNING'].includes(state.lastRecovery.code)) {
+      lines.push('最近恢复结果：' + state.lastRecovery.code + '；冲突 ' + state.lastRecovery.conflictCount + ' 处');
+    }
+    if (state?.canRepairCompletion) lines.push('有与这份备份匹配的提交凭据，只补记状态，不回滚书签。');
+    if (!lines.length) lines.push('检查和导出不会修改书签；恢复需要单独确认，不会自动同步云端。');
+    els.detail.textContent = lines.join('\n');
+  }
+  if (els.check) els.check.disabled = localRecoveryBusy;
+  if (els.export) els.export.disabled = localRecoveryBusy;
+  if (els.restore) {
+    els.restore.disabled = localRecoveryBusy || !!state?.busy || !(state?.canRestore || state?.canRepairCompletion);
+    els.restore.textContent = state?.canRepairCompletion ? '补记完成状态' : '检查并恢复备份';
+  }
+  if (els.confirmBtn) els.confirmBtn.disabled = localRecoveryBusy;
+  if (els.cancel) els.cancel.disabled = localRecoveryBusy;
+}
+
+async function refreshLocalRecovery() {
+  const generation = ++localRecoveryGeneration;
+  const els = localRecoveryElements();
+  if (!els.summary) return;
+  try {
+    const result = await chrome.runtime.sendMessage({ action: 'getLocalRecoveryStatus' });
+    if (generation !== localRecoveryGeneration) return;
+    localRecoveryState = result?.ok ? result : null;
+  } catch (_) {
+    if (generation !== localRecoveryGeneration) return;
+    localRecoveryState = null;
+  }
+  localRecoveryConfirmation = null;
+  if (els.confirm) els.confirm.hidden = true;
+  renderLocalRecovery();
+}
+
+async function initLocalRecovery() {
+  const els = localRecoveryElements();
+  if (!els.summary) return;
+  if (!localRecoveryInitialized) {
+    localRecoveryInitialized = true;
+    els.check?.addEventListener('click', () => refreshLocalRecovery());
+    els.export?.addEventListener('click', async () => {
+      if (localRecoveryBusy) return;
+      localRecoveryBusy = true;
+      renderLocalRecovery();
+      setLocalRecoveryResult('正在生成本地备份文件…');
+      try {
+        const result = await chrome.runtime.sendMessage({ action: 'exportLocalRecovery' });
+        if (!result?.ok || !result.data) throw new Error(result?.message || '未拿到导出结果');
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        downloadTextFile('minibookmark-sync-local-recovery-' + stamp + '.json', JSON.stringify(result.data, null, 2));
+        setLocalRecoveryResult('已交给浏览器下载。文件含书签标题和网址，请妥善保管；同步保护未改变。', 'ok');
+      } catch (e) { setLocalRecoveryResult('导出失败：' + e.message, 'err'); }
+      finally { localRecoveryBusy = false; renderLocalRecovery(); }
+    });
+    els.restore?.addEventListener('click', async () => {
+      if (localRecoveryBusy) return;
+      await refreshLocalRecovery();
+      const state = localRecoveryState;
+      if (!state || state.busy || !(state.canRestore || state.canRepairCompletion)) return;
+      localRecoveryConfirmation = { backupId: state.backupId, expectedStatus: state.status,
+        repairOnly: !!state.canRepairCompletion };
+      const scope = '同步文件夹：' + (state.targetTitle || '备份中记录的位置') + '。';
+      els.confirmText.textContent = state.canRepairCompletion
+        ? scope + '只补记已确认的完成状态，不修改任何本地书签，也不访问云端。'
+        : scope + (state.restoreMode === 'rollback'
+          ? '将继续上次未完成的回滚，可能还原标题、位置，并撤销该事务创建的内容。'
+          : '将补回备份中缺失的内容，保留当前已有书签；之后手动删除的旧书签也可能被补回。')
+          + (state.includeHome ? '恢复范围包含备份中的移动端主页。' : '')
+          + '执行前会保存当前书签副本，旧备份保持不变。此操作仅在本机执行，不自动上传或下载云端。';
+      els.confirmBtn.textContent = state.canRepairCompletion ? '确认补记状态' : '确认恢复';
+      els.confirm.hidden = false;
+      els.confirmBtn.focus();
+    });
+    els.cancel?.addEventListener('click', () => {
+      localRecoveryConfirmation = null;
+      els.confirm.hidden = true;
+      els.restore.focus();
+    });
+    els.confirmBtn?.addEventListener('click', async () => {
+      if (localRecoveryBusy || !localRecoveryConfirmation) return;
+      const confirmation = localRecoveryConfirmation;
+      localRecoveryConfirmation = null;
+      localRecoveryBusy = true;
+      renderLocalRecovery();
+      setLocalRecoveryResult('正在检查并处理本地备份…');
+      try {
+        const result = await chrome.runtime.sendMessage({ action: 'restoreFromBackup', ...confirmation });
+        if (!result || result.code === 'DIRECT_TIMEOUT') {
+          setLocalRecoveryResult('未拿到恢复回执，后台可能仍在处理。请重新检查状态，不要清除备份。', 'warn');
+        } else {
+          setLocalRecoveryResult(result.message || '恢复未完成，备份已保留', result.success ? 'ok' : 'err');
+        }
+      } catch (_) {
+        setLocalRecoveryResult('未拿到恢复回执，请重新检查状态；不要清除备份或卸载扩展。', 'warn');
+      } finally {
+        localRecoveryBusy = false;
+        els.confirm.hidden = true;
+        await refreshLocalRecovery();
+      }
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local' || localRecoveryBusy) return;
+      if (['local_bookmark_backup_meta', 'local_bookmark_backup_commit', 'bookmark_target_id', 'sync_status',
+        'webdav_url', 'webdav_user', 'webdav_bookmark_path', 'webdav_config'].some(key => changes[key])) {
+        refreshLocalRecovery();
+      }
+    });
+  }
+  await refreshLocalRecovery();
 }
 
 // ========== 配置备份 / 迁移 ==========
@@ -1335,3 +1492,4 @@ loadPage();
 initBookmarkTargetPicker();
 initDownloadClearToggle();
 initUpdateCard();
+initLocalRecovery();

@@ -820,22 +820,40 @@ function onRuntimeMessage(message, sender, sendResponse) {
       });
       return true;
 
-    // 从备份恢复（安全阀弹窗「从历史备份恢复」）
+    case 'getLocalRecoveryStatus':
+      handleAsyncResponse(sendResponse, () => MiniSync.syncInput.getLocalRecoveryStatus());
+      return true;
+
+    case 'exportLocalRecovery':
+      handleAsyncResponse(sendResponse, async () => ({ ok: true, data: await MiniSync.orchestrator.exportLocalRecovery() }));
+      return true;
+
     case 'restoreFromBackup':
       handleAsyncResponse(sendResponse, async () => {
-        const restored = await MiniSync.orchestrator.restoreLocalBackup();
-        if (restored && restored.ok && restored.restored > 0 && !(restored.conflicts && restored.conflicts.length)) {
-          return {
-            ok: true,
-            success: true,
-            message: `已从备份恢复 ${restored.restored} 条书签`,
-            restored: restored.restored
-          };
+        const restored = await MiniSync.orchestrator.restoreLocalBackup({
+          backupId: message.backupId, expectedStatus: message.expectedStatus,
+          preserveCurrent: true, repairOnly: message.repairOnly === true
+        });
+        if (restored?.ok && !(restored.conflicts && restored.conflicts.length)) {
+          return { ok: true, success: true,
+            message: restored.completionRepaired ? '已补记同步完成状态，未改动书签'
+              : restored.restored > 0 ? `已从备份恢复 ${restored.restored} 项`
+              : '备份检查完成，无需补回书签',
+            restored: restored.restored || 0, completionRepaired: !!restored.completionRepaired };
         }
-        return { ok: false, success: false,
-          message: restored && restored.restored > 0 ? '备份恢复未完成，已保留备份，请检查后重试' : '没有可用的备份数据',
-          restored: (restored && restored.restored) || 0,
-          conflicts: (restored && restored.conflicts) || [] };
+        const code = restored?.code || 'RECOVERY_FAILED';
+        const messages = {
+          BACKUP_CHANGED: '备份已变化，请重新检查后确认恢复',
+          BACKUP_MISSING: '没有可用的本地备份，请保留当前书签并导出检查',
+          BACKUP_TARGET_MISSING: '无法定位或重建备份的同步文件夹，原备份已保留',
+          BACKUP_TARGET_MISMATCH: '当前同步文件夹与备份不一致，请先恢复原设置',
+          BACKUP_RELATIONSHIP_MISMATCH: '当前账户或云端文件与备份不一致，请先恢复原设置',
+          RECOVERY_CHECKPOINT_FAILED: '无法保存恢复前的书签副本，未执行恢复；原备份已保留',
+          RECOVERY_METADATA_FAILED: '恢复完成状态未能保存，原备份已保留，请检查存储后重试'
+        };
+        return { ok: false, success: false, code,
+          message: messages[code] || '备份恢复未完成，原备份和恢复前副本已保留，请检查后重试',
+          restored: restored?.restored || 0, conflicts: restored?.conflicts || [] };
       });
       return true;
 
@@ -1381,6 +1399,10 @@ function countLocalBookmarks() {
 
 // 空树本身不是崩溃证据；只有明确未完成的事务才允许启动恢复。
 async function startupRecovery() {
+  if (MiniSync.syncInput?.repairLocalBackupCompletion) {
+    const completion = await MiniSync.syncMutex.run(() => MiniSync.syncInput.repairLocalBackupCompletion());
+    if (completion.ok) return;
+  }
   const data = await MiniSync.storage.getLocal([STORAGE_KEYS.LOCAL_BACKUP, 'local_bookmark_backup_meta']);
   const backup = data[STORAGE_KEYS.LOCAL_BACKUP];
   const meta = data.local_bookmark_backup_meta;

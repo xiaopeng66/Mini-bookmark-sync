@@ -42,6 +42,13 @@ const footerRow = document.getElementById('footerRow');
 const addConfigBtn = document.getElementById('addConfigBtn');
 const homeCard = document.getElementById('homeCard');
 const emptyHero = document.getElementById('emptyHero');
+const localRecoveryEntry = document.getElementById('localRecoveryEntry');
+const openRecoveryBtn = document.getElementById('openRecoveryBtn');
+
+function renderLocalRecoveryEntry(meta) {
+  localRecoveryEntry?.classList.toggle('hide', !MiniSync.utils.localBackupNeedsRecovery(meta));
+}
+if (openRecoveryBtn) openRecoveryBtn.onclick = () => chrome.runtime.openOptionsPage();
 
 
 // 支持 hover 显示/隐藏
@@ -601,7 +608,7 @@ async function updateHomeStatus() {
   const r = await chrome.storage.local.get([
     'webdav_url', 'webdav_user', 'webdav_password', 'webdav_bookmark_path', 'webdav_config', 'bookmark_target_id',
     'last_sync_count', 'ever_connected', CONN_CACHE_STORAGE_KEY,
-    'sync_status', 'sync_error', 'sync_action', 'sync_status_config_key'
+    'sync_status', 'sync_error', 'sync_action', 'sync_status_config_key', 'local_bookmark_backup_meta'
   ]);
   if (!isCurrent()) return;
   const configured = !!(r.webdav_url && r.webdav_user && r.webdav_password);
@@ -611,8 +618,14 @@ async function updateHomeStatus() {
     return;
   }
 
+  if (r.local_bookmark_backup_meta) renderLocalRecoveryEntry(r.local_bookmark_backup_meta);
   if (r.sync_status === 'syncing') {
     renderBusySync(r.sync_action);
+    return;
+  }
+  if (MiniSync.utils.localBackupNeedsRecovery(r.local_bookmark_backup_meta)) {
+    setStatus('本地备份待检查，请打开「本地书签恢复」', 'warn');
+    renderProgressLine(null);
     return;
   }
   let partialMatchesConfig = false;
@@ -1319,28 +1332,16 @@ async function runSyncAction(action) {
   }
   // 状态行单源化：有写入失败时显示成红色（不能因为 success=true 就报绿「成功」）
   applySyncResult(action, label, MiniSync.utils.describeActionStatus(resp, label), resp);
+  if (resp?.code === 'RECOVERY_REQUIRED') {
+    renderLocalRecoveryEntry({ status: 'pending' });
+    setStatus('本地备份待检查，请打开「本地书签恢复」', 'warn');
+  }
 
-  // 安全阀触发提醒：云端数据差异较大，询问是否使用历史备份恢复
-  if (resp && resp.safetyValve) {
-    const restore = await openConfirm({
-      title: '检测到云端数据差异较大',
-      body: '已跳过异常删除，当前同步结果可能不完整。<br>是否使用历史备份恢复书签？',
-      okText: '恢复备份',
-      cancelText: '忽略'
-    });
-    if (restore) {
-      setStatus('正在恢复历史备份...');
-      const restoreResp = await new Promise(resolve => {
-        chrome.runtime.sendMessage({ action: 'restoreFromBackup' }, resolve);
-      });
-      if (restoreResp && restoreResp.success) {
-        setStatus('✓ 已从历史备份恢复', 'ok');
-        const r = await chrome.storage.local.get(['last_sync_count']);
-        renderProgressLine(r.last_sync_count, undefined, 'ok');
-      } else {
-        setStatus('恢复失败：' + (restoreResp && restoreResp.message || '无可用备份'), 'err');
-      }
-    }
+  if (resp?.safetyValve) {
+    const inspect = await openConfirm({ title: '检测到云端数据差异较大',
+      body: '已跳过异常删除。请先在设置页检查并导出备份，再确认是否恢复。',
+      okText: '检查备份', cancelText: '稍后', danger: false });
+    if (inspect) chrome.runtime.openOptionsPage();
   }
 }
 
@@ -1442,6 +1443,9 @@ chrome.storage.onChanged.addListener((changes, area) => {
     chrome.storage.local.remove(CONN_CACHE_STORAGE_KEY).catch(() => {}).then(() => {
       if (probe === _statusProbe) loadAll();
     });
+  }
+  if (changes.local_bookmark_backup_meta) {
+    renderLocalRecoveryEntry(changes.local_bookmark_backup_meta.newValue);
   }
   if (changes.last_sync_at) {
     renderLastSync(changes.last_sync_at.newValue);
