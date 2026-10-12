@@ -1,6 +1,271 @@
 // adapters/berry-adapter.js - Berry 浏览器桥接逻辑
 // 负责：读写 bookmarks.json、继承图标、顺序同步、id 映射
 
+// Shared by all three adapters (Berry is loaded first). Identity belongs to a
+// parent chain, never to a global title/URL set. Reads only propose changes;
+// callers commit snapshots/revocations after the corresponding writes succeed.
+function createBridgeIdentity() {
+  const paths = list => MiniSync.xbelPath.computeJsonPathKeys(list);
+  const keyOf = item => typeof item === 'string' ? item : item && item.key;
+  const versionOf = item => ({ key: keyOf(item), deletedAt: Number(item && item.deletedAt) || 0,
+    deviceId: typeof item === 'object' && item ? item.deviceId || '' : '' });
+  const versionKey = item => JSON.stringify(Object.values(versionOf(item)));
+  const sameKeys = (a, b) => Array.isArray(a) && Array.isArray(b) &&
+    JSON.stringify([...new Set(a)].sort()) === JSON.stringify([...new Set(b)].sort());
+  const identityFields = ['id', 'parentId', 'title', 'url', 'isFolder', 'source', 'zoneRoot',
+    '_index', 'addedAt', 'createdAt', 'updatedAt'];
+  const copyNodes = list => list.map(n => Object.fromEntries(identityFields
+    .filter(k => n[k] !== undefined).map(k => [k, n[k]])));
+
+  async function stateFor(storageKey, owner, context) {
+    const data = await MiniSync.utils.readLocalKeys([storageKey, storageKey + '_owner', storageKey + '_meta',
+      'sync_relationship_key', 'sync_tombstones', 'sync_tombstone_acked']);
+    const sameOwner = data[storageKey + '_owner'] === undefined || owner == null || data[storageKey + '_owner'] === owner;
+    const keys = sameOwner && Array.isArray(data[storageKey]) ? data[storageKey] : [];
+    const meta = data[storageKey + '_meta'];
+    const trusted = sameOwner && meta && meta.version === 2 && meta.owner === owner &&
+      meta.relationshipKey === (data.sync_relationship_key || null) && sameKeys(meta.keys, keys) && Array.isArray(meta.nodes);
+    return { keys, meta: trusted ? meta : null, relationshipKey: data.sync_relationship_key || null,
+      tombstones: context && Array.isArray(context.tombstones) ? context.tombstones : data.sync_tombstones || [],
+      acked: new Set(context && context.ackedPathKeys || data.sync_tombstone_acked || []) };
+  }
+
+  function makeSnapshot(storageKey, owner, list, state) {
+    const keys = [...new Set(paths(list).values())];
+    const present = new Set(keys);
+    // An acknowledgment is for this deletion version, not for this path forever.
+    // Observing an absent phone path is necessary even when main XBEL acked it.
+    const absentTombstones = state.tombstones.map(versionOf).filter(t => t.key && t.deletedAt > 0 &&
+      state.acked.has(t.key) && !present.has(t.key));
+    return { ...MiniSync.utils.scopedBridgeSnapshotUpdate(storageKey, owner, keys),
+      [storageKey + '_meta']: { version: 2, owner, relationshipKey: state.relationshipKey,
+        keys, nodes: copyNodes(list), observedAt: Date.now(), absentTombstones } };
+  }
+
+  async function snapshotUpdates(storageKey, owner, list, context) {
+    return makeSnapshot(storageKey, owner, list, await stateFor(storageKey, owner, context));
+  }
+
+  function treeIndex(list) {
+    const keys = paths(list);
+    const byId = new Map(list.map(n => [n.id, n]));
+    const byKey = new Map();
+    const children = new Map();
+    for (const n of list) {
+      const pk = keys.get(n.id);
+      if (pk && !byKey.has(pk)) byKey.set(pk, n);
+      if (!children.has(n.parentId)) children.set(n.parentId, []);
+      children.get(n.parentId).push(n);
+    }
+    const signatures = new Map();
+    function signature(node, visiting = new Set()) {
+      if (signatures.has(node.id)) return signatures.get(node.id);
+      if (visiting.has(node.id)) throw new Error('桥接文件包含环形父链');
+      visiting.add(node.id);
+      const childrenSig = (children.get(node.id) || []).map(n => n.isFolder
+        ? ['F', n.title, signature(n, visiting)] : ['L', n.title, n.url || '']);
+      visiting.delete(node.id);
+      const value = childrenSig.length ? JSON.stringify(childrenSig.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))) : '';
+      signatures.set(node.id, value);
+      return value;
+    }
+    const parentKey = n => keys.get(n.parentId) || (keys.get(n.id) || '').split('/')[0];
+    return { keys, byId, byKey, children, signature, parentKey };
+  }
+
+  async function merge({ kind, storageKey, owner, currentList, phoneList, tombstoneKeys,
+    context, stableIds = true, preferPhoneOrder = false }) {
+    const state = await stateFor(storageKey, owner, context);
+    const cur = treeIndex(currentList);
+    const ph = treeIndex(phoneList);
+    const previous = state.meta ? treeIndex(state.meta.nodes) : null;
+    const resolveLegacy = MiniSync.xbelPath.legacyKeyResolver([currentList, phoneList]);
+    const previousKeys = new Set(state.meta ? state.keys : state.keys.map(resolveLegacy).filter(Boolean));
+    const blocked = new Set(tombstoneKeys || []);
+    const changes = { list: currentList, deletedIds: [], deletedPathKeys: [], revokedPathKeys: [],
+      revokedTombstones: [], pathRemaps: [], changed: false, complete: true, errors: [] };
+    const absenceVersions = new Set(state.meta && owner != null
+      ? (state.meta.absentTombstones || []).map(versionKey) : []);
+    for (const item of state.tombstones) {
+      const t = versionOf(item);
+      if (blocked.has(t.key) && ph.byKey.has(t.key) && !previousKeys.has(t.key) &&
+          !cur.byKey.has(t.key) && state.acked.has(t.key) && absenceVersions.has(versionKey(t))) {
+        changes.revokedPathKeys.push(t.key);
+        changes.revokedTombstones.push(t);
+        blocked.delete(t.key);
+      }
+    }
+    function blockedNode(n, index) {
+      const seen = new Set();
+      while (n && !seen.has(n.id)) {
+        seen.add(n.id);
+        if (blocked.has(index.keys.get(n.id))) return true;
+        n = index.byId.get(n.parentId);
+      }
+      return false;
+    }
+
+    const phoneToCurrent = new Map();
+    const usedCurrent = new Set();
+    const pair = (p, c) => {
+      if (!p || !c || !!p.isFolder !== !!c.isFolder || phoneToCurrent.has(p.id) || usedCurrent.has(c.id) ||
+          blockedNode(p, ph) || blockedNode(c, cur)) return false;
+      phoneToCurrent.set(p.id, c.id);
+      usedCurrent.add(c.id);
+      return true;
+    };
+    // Stable native ID is evidence only when the *committed phone tree* maps it
+    // back to the old local path. Device-local IDs are not globally unique.
+    if (stableIds && previous) {
+      for (const p of phoneList) {
+        const old = previous.byId.get(p.id);
+        if (!old || (old.createdAt && p.createdAt && old.createdAt !== p.createdAt)) continue;
+        const oldPk = previous.keys.get(p.id);
+        if (oldPk && previousKeys.has(oldPk)) pair(p, cur.byKey.get(oldPk));
+      }
+    }
+    for (const p of phoneList) pair(p, cur.byKey.get(ph.keys.get(p.id)));
+
+    // HTML has no persistent ID. Infer a rename only within an already mapped
+    // parent, with one nonempty, complete subtree signature on each side and a
+    // committed baseline for its children. Never match a lone URL/title globally.
+    const mappedParent = p => phoneToCurrent.get(p.parentId) || null;
+    const baselineSubtree = n => {
+      const kids = cur.children.get(n.id) || [];
+      return kids.length > 0 && kids.every(c => (previousKeys.has(cur.keys.get(c.id)) ||
+        (c.isFolder && baselineSubtree(c))) && (!c.isFolder || !(cur.children.get(c.id) || []).length || baselineSubtree(c)));
+    };
+    let progress = true;
+    while (progress) {
+      progress = false;
+      // Descendants follow a proved parent identity; match only direct children.
+      for (const p of phoneList) {
+        if (phoneToCurrent.has(p.id)) continue;
+        const parentId = mappedParent(p);
+        if (!parentId) continue;
+        const candidates = (cur.children.get(parentId) || []).filter(c => !usedCurrent.has(c.id) &&
+          !!c.isFolder === !!p.isFolder && (c.isFolder ? c.title === p.title :
+            MiniSync.xbel.normalizeUrl(c.url) === MiniSync.xbel.normalizeUrl(p.url)));
+        if (candidates.length === 1 && pair(p, candidates[0])) progress = true;
+      }
+      const candidates = [];
+      for (const p of phoneList) {
+        if (!p.isFolder || phoneToCurrent.has(p.id) || blockedNode(p, ph)) continue;
+        const sig = ph.signature(p);
+        if (!sig) continue;
+        const parent = mappedParent(p);
+        for (const c of currentList) {
+          if (!c.isFolder || usedCurrent.has(c.id) || ph.byKey.has(cur.keys.get(c.id))) continue;
+          const sameParent = parent ? c.parentId === parent : cur.parentKey(c) === ph.parentKey(p);
+          if (sameParent && baselineSubtree(c) && cur.signature(c) === sig) candidates.push([p, c]);
+        }
+      }
+      for (const [p, c] of candidates) {
+        if (candidates.filter(([other]) => other.id === p.id).length !== 1 ||
+            candidates.filter(([, other]) => other.id === c.id).length !== 1) continue;
+        if (pair(p, c)) progress = true;
+      }
+    }
+
+    const removed = new Set();
+    for (const n of currentList) {
+      const pk = cur.keys.get(n.id);
+      if (pk && previousKeys.has(pk) && !ph.byKey.has(pk) && !usedCurrent.has(n.id)) removed.add(n.id);
+    }
+    const idMap = new Map(phoneToCurrent);
+    const taken = new Set([...currentList.map(n => String(n.id)), ROOT_ID, HOME_FOLDER_ID,
+      OTHER_FOLDER_ID, MOBILE_FOLDER_ID, '0', '1', '2', '3']);
+    const newByKey = new Map();
+    let seq = 0;
+    for (const p of phoneList) {
+      const pk = ph.keys.get(p.id);
+      if (!pk || idMap.has(p.id) || blockedNode(p, ph)) continue;
+      if (newByKey.has(pk)) { idMap.set(p.id, newByKey.get(pk)); continue; }
+      let id = String(p.id);
+      while (taken.has(id)) id = '__bridge_' + kind + '_' + (++seq);
+      taken.add(id);
+      idMap.set(p.id, id);
+      newByKey.set(pk, id);
+    }
+    const rootsBySource = new Map(currentList.filter(n => n.isFolder && !cur.keys.has(n.id))
+      .map(n => [n.source, n.id]));
+    function parentIdFor(p) {
+      if (idMap.has(p.parentId)) return idMap.get(p.parentId);
+      const root = (ph.keys.get(p.id) || '').split('/')[0];
+      const source = root.slice('ROOT:'.length);
+      if (rootsBySource.has(source)) return rootsBySource.get(source);
+      return { home: HOME_FOLDER_ID, other: OTHER_FOLDER_ID, mobile: MOBILE_FOLDER_ID }[source] || ROOT_ID;
+    }
+
+    const resultById = new Map(currentList.map(n => [n.id, { ...n }]));
+    const incomingIds = [];
+    for (const p of phoneList) {
+      const id = idMap.get(p.id);
+      if (!id || blockedNode(p, ph)) continue;
+      if (!incomingIds.includes(id)) incomingIds.push(id);
+      const existing = resultById.get(id);
+      if (!existing) {
+        resultById.set(id, { ...p, id, parentId: parentIdFor(p) });
+        continue;
+      }
+      const oldPk = cur.keys.get(id);
+      const newPk = ph.keys.get(p.id);
+      if (oldPk !== newPk) {
+        existing.parentId = parentIdFor(p);
+        existing.title = p.title;
+        if (!p.isFolder) existing.url = p.url;
+      } else if (previous) {
+        const old = previous.byId.get(p.id) || previous.byKey.get(newPk);
+        // Keep local edits in a true conflict; adopt proved phone-only edits.
+        for (const key of p.isFolder ? ['title'] : ['title', 'url']) {
+          if (old && p[key] !== old[key] && existing[key] === old[key]) existing[key] = p[key];
+        }
+      }
+      for (const key of ['favicon', 'color', 'customIcon']) if (!existing[key] && p[key]) existing[key] = p[key];
+      if (oldPk !== newPk || existing.title !== cur.byId.get(id).title || existing.url !== cur.byId.get(id).url) {
+        changes.pathRemaps.push({ id, oldPk, newPk, title: existing.title, parentId: existing.parentId,
+          ...(existing.url ? { url: existing.url } : {}) });
+      }
+    }
+    // A concurrently added local child cannot be orphaned by deleting its old
+    // parent. Preserve that parent unless the child was proved to move elsewhere.
+    for (const n of resultById.values()) {
+      if (removed.has(n.id) || blockedNode(n, cur)) continue;
+      let parent = resultById.get(n.parentId);
+      const seen = new Set();
+      while (parent && !seen.has(parent.id)) {
+        seen.add(parent.id);
+        removed.delete(parent.id);
+        parent = resultById.get(parent.parentId);
+      }
+    }
+    for (const id of removed) {
+      changes.deletedIds.push(id);
+      changes.deletedPathKeys.push(cur.keys.get(id));
+      resultById.delete(id);
+    }
+    let result = [...resultById.values()].filter(n => !blockedNode(n, cur));
+    if (preferPhoneOrder) {
+      const ranked = new Map(result.map(n => [n.id, n]));
+      result = [...incomingIds.filter(id => ranked.has(id)).map(id => ranked.get(id)),
+        ...result.filter(n => !incomingIds.includes(n.id))];
+      const counters = new Map();
+      for (const n of result) {
+        n._index = counters.get(n.parentId) || 0;
+        counters.set(n.parentId, n._index + 1);
+      }
+    }
+    MiniSync.utils.fillMissingSiblingIndex(result);
+    changes.list = result;
+    const visible = list => list.map(n => [n.id, n.parentId, n.title, n.url, n._index]);
+    changes.changed = JSON.stringify(visible(currentList)) !== JSON.stringify(visible(result));
+    changes.snapshotUpdates = makeSnapshot(storageKey, owner, phoneList, state);
+    return changes;
+  }
+
+  return { merge, snapshotUpdates, versionKey };
+}
+
 // Berry 文件字段兼容：新版用 data，旧版/外部格式可能用 bookmarks
 function getBerryList(berryData) {
   if (!berryData) return null;
@@ -190,8 +455,10 @@ async function patchBerryFile(mergedList) {
     data: finalBerryList
   };
   await uploadBerryBookmarks(updatedBerryData);
+  const snapshotUpdates = await MiniSync.berry.bridgeIdentity.snapshotUpdates('berry_pathkey_snapshot',
+    await MiniSync.utils.bridgeResourceUrl('berry'), finalBerryList);
   console.log(`[sync] 🍓 Berry 回写完成: ${zoneSummary(finalBerryList)}`);
-  return { status: 'success' };
+  return { status: 'success', snapshotUpdates };
 }
 
 // 从 Berry 文件读取变更并合并：继承图标 + 合并新增节点 + 决定顺序
@@ -201,249 +468,33 @@ async function mergeBerryData(currentList, preferLocalOrder = false, tombstoneKe
   return result.list;
 }
 
-async function mergeBerryDataWithChanges(currentList, preferLocalOrder = false, tombstoneKeys = null) {
-  let berryData;
+async function mergeBerryDataWithChanges(currentList, preferLocalOrder = false, tombstoneKeys = null, bridgeContext = null) {
   try {
-    berryData = await downloadBerryBookmarks();
+    const berryData = await downloadBerryBookmarks();
+    if (!berryData) throw new Error('Berry 文件不存在');
+    const berryList = getBerryList(berryData);
+    validateBerryList(berryList);
+    const phoneList = berryList.map(n => {
+      if (n.source) return { ...n };
+      const source = n.parentId === HOME_FOLDER_ID ? 'home' : n.parentId === MOBILE_FOLDER_ID ? 'mobile'
+        : n.parentId === OTHER_FOLDER_ID ? 'other' : n.parentId === ROOT_ID ? 'bar' : '';
+      return { ...n, source };
+    });
+    const owner = await MiniSync.utils.bridgeResourceUrl('berry');
+    const state = await MiniSync.utils.readLocalKeys([STORAGE_KEYS.CLOUD_LAST_MODIFIED]);
+    const changes = await MiniSync.berry.bridgeIdentity.merge({ kind: 'berry', storageKey: 'berry_pathkey_snapshot',
+      owner, currentList, phoneList, tombstoneKeys, context: bridgeContext,
+      preferPhoneOrder: !preferLocalOrder && (berryData.lastModified || 0) > (state[STORAGE_KEYS.CLOUD_LAST_MODIFIED] || 0) });
+    console.log(`[sync] Berry 处理完成: ${zoneSummary(changes.list)}`);
+    return changes;
   } catch (e) {
     return { list: currentList, deletedIds: [], deletedPathKeys: [], complete: false, errors: [e.message] };
-  }
-  if (berryData === null) return { list: currentList, deletedIds: [], deletedPathKeys: [], complete: false, errors: ['Berry 文件不存在'] };
-  const berryList = getBerryList(berryData);
-  if (!berryList) return { list: currentList, deletedIds: [], deletedPathKeys: [], complete: false, errors: ['Berry 文件格式无效'] };
-  try { validateBerryList(berryList); } catch (e) {
-    return { list: currentList, deletedIds: [], deletedPathKeys: [], complete: false, errors: [e.message] };
-  }
-  const changes = { list: currentList, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] };
-  // ★ 删除快照绑定「它属于哪个远端文件」：只换手机目录时旧快照不得复用
-  //   （否则新文件里的书签被当成手机端删除，本地与主 XBEL 一起被删）。
-  const berryOwner = await MiniSync.utils.bridgeResourceUrl('berry');
-  if (berryList.length === 0) {
-    const previous = await MiniSync.utils.readScopedBridgeSnapshot('berry_pathkey_snapshot', berryOwner);
-    const paths = computePathKeys(currentList);
-    for (const n of currentList) {
-      const pk = paths.get(n.id);
-      if (pk && previous.includes(pk)) { changes.deletedIds.push(n.id); changes.deletedPathKeys.push(pk); }
-    }
-    changes.list = currentList.filter(n => !changes.deletedIds.includes(n.id));
-    changes.snapshotUpdates = MiniSync.utils.scopedBridgeSnapshotUpdate('berry_pathkey_snapshot', berryOwner, []);
-    return changes;
-  }
-
-  // 补 source：旧版可能没有，按 parentId 推断
-  for (const n of berryList) {
-    if (n.source) continue;
-    if (n.parentId === HOME_FOLDER_ID) n.source = 'home';
-    else if (n.parentId === MOBILE_FOLDER_ID) n.source = 'mobile';
-    else if (n.parentId === OTHER_FOLDER_ID) n.source = 'other';
-    else if (n.parentId === ROOT_ID) n.source = 'bar';
-  }
-
-  const berryPathKeys = computePathKeys(berryList);
-  const currentPKs = computePathKeys(currentList);
-
-  // 建立 pathKey 映射
-  const berryByPK = new Map();
-  for (const n of berryList) {
-    const pk = berryPathKeys.get(n.id);
-    if (pk) berryByPK.set(pk, n);
-  }
-  const currentPKSet = new Set(currentPKs.values());
-
-  // 1. 从 Berry 继承图标到当前节点
-  let enrichedCurrent = currentList.map(n => {
-    const pk = currentPKs.get(n.id);
-    if (!pk) return n;
-    const berryNode = berryByPK.get(pk);
-    if (berryNode) {
-      const copy = { ...n };
-      if (berryNode.favicon && !copy.favicon) copy.favicon = berryNode.favicon;
-      if (berryNode.color && !copy.color) copy.color = berryNode.color;
-      if (berryNode.customIcon && !copy.customIcon) copy.customIcon = berryNode.customIcon;
-      return copy;
-    }
-    return n;
-  });
-
-  // 2. 找出 Berry 中有但当前列表没有的节点（Berry 新增的）
-  function getParentPath(pk) {
-    if (!pk) return '';
-    const lastSlash = pk.lastIndexOf('/');
-    return lastSlash > 0 ? pk.substring(0, lastSlash) : pk;
-  }
-  const currentDupIndex = new Map();
-  for (const n of currentList) {
-    const pk = currentPKs.get(n.id);
-    const parentPath = getParentPath(pk);
-    // 对文件夹：目录层级 + F:标题
-    // 对书签：目录层级 + L:标题 + URL
-    const key = n.isFolder
-      ? `${parentPath}/F:${n.title}`
-      : `${parentPath}/L:${n.title}:${(n.url || '').replace(/&amp;/g, '&')}`;
-    if (!currentDupIndex.has(key)) currentDupIndex.set(key, n.id);
-  }
-  // ★ URL 精确匹配集（fallback，覆盖 parentPath 不一致但实际是同一书签的场景）
-  const localUrlSet = new Set(
-    currentList.filter(n => !n.isFolder && n.url).map(n => n.url.replace(/&amp;/g, '&').replace(/\/$/, ''))
-  );
-  // ★ 文件夹标题集（fallback，覆盖 parentPath 不一致但实际是同一文件夹的场景）
-  const localFolderTitles = new Set(
-    currentList.filter(n => n.isFolder).map(n => n.title)
-  );
-
-  let dedupByPath = 0, dedupByUrl = 0;
-  const berryNew = berryList.filter(n => {
-    const pk = berryPathKeys.get(n.id);
-    if (!pk || currentPKSet.has(pk)) return false;
-    // 被 tombstone 标记删除的不当作新增
-    if (tombstoneKeys && tombstoneKeys.has(pk)) return false;
-    // 补充去重：目录 + 标题 + URL 相同则视为重复
-    const parentPath = getParentPath(pk);
-    const dupKey = n.isFolder
-      ? `${parentPath}/F:${n.title}`
-      : `${parentPath}/L:${n.title}:${(n.url || '').replace(/&amp;/g, '&')}`;
-    if (currentDupIndex.has(dupKey)) { dedupByPath++; return false; }
-    // URL 精确匹配 fallback
-    if (!n.isFolder && n.url) {
-      const normalizedUrl = n.url.replace(/&amp;/g, '&').replace(/\/$/, '');
-      if (localUrlSet.has(normalizedUrl)) { dedupByUrl++; return false; }
-    }
-    // 文件夹标题 fallback：本地已有同名文件夹 → 视为重复
-    if (n.isFolder && n.title && localFolderTitles.has(n.title)) return false;
-    return true;
-  });
-
-  // 3. Berry 删除检测：快照中有但现在没有 → Berry 端删除 → 移除
-  const berryPKSet = new Set(berryPathKeys.values());
-  // 对方节点的 URL / 文件夹标题集合：用于识别「父改名/移动导致 pathKey 变了，但并非真删」
-  const berryUrlSet = new Set(
-    berryList.filter(n => !n.isFolder && n.url).map(n => n.url.replace(/&amp;/g, '&').replace(/\/$/, ''))
-  );
-  const berryFolderTitles = new Set(
-    berryList.filter(n => n.isFolder).map(n => n.title)
-  );
-  const berrySnapshotData = await MiniSync.utils.readScopedBridgeSnapshot('berry_pathkey_snapshot', berryOwner);
-  const berrySnapshotSet = new Set(berrySnapshotData);
-  let berryDeletedCount = 0;
-  if (berrySnapshotSet.size > 0) {
-    // 从结果中过滤掉 Berry 删除的节点
-    const beforeLen = enrichedCurrent.length;
-    const filteredCurrent = enrichedCurrent.filter(n => {
-      const pk = currentPKs.get(n.id);
-      if (!pk) return true;
-      // Berry 快照中有但现在没有 → 疑似 Berry 删了
-      if (berrySnapshotSet.has(pk) && !berryPKSet.has(pk)) {
-        // 改名/移动兜底：URL（书签）或标题（文件夹）仍存在于对方 → 只是路径变了，不是真删
-        if (!n.isFolder && n.url) {
-          const u = n.url.replace(/&amp;/g, '&').replace(/\/$/, '');
-          if (berryUrlSet.has(u)) return true;
-        }
-        if (n.isFolder && n.title && berryFolderTitles.has(n.title)) return true;
-        berryDeletedCount++;
-        changes.deletedIds.push(n.id);
-        changes.deletedPathKeys.push(pk);
-        return false;
-      }
-      return true;
-    });
-    if (berryDeletedCount > 0) {
-      enrichedCurrent = filteredCurrent;
-    }
-  }
-
-  // 保存 Berry pathKey 快照（用于下次检测删除），连同所属文件一起写
-  changes.snapshotUpdates = MiniSync.utils.scopedBridgeSnapshotUpdate('berry_pathkey_snapshot', berryOwner, [...berryPKSet]);
-
-  // 4. （已移除）原「Berry 主页权威过滤」：将不在 Berry 文件中的桌面 home 节点从合并列表移除。
-  // 删除原因：Berry 的 bookmarks.json 本身不含 home 节点（主页数据在手机端自管），
-  // berryPKSet 永远没有 home 的 pathKey，导致该过滤恒等于「全量清空桌面 home」。
-  // 清空后的列表传给 mergeViaData/mergeAiraData 时，favorites.txt / personalization 里
-  // 同样的 home 书签因去重基线缺失被误判为「主页新增」重新注入，一来一回把同一批
-  // 书签复制成两份（手机端 Berry主页 出现成对重复）。
-  // home 节点现在完整保留在合并列表中：Berry 回写时由 patchBerryFile 跳过（不写入
-  // bookmarks.json），Via favorites / Aira personalization 的去重基线恢复正常。
-  let homeDeletedCount = 0;
-
-  // 5. 决定顺序
-  const pluginLastMod = (await chrome.storage.local.get([STORAGE_KEYS.CLOUD_LAST_MODIFIED]))[STORAGE_KEYS.CLOUD_LAST_MODIFIED] || 0;
-  const berryLastMod = berryData.lastModified || 0;
-  const useBerryOrder = !preferLocalOrder && berryLastMod > pluginLastMod;
-
-  // 映射 Berry parentId → currentList 中对应节点的 ID
-  function mapBerryParentId(bn) {
-    const parentPK = berryPathKeys.get(bn.parentId);
-    if (parentPK) {
-      const currentParent = enrichedCurrent.find(n => currentPKs.get(n.id) === parentPK);
-      if (currentParent) {
-        return { ...bn, parentId: currentParent.id };
-      }
-    }
-    return bn;
-  }
-
-  if (useBerryOrder) {
-    // Berry 更新 → 按 Berry 顺序排列，Chrome 独有的追加末尾
-    const result = [];
-    const usedPKs = new Set();
-    for (const bn of berryList) {
-      const bpk = berryPathKeys.get(bn.id);
-      if (!bpk || (tombstoneKeys && tombstoneKeys.has(bpk))) continue;
-      // 找当前列表中对应的节点（已继承图标）
-      const localNode = enrichedCurrent.find(n => currentPKs.get(n.id) === bpk);
-      if (localNode) {
-        result.push(localNode);
-        usedPKs.add(bpk);
-      } else {
-        // Berry 有但本地（按 pk）没有 → 先按「目录+标题+URL」去重，
-        // 防止 pathKey 口径变更（如 ROOT:other/F:Berry主页 → ROOT:home）导致
-        // Berry 存储里的旧 pk 与本地新 pk 不匹配、被误判为「新增」而重复追加。
-        const parentPath = getParentPath(bpk);
-        const dupKey = bn.isFolder
-          ? `${parentPath}/F:${bn.title}`
-          : `${parentPath}/L:${bn.title}:${(bn.url || '').replace(/&amp;/g, '&')}`;
-        if (currentDupIndex.has(dupKey)) {
-          continue;
-        }
-        result.push(mapBerryParentId(bn));
-        usedPKs.add(bpk);
-      }
-    }
-    // Chrome 独有的追加末尾
-    for (const n of enrichedCurrent) {
-      const pk = currentPKs.get(n.id);
-      if (pk && !usedPKs.has(pk) && !(tombstoneKeys && tombstoneKeys.has(pk))) {
-        result.push(n);
-      }
-    }
-    // ★ 重编 _index 为同父内序号：本分支按 Berry 顺序重排了数组，但节点上的
-    //   _index 仍是本地树旧序/云端旧值——落盘（import.js）的 landed 重排按
-    //   _index 排序，不重编的话顺序会被打回（表现为「一端调整子文件夹内顺序，
-    //   另一端合并后顺序不变」）。
-    const sibCounter = new Map();
-    for (const n of result) {
-      const key = n.parentId || '__root__';
-      const idx = sibCounter.get(key) || 0;
-      n._index = idx;
-      sibCounter.set(key, idx + 1);
-    }
-    console.log(`[sync] 🍓 Berry 处理完成: ${zoneSummary(result)}`);
-    changes.list = result;
-    return changes;
-  } else {
-    // Chrome 顺序：当前列表 + Berry 新增追加末尾
-    const mappedBerryNew = berryNew.map(mapBerryParentId);
-    const result = [...enrichedCurrent, ...mappedBerryNew];
-    // Berry 新增节点无 _index → 补到同父已有节点之后（否则落盘重排按 _index||0
-    // 会把它们挪到同父最前）。已有节点的 _index 保持（本地序或云端覆盖序）。
-    MiniSync.utils.fillMissingSiblingIndex(result);
-    console.log(`[sync] 🍓 Berry 处理完成: ${zoneSummary(result)}`);
-    changes.list = result;
-    return changes;
   }
 }
 
 // 挂载到 MiniSync，供 sync-orchestrator 在合并阶段调用
 MiniSync.berry = {
+  bridgeIdentity: createBridgeIdentity(),
   mergeBerryData,
   mergeBerryDataWithChanges,
   patchBerryFile

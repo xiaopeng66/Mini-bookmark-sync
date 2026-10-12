@@ -27,6 +27,7 @@ global.chrome.bookmarks = {
 loadSource();
 const M = global.MiniSync;
 const bindSyncStatusBucket = M.storage.bindSyncStatusBucket;
+const bridgeIdentity = M.berry.bridgeIdentity;
 vm.runInThisContext(fs.readFileSync(path.join(ROOT, 'lib/webdav.js'), 'utf8'), { filename: 'lib/webdav.js' });
 const isStrongETag = M.webdav.isStrongETag;
 const versionWriteCondition = M.webdav.versionWriteCondition;
@@ -134,7 +135,7 @@ function installMocks(mergeResultOverride = {}) {
   // tombstone 使用真实实现（load-source 已加载 model/tombstone.js，纯逻辑无副作用）；
   // bridge / berry/via/aira：no-op
   M.bridgePatcher = { patchBridges: async () => ({ bridgeResults: {}, partial: false }) };
-  M.berry = { mergeBerryDataWithChanges: async (list) => ({ list, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] }) };
+  M.berry = { bridgeIdentity, mergeBerryDataWithChanges: async (list) => ({ list, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] }) };
   M.via = { mergeViaDataWithChanges: async (list) => ({ list, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] }) };
   M.aira = { mergeAiraDataWithChanges: async (list) => ({ list, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] }) };
 
@@ -261,7 +262,7 @@ describe('mergeSync — 回迁桥必须收到墓碑集合（否则桥接写回�
     expect(calls.length).toBeGreaterThan(0);
     for (const args of calls) {
       // ★ 第 2 参必须传：漏传时桥接侧拿不到墓碑，会把已删节点写回桥接文件 → 下一轮复活
-      expect(args.length).toBe(2);
+      expect(args.length).toBeGreaterThanOrEqual(2);
       const keys = args[1];
       expect(keys && typeof keys.has === 'function').toBe(true);
       expect([...keys]).toContain('ROOT:bar/L:https://dead.example');

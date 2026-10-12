@@ -77,22 +77,6 @@ async function doUploadBookmarks(options) {
         + MiniSync.webdav.describeWriteProtection(writeCondition));
     }
 
-    // ===== 回迁：上传前云端冲突检测（非强制上传） =====
-    // 云端文件 lastModified 比本地记录新 → 说明被其他设备修改过，需用户确认
-    // ★ 只认服务器真的发来的 Last-Modified（serverModified）。没有它时 lastModified
-    //   退化成响应 Date（≈现在），拿去和上次记录比必然「更晚」——那样在没有
-    //   Last-Modified 的服务器上，每次非强制上传都会误报「云端已被其他设备修改」。
-    if (!options.force && remoteVersion.exists && remoteVersion.serverModified > 0) {
-      const stored = await MiniSync.storage.getLocal([STORAGE_KEYS.CLOUD_LAST_MODIFIED]);
-      const lastSeen = stored[STORAGE_KEYS.CLOUD_LAST_MODIFIED] || 0;
-      if (lastSeen > 0 && remoteVersion.serverModified > lastSeen) {
-        await MiniSync.storage.setSyncStatus({ status: IDLE });
-        return { success: false, code: 'CLOUD_CONFLICT',
-          message: '云端书签已被其他设备修改，请先下载并合并',
-          remoteModified: remoteVersion.serverModified, endpointKey };
-      }
-    }
-
     // ★ 上传前尽力读一次云端正文，只为取「写入端声明的扁平根容器名」：
     //   桌面 Edge 本机是标准三区（根下有书签栏/其他收藏夹），它识别不出自己
     //   「其他收藏夹/根目录」这一层是手机容器的镜像 —— 只能靠云端 XBEL 的
@@ -114,6 +98,17 @@ async function doUploadBookmarks(options) {
     if (!bucketInfo.id) throw new Error('找不到同步文件夹（浏览器根下没有任何文件夹）');
     await MiniSync.syncInput.ensureSyncRelationship(config, bucketInfo.id);
     recoveryBucketId = bucketInfo.id;
+    // Only this relationship's last observation can establish an unseen cloud edit.
+    if (!options.force && remoteVersion.exists && remoteVersion.serverModified > 0) {
+      const stored = await MiniSync.storage.getLocal([STORAGE_KEYS.CLOUD_LAST_MODIFIED]);
+      const lastSeen = stored[STORAGE_KEYS.CLOUD_LAST_MODIFIED] || 0;
+      if (lastSeen > 0 && remoteVersion.serverModified > lastSeen) {
+        await MiniSync.storage.setSyncStatus({ status: IDLE });
+        return { success: false, code: 'CLOUD_CONFLICT',
+          message: '云端书签已被其他设备修改，请先下载并合并',
+          remoteModified: remoteVersion.serverModified, endpointKey };
+      }
+    }
     // 「上传」是「以本机为准覆盖云端」的动作。若云端声明的同步文件夹在本机不存在
     // （典型：手机建的容器还没同步到这台桌面），本次上传的覆盖范围会以本机探测到的
     // 文件夹为准 —— 如实说出来，用户才知道该先点「合并」。
@@ -137,7 +132,10 @@ async function doUploadBookmarks(options) {
     // ② 消费「本地 ∪ 云端」墓碑：云端已删、而本机还留着的节点，先在本机删掉再上传。
     //    不删的话本机会把它们原样覆盖回云端 —— 用户的删除被反推成「复活」。
     // Deletions are destructive local writes: verify the backup before consuming tombstones.
-    if (!await MiniSync.syncInput.backupLocalTree()) throw new Error('本地备份失败，已停止上传以保护书签');
+    if (!await MiniSync.syncInput.backupLocalTree()) {
+      const failure = MiniSync.syncInput.getLocalBackupFailure();
+      throw Object.assign(new Error(failure ? failure.message : '本地备份失败，已停止上传以保护书签'), failure);
+    }
     backupReady = true;
     const deletions = await MiniSync.syncInput.applyTombstoneDeletions(remoteData);
     if (deletions.deletedCount > 0) {
@@ -173,6 +171,7 @@ async function doUploadBookmarks(options) {
     const putResult = await MiniSync.webdav.putFile(config.url, config.username, config.password, config.filename, xbelString, undefined,
       writeCondition);
     mainCommitted = true;
+    const backupCompletion = await MiniSync.syncInput.completeLocalBackup();
     uploadNote += MiniSync.webdav.writeProtectionNote(putResult.protection);
     // ★ 本端把墓碑成功写上了云 ⇒ 这些 key 就是「已确认上云」（撤销判定的条件 ⑤）。
     try {
@@ -183,7 +182,13 @@ async function doUploadBookmarks(options) {
       await MiniSync.storage.setLocal({ sync_tombstone_acked: [...acked] });
     } catch (e) { console.warn('[sync] 记录已上云墓碑失败（忽略）:', e.message); }
     // 记录云端 lastModified，供下次上传冲突检测使用
-    await MiniSync.storage.setLocal({ [STORAGE_KEYS.CLOUD_LAST_MODIFIED]: putResult.lastModified || Date.now() });
+    let metadataError = '';
+    try {
+      await MiniSync.storage.setLocal({ [STORAGE_KEYS.CLOUD_LAST_MODIFIED]: putResult.lastModified || Date.now() });
+    } catch (e) {
+      metadataError = e.message;
+      console.warn('[sync] 主文件已上传，云端版本记录失败:', e.message);
+    }
 
     // ★ 提交后对账：写出去的是 PUT 之前那一刻的树。若用户在这次 PUT 等待期间删了书签，
     //   它此刻已不在本机树上，却**刚刚被写进了云端**。不补墓碑的话，下一轮会把云端那条
@@ -251,11 +256,6 @@ async function doUploadBookmarks(options) {
     // 记录同步信息（count=纯书签数，与 result.bookmarkCount 同口径）
     await MiniSync.syncInput.recordLastSync(totalCount, bmCount);
 
-    // 更新状态
-    await MiniSync.storage.setSyncStatus({ status: bridgeOutcome.partial ? 'partial' : SUCCESS,
-      partial: !!bridgeOutcome.partial, bridgeResults: bridgeOutcome.bridgeResults,
-      error: bridgeOutcome.partial ? '主文件已上传，手机桥接部分失败' : '' });
-
     // 同步成功后刷新本地快照（供删除监听回溯被删节点 pathKey），并检查基线是否完整。
     // ★ 先算基线结果再写状态/返回值：基线没写成必须如实进 partial 与 message，
     //   否则用户以为「同步成功」，而之后删除的书签其实拿不到 pathKey、无法传播
@@ -264,17 +264,22 @@ async function doUploadBookmarks(options) {
     const baselineRepair = await MiniSync.syncInput.repairBaselineIfNeeded();
     const baselineSave = await MiniSync.syncInput.saveLocalTreeSnapshot();
     const baselineIncomplete = !baselineSave.ok || baselineRepair.ok === false;
-    if (baselineIncomplete) {
-      await MiniSync.storage.setSyncStatus({ status: 'partial', partial: true,
-        bridgeResults: bridgeOutcome.bridgeResults,
-        error: '本地基线快照写入失败：期间删除的书签可能无法传播，下次同步会自动重试' });
+    const warnings = [];
+    if (!backupCompletion.ok) warnings.push('备份事务状态保存失败: ' + backupCompletion.error);
+    if (bridgeOutcome.partial) warnings.push('手机桥接部分失败');
+    if (baselineIncomplete) warnings.push('本地基线快照写入失败，删除传播可能延迟');
+    if (metadataError) warnings.push('云端版本记录失败: ' + metadataError);
+    try {
+      await MiniSync.storage.setSyncStatus({ status: warnings.length ? 'partial' : SUCCESS,
+        partial: warnings.length > 0, bridgeResults: bridgeOutcome.bridgeResults, error: warnings.join('；') });
+    } catch (e) {
+      warnings.push('同步状态保存失败: ' + e.message);
     }
     return {
       success: true,
-      partial: !!bridgeOutcome.partial || baselineIncomplete,
+      partial: warnings.length > 0,
       bridgeResults: bridgeOutcome.bridgeResults || {},
-      message: (bridgeOutcome.partial ? '主文件已上传，手机桥接部分失败'
-        : (baselineIncomplete ? '上传成功，但本地基线快照写入失败（删除传播可能延迟）' : '上传成功')) + uploadNote,
+      message: (warnings.length ? '主文件已上传，但' + warnings.join('；') : '上传成功') + uploadNote,
       endpointKey: endpointKey,
       count: totalCount,
       bookmarkCount: bmCount,
@@ -286,6 +291,11 @@ async function doUploadBookmarks(options) {
 
   } catch (error) {
     console.error('[sync] 上传失败:', error.message);
+    if (mainCommitted) {
+      try { await MiniSync.storage.setSyncStatus({ status: 'partial', partial: true, error: error.message }); }
+      catch (_) { /* Storage may remain unavailable after the remote commit. */ }
+      return { success: true, partial: true, message: `主文件已上传，后续处理未完成: ${error.message}` };
+    }
     let recovery = null;
     if (backupReady && !mainCommitted) {
       // ★ 上传路径本机只做**删除**（按云端墓碑删本地，含主页区），从不新建内容节点，
@@ -299,11 +309,13 @@ async function doUploadBookmarks(options) {
         includeHome: true, recreateMissingHome: true }); }
       catch (e) { recovery = { ok: false, reason: e.message }; }
     }
-    await MiniSync.storage.setSyncStatus({ status: FAILED, error: error.message });
+    try { await MiniSync.storage.setSyncStatus({ status: FAILED, error: error.message }); }
+    catch (e) { console.warn('[sync] 保存失败状态异常:', e.message); }
     // ★ code 必须透传：popup 靠 code === 'CLOUD_CONFLICT' 才给「强制覆盖」这条路。
     //   条件写入在 PUT 阶段被拒（412/409）时如果不带 code，用户只会看到「上传失败」，
     //   既不知道是并发冲突，也没有任何可走的下一步。
-    return { success: false, message: `上传失败: ${error.message}`, code: error.code, recovery };
+    return { success: false, message: `上传失败: ${error.message}`, code: error.code,
+      retryable: error.retryable === true && (!backupReady || !!(recovery && recovery.ok)), recovery };
   } finally {
     // 事务结束必须解锁：后续同步按当时最新设置重新锁定目标。
     if (MiniSync.utils.clearTransactionWebDAVConfig) MiniSync.utils.clearTransactionWebDAVConfig();
@@ -329,6 +341,8 @@ async function doDownloadBookmarks(options) {
   let recoveryBucketId = null;
   let backupReady = false;
   let localCommitted = false;
+  const warnings = [];
+  const transaction = { createdIds: [] };
   let restoreHome = false;
   // 拿到锁后状态仍是 SYNCING → 必为 SW 崩溃/重启残留，恢复为 IDLE
   const status = await MiniSync.storage.getSyncStatus();
@@ -390,14 +404,16 @@ async function doDownloadBookmarks(options) {
     // 关键改动：不再 clearAllBookmarks() + 全量重建（会令本地节点 id 全部变更，
     //   导致 floccus 误判本地被清空、触发 E029 删除保险删光服务端）。
     //   改为增量导入：复用本地已存在的同名/同 URL 节点 id，仅增删差异，保持本地 id 稳定。
-    // 1. 备份当前本地书签（供失败回滚）
-    const backupCount = await MiniSync.syncInput.backupLocalTree();
-    if (!backupCount) throw new Error('本地备份失败，已停止下载以保护书签');
-    backupReady = true;
     const bucketInfo = await MiniSync.syncInput.resolveSyncBucketSetting();
     if (!bucketInfo.id) throw new Error('找不到同步文件夹（浏览器根下没有任何文件夹）');
     recoveryBucketId = bucketInfo.id;
     await MiniSync.syncInput.ensureSyncRelationship(config, bucketInfo.id);
+    // The rollback identity must belong to this task's resolved relationship and bucket.
+    if (!await MiniSync.syncInput.backupLocalTree()) {
+      const failure = MiniSync.syncInput.getLocalBackupFailure();
+      throw Object.assign(new Error(failure ? failure.message : '本地备份失败，已停止下载以保护书签'), failure);
+    }
+    backupReady = true;
 
     // 1b. ===== 增量删减：下载也要减量，不是「只加不删」=====
     // 旧实现（mergeMode:false、不传 deletedIds）是纯加法：云端删掉的书签在本机永远留着。
@@ -435,7 +451,7 @@ async function doDownloadBookmarks(options) {
       result = await MiniSync.importer.importBookmarksFromData(
         pluginData,
         { mode: DOWNLOAD_MODE, mergeIntoLocal: true, mergeMode: false, skipBerryBridge: true, skipViaBridge: true,
-          targetParentId, clearLocalFirst }
+          targetParentId, clearLocalFirst, transaction }
       );
     } catch (e) {
       // 4a. 导入异常 → 从备份恢复
@@ -446,11 +462,14 @@ async function doDownloadBookmarks(options) {
       //   （审计复现：download-exception-write-set 的 LateUser 被回滚误删）。
       const restored = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true, targetParentId: bucketInfo.id,
         // 下载的删除阶段也覆盖 home 区；失败回滚必须一起恢复（含容器被整棵删除的情形）。
-        includeHome: true, recreateMissingHome: true, createdIds: e.writeSet || [] });
+        includeHome: true, recreateMissingHome: true,
+        createdIds: [...transaction.createdIds, ...(e.writeSet || [])] });
       await MiniSync.storage.setSyncStatus({ status: FAILED, error: e.message });
       return {
         success: false,
-        message: `下载失败: ${e.message}` + (restored.restored > 0 ? `（已回滚 ${restored.restored} 条本地书签）` : ''),
+        message: `下载失败: ${e.message}` + (!restored.ok ? '（回滚未完成，请核对本地书签）'
+          : (restored.restored > 0 ? `（已回滚 ${restored.restored} 条本地书签）` : '')),
+        recovery: restored,
         restored: restored.restored
       };
     }
@@ -477,7 +496,7 @@ async function doDownloadBookmarks(options) {
         includeHome: true, recreateMissingHome: true, createdIds: result.createdIds });
       await MiniSync.storage.setSyncStatus({ status: FAILED, error: '下载写入未完整落地' });
       return { success: false, partial: true, conflictCount: failureCount, conflicts: result.conflicts || [],
-        restored: restored.restored,
+        recovery: restored, restored: restored.restored,
         message: restored.ok ? `下载有 ${failureCount} 处未落地，已回滚本地` : `下载有 ${failureCount} 处未落地，回滚未完成` };
     }
     // 修复动作要如实说给用户听（手机上 console 看不到）：
@@ -514,8 +533,8 @@ async function doDownloadBookmarks(options) {
     // 记录本次同步信息（popup 首页渲染用；count=纯书签数，与 result.bookmarkCount 同口径）
     await MiniSync.syncInput.recordLastSync(cloudTotal, cloudBmCount);
     localCommitted = true;
-
-    await MiniSync.storage.setSyncStatus({ status: SUCCESS });
+    const backupCompletion = await MiniSync.syncInput.completeLocalBackup();
+    if (!backupCompletion.ok) warnings.push('备份事务状态保存失败: ' + backupCompletion.error);
 
     // 同步成功后刷新本地快照（供删除监听回溯被删节点 pathKey）
     await MiniSync.syncInput.saveLocalSnapshot();
@@ -524,15 +543,13 @@ async function doDownloadBookmarks(options) {
     const baselineRepair = await MiniSync.syncInput.repairBaselineIfNeeded();
     const baselineSave = await MiniSync.syncInput.saveLocalTreeSnapshot();
     const baselineIncomplete = !baselineSave.ok || baselineRepair.ok === false;
-    if (baselineIncomplete) {
-      await MiniSync.storage.setSyncStatus({ status: 'partial', partial: true,
-        error: '本地基线快照写入失败：期间删除的书签可能无法传播，下次同步会自动重试' });
-    }
-    const message = failedWrites > 0
-      ? `下载完成，但有 ${failedWrites} 条没能写入本地（云端数据未丢）：${conflictSamples.join('；')}`
-      : (baselineIncomplete
-        ? '下载成功，但本地基线快照写入失败（删除传播可能延迟）'
-        : (cleanedNotes.length > 0 ? `下载成功（${cleanedNotes.join('，')}）` : '下载成功'));
+    if (baselineIncomplete) warnings.push('本地基线快照写入失败，删除传播可能延迟');
+    try {
+      await MiniSync.storage.setSyncStatus({ status: warnings.length ? 'partial' : SUCCESS,
+        partial: warnings.length > 0, error: warnings.join('；') });
+    } catch (e) { warnings.push('同步状态保存失败: ' + e.message); }
+    const message = (cleanedNotes.length > 0 ? `下载成功（${cleanedNotes.join('，')}）` : '下载成功')
+      + (warnings.length ? '，但' + warnings.join('；') : '');
     // 台账：消息通道坏的宿主（可拓/雨见）也能靠 storage 读到「这次到底写了什么」
     try {
       await MiniSync.storage.setLocal({
@@ -576,7 +593,7 @@ async function doDownloadBookmarks(options) {
     }
     return {
       success: true,
-      partial: baselineIncomplete || undefined,
+      partial: warnings.length > 0 || undefined,
       message,
       importedCount: result.importedCount,
       totalCount: cloudTotal,
@@ -595,14 +612,24 @@ async function doDownloadBookmarks(options) {
 
   } catch (error) {
     console.error('[sync] 下载失败:', error.message);
+    if (localCommitted) {
+      try { await MiniSync.syncInput.saveLocalTreeSnapshot(); }
+      catch (e) { warnings.push('本地基线快照写入失败: ' + e.message); }
+      warnings.push(error.message);
+      try { await MiniSync.storage.setSyncStatus({ status: 'partial', partial: true, error: warnings.join('；') }); }
+      catch (_) { /* The accepted local landing must not be repeated for a status failure. */ }
+      return { success: true, partial: true, message: '书签已下载，后续处理未完成: ' + warnings.join('；') };
+    }
     let recovery = null;
     if (backupReady && recoveryBucketId && !localCommitted) {
       try { recovery = await MiniSync.syncInput.restoreLocalBackup({ replaceCurrent: true, targetParentId: recoveryBucketId,
-        includeHome: true, recreateMissingHome: true }); }
+        includeHome: true, recreateMissingHome: true, createdIds: transaction.createdIds }); }
       catch (e) { recovery = { ok: false, reason: e.message }; }
     }
-    await MiniSync.storage.setSyncStatus({ status: FAILED, error: error.message });
-    return { success: false, message: `下载失败: ${error.message}`, recovery };
+    try { await MiniSync.storage.setSyncStatus({ status: FAILED, error: error.message }); }
+    catch (e) { console.warn('[sync] 保存失败状态异常:', e.message); }
+    return { success: false, message: `下载失败: ${error.message}`, code: error.code,
+      retryable: error.retryable === true && (!backupReady || !!(recovery && recovery.ok)), recovery };
   } finally {
     // 下载路径不写云端，但同样要清掉可能残留的锁定（防御性：正常不会设置）。
     if (MiniSync.utils.clearTransactionWebDAVConfig) MiniSync.utils.clearTransactionWebDAVConfig();

@@ -71,7 +71,7 @@ async function getSyncStatus() {
   // SYNCING 超时自动释放（5分钟）
   if (status === SYNCING && data.last_sync_time) {
     const elapsed = Date.now() - data.last_sync_time;
-    if (elapsed > 5 * 60 * 1000) {
+    if (elapsed > 5 * 60 * 1000 && !(MiniSync.syncMutex && MiniSync.syncMutex.active)) {
       console.warn('[storage] SYNCING 超时释放，已卡住', Math.round(elapsed / 1000), '秒');
       status = IDLE;
       await setLocal({ sync_status: IDLE });

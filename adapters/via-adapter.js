@@ -98,18 +98,64 @@ function parseHtmlToBookmarks(html) {
   // ★ 旧实现在大正则里写死 `<A\s+HREF="..."`：属性顺序一变（合法 HTML）或写成单引号，
   //   整条书签读不到，而文件仍被判为「读取完整」→ 上一轮快照里的书签被当成手机端删除，
   //   本地与主 XBEL 一起被删（审计 2026-10-11 复现）。这里对合法书写形式一视同仁。
+  function parseAttrs(tagText) {
+    const attrs = new Map();
+    let rest = tagText;
+    while (rest.trim()) {
+      // Consume the whole attribute list. An unmatched quote must never fall
+      // through to the unquoted alternative or match a suffix such as DATA-HREF.
+      const attr = /^\s+([^\s"'<>/=`]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`=]+)))?/.exec(rest);
+      if (!attr) throw new Error('Via bookmarks.html 属性格式无效');
+      const key = attr[1].toUpperCase();
+      if (attrs.has(key)) throw new Error('Via bookmarks.html 属性重复');
+      attrs.set(key, attr[2] ?? attr[3] ?? attr[4] ?? '');
+      rest = rest.slice(attr[0].length);
+    }
+    return attrs;
+  }
+
   function attrValue(tagText, name) {
-    if (!tagText) return '';
-    const re = new RegExp('\\b' + name + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\'|([^\\s>]+))', 'i');
-    const m = re.exec(tagText);
-    if (!m) return '';
-    return m[1] !== undefined ? m[1] : (m[2] !== undefined ? m[2] : (m[3] || ''));
+    return parseAttrs(tagText).get(name.toUpperCase()) || '';
+  }
+
+  // Check every item, not just successfully parsed ones: a partial export must
+  // not authorize deletions. Quoted '>' is data, not the end of a tag.
+  const attributeText = `(?:[^<>"']|"[^"]*"|'[^']*')*`;
+  // Consume whole quoted tags before looking for comments, so <!--...--> in
+  // an HREF remains data. The final alternative catches a truncated <DT that
+  // would otherwise leave a valid-looking anchor invisible to parseDL.
+  const markup = /<!--[\s\S]*?-->|<(?:[^<>"']|"[^"]*"|'[^']*')*>|<DT\b/gi;
+  html = html.replace(markup, tag => {
+    if (tag.startsWith('<!--')) return '';
+    if (/^<DT\b/i.test(tag) && !/^<DT>$/i.test(tag)) {
+      throw new Error('Via bookmarks.html DT 标签格式无效');
+    }
+    return tag;
+  });
+  const itemStart = /<(A|H3)\b/gi;
+  const itemHead = new RegExp('<(A|H3)\\b(' + attributeText + ')>', 'iy');
+  let item;
+  while ((item = itemStart.exec(html))) {
+    itemHead.lastIndex = item.index;
+    const head = itemHead.exec(html);
+    if (!head) throw new Error('Via bookmarks.html 标签格式无效');
+    const attrs = parseAttrs(head[2]);
+    if (head[1].toUpperCase() === 'A' && !decodeHtmlEntities(attrs.get('HREF')).trim()) {
+      throw new Error('Via bookmarks.html 书签地址缺失');
+    }
+    const close = new RegExp('</' + head[1] + '\\s*>', 'gi');
+    close.lastIndex = itemHead.lastIndex;
+    const end = close.exec(html);
+    if (!end || /<(?:A|H3|DT|DL)\b/i.test(html.slice(itemHead.lastIndex, end.index))) {
+      throw new Error('Via bookmarks.html 书签标签不完整');
+    }
+    itemStart.lastIndex = close.lastIndex;
   }
 
   function parseDL(block, parentId, source) {
     // 逐项扫描：按 <DT> 切分后再判断这一项是文件夹还是书签。
     // 属性解析交给 attrValue —— 不再依赖固定书写顺序与引号风格（两者都是合规 HTML）。
-    const dtRegex = /<DT>\s*(?:<H3\b([^>]*)>([\s\S]*?)<\/H3>\s*<DL\b[^>]*>|<A\b([^>]*)>([\s\S]*?)<\/A>)/gi;
+    const dtRegex = new RegExp('<DT>\\s*(?:<H3\\b(' + attributeText + ')>([\\s\\S]*?)<\\/H3\\s*>\\s*<DL\\b[^>]*>|<A\\b(' + attributeText + ')>([\\s\\S]*?)<\\/A\\s*>)', 'gi');
     let match;
     while ((match = dtRegex.exec(block)) !== null) {
       if (match[2] !== undefined) {
@@ -332,24 +378,7 @@ async function downloadViaBookmarks() {
   if (!config.url || !config.user || !config.password) throw new Error('Via WebDAV 未配置');
   const viaPath = await getViaPath();
   if (!viaPath) throw new Error('Via 路径未配置');
-  const fullUrl = joinWebDAVUrl(config.url, viaPath + '/' + VIA_FILE);
-  try {
-    const response = await fetch(fullUrl, {
-      method: 'GET',
-      cache: 'no-store',
-      headers: {
-        'Authorization': getAuthHeader(config.user, config.password),
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache'
-      }
-    });
-    if (response.status === 404) return null;
-    if (!response.ok) throw new Error(`读取 Via 文件失败: ${response.status}`);
-    return await response.text();
-  } catch (e) {
-    console.warn('[sync] 读取 Via 文件异常:', e.message);
-    throw e;
-  }
+  return MiniSync.webdav.getFile(config.url, config.user, config.password, viaPath + '/' + VIA_FILE);
 }
 
 // 上传 HTML 到 WebDAV
@@ -359,16 +388,8 @@ async function uploadViaHtml(html) {
   const viaPath = await getViaPath();
   if (!viaPath) throw new Error('Via 路径未配置');
   await ensureWebDAVDir(config.url, viaPath, config.user, config.password);
-  const fullUrl = joinWebDAVUrl(config.url, viaPath + '/' + VIA_FILE);
-  const response = await fetch(fullUrl, {
-    method: 'PUT',
-    headers: {
-      'Authorization': getAuthHeader(config.user, config.password),
-      'Content-Type': 'text/html; charset=utf-8'
-    },
-    body: html
-  });
-  if (!response.ok) throw new Error(`写入 Via 文件失败: ${response.status}`);
+  return MiniSync.webdav.putFile(config.url, config.user, config.password,
+    viaPath + '/' + VIA_FILE, html, 'text/html; charset=utf-8');
 }
 
 // ========== 桥接逻辑 ==========
@@ -376,17 +397,24 @@ async function uploadViaHtml(html) {
 // 将合并结果写回 Via（HTML + favorites.txt）
 async function patchViaFile(mergedList) {
   const results = {};
+  const written = {};
   for (const [name, upload, serialize] of [
     ['html', uploadViaHtml, serializeToHtml],
     ['favorites', uploadViaFavorites, serializeToFavoritesTxt]
   ]) {
     try {
-      await upload(serialize(mergedList));
+      written[name] = serialize(mergedList);
+      await upload(written[name]);
       results[name] = { status: 'success' };
     } catch (e) {
       results[name] = { status: 'failed', error: e.message };
       console.warn(`[sync] Via ${name} 写回失败:`, e.message);
     }
+  }
+  if (results.html.status === 'success' && results.favorites.status === 'success') {
+    results.snapshotUpdates = await MiniSync.berry.bridgeIdentity.snapshotUpdates('via_pathkey_snapshot',
+      await MiniSync.utils.bridgeResourceUrl('via'),
+      [...parseHtmlToBookmarks(written.html), ...parseFavoritesTxt(written.favorites)]);
   }
   return results;
 }
@@ -398,151 +426,19 @@ async function mergeViaData(currentList, tombstoneKeys = null) {
   return result.list;
 }
 
-async function mergeViaDataWithChanges(currentList, tombstoneKeys = null) {
-  const changes = { list: currentList, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] };
-  // ★ 删除快照绑定「它属于哪个远端文件」（同 Berry）：只换手机目录时不得复用旧快照，
-  //   否则新文件里的书签会被当成手机端删除（审计复现三个 folder-switch 场景）。
-  const viaOwner = await MiniSync.utils.bridgeResourceUrl('via');
-  // 计数：供末尾「处理完成」日志展示差异构成（声明在函数级，块内赋值）
-  let viaNewCount = 0, homeNewCount = 0;
-  // ★ 收集所有"来自 Via 文件"的 pathKey（HTML + favorites），
-  //   用于删除检测时正确圈定 Via 负责的节点（含嵌套子书签，其 source 为空）。
-  const viaAllPKSet = new Set();
-  let viaList = []; // 提前声明，避免 html 下载失败时后面删除检测引用报错
-  // ===== 1. 合并 bookmarks.html（source='bar'/'other'/'mobile'）=====
-  let html;
+async function mergeViaDataWithChanges(currentList, tombstoneKeys = null, bridgeContext = null) {
   try {
-    html = await downloadViaBookmarks();
+    const html = await downloadViaBookmarks();
     if (html === null) throw new Error('Via bookmarks.html 不存在');
     if (typeof html !== 'string' || !/<DL\b[^>]*>/i.test(html) || !/<\/DL\s*>/i.test(html)) {
       throw new Error('Via bookmarks.html 格式无效');
     }
-  } catch (e) {
-    changes.complete = false;
-    changes.errors.push(e.message);
-  }
-
-  if (changes.complete && html) {
-    viaList = parseHtmlToBookmarks(html);
-    // ★ fail-closed：文件里明明有书签/文件夹标签，却一条都没解析出来 ⇒ 判为读取不完整，
-    //   交给调用方停掉删除检测与写回。旧行为把「解析器读不懂」当成「手机端删光了」，
-    //   用户书签在本地与主 XBEL 一起消失（审计 2026-10-11 复现）。
-    //   只有「确实是空书签文件」才允许走空列表（那才代表手机端删空）。
-    const hasAnyItemTag = /<(?:A|H3)\b/i.test(html);
-    if (viaList.length === 0 && hasAnyItemTag) {
-      changes.complete = false;
-      changes.errors.push('Via bookmarks.html 内容无法解析（格式不兼容）');
-      return changes;
+    const viaList = parseHtmlToBookmarks(html);
+    if (viaList.length === 0 && /<(?:A|H3)\b/i.test(html)) {
+      throw new Error('Via bookmarks.html 内容无法解析（格式不兼容）');
     }
-    if (viaList.length > 0) {
-      const currentPKs = computePathKeys(currentList);
-      const viaPKs = computePathKeys(viaList);
-      for (const pk of viaPKs.values()) viaAllPKSet.add(pk);
-      const currentPKSet = new Set(currentPKs.values());
-
-      const viaIdToPK = new Map();
-      for (const n of viaList) {
-        const pk = viaPKs.get(n.id);
-        if (pk) viaIdToPK.set(n.id, pk);
-      }
-
-      const currentPKToId = new Map();
-      for (const n of currentList) {
-        const pk = currentPKs.get(n.id);
-        if (pk) currentPKToId.set(pk, n.id);
-      }
-
-      // 构建去重索引：目录层级 + 标题 + URL
-      function getParentPath(pk) {
-        if (!pk) return '';
-        const lastSlash = pk.lastIndexOf('/');
-        return lastSlash > 0 ? pk.substring(0, lastSlash) : pk;
-      }
-      const currentDupIndex = new Map();
-      for (const n of currentList) {
-        const pk = currentPKs.get(n.id);
-        const parentPath = getParentPath(pk);
-        const key = n.isFolder
-          ? `${parentPath}/F:${n.title}`
-          : `${parentPath}/L:${n.title}:${(n.url || '').replace(/&amp;/g, '&')}`;
-        if (!currentDupIndex.has(key)) currentDupIndex.set(key, n.id);
-      }
-      // ★ URL 精确匹配集：用于 fallback 去重（覆盖 parentPath 不一致但实际是同一书签的场景）
-      const localUrlSet = new Set(
-        currentList.filter(n => !n.isFolder && n.url).map(n => n.url.replace(/&amp;/g, '&').replace(/\/$/, ''))
-      );
-
-      let dedupByPath = 0, dedupByUrl = 0, dedupFolderByName = 0;
-      // ★ 文件夹标题集：用于 fallback 匹配（覆盖 parentPath 不一致但实际是同一文件夹的场景）
-      const localFolderTitles = new Set(
-        currentList.filter(n => n.isFolder).map(n => n.title)
-      );
-      const viaNew = viaList.filter(n => {
-        const pk = viaPKs.get(n.id);
-        if (!pk || currentPKSet.has(pk)) return false;
-        // 被 tombstone 标记删除的不当作新增
-        if (tombstoneKeys && tombstoneKeys.has(pk)) return false;
-        // 补充去重：目录 + 标题 + URL 相同则视为重复
-        const parentPath = getParentPath(pk);
-        const dupKey = n.isFolder
-          ? `${parentPath}/F:${n.title}`
-          : `${parentPath}/L:${n.title}:${(n.url || '').replace(/&amp;/g, '&')}`;
-        if (currentDupIndex.has(dupKey)) { dedupByPath++; return false; }
-        // URL 精确匹配 fallback（覆盖路径不一致但实际是同一书签的场景）
-        if (!n.isFolder && n.url) {
-          const normalizedUrl = n.url.replace(/&amp;/g, '&').replace(/\/$/, '');
-          if (localUrlSet && localUrlSet.has(normalizedUrl)) { dedupByUrl++; return false; }
-        }
-        // ★ 文件夹标题 fallback：若本地已有同名文件夹，视为重复
-        //   场景：Via 文件里文件夹 parentPath=ROOT:other/F:X，本地同一文件夹
-        //   parentPath=ROOT:home/F:X（Berry主页 映射导致路径分歧），
-        //   上述两种去重都失效，但标题相同就是同一个文件夹。
-        if (n.isFolder && n.title && localFolderTitles.has(n.title)) {
-          dedupFolderByName++;
-          return false;
-        }
-        return true;
-      });
-      if (viaNew.length > 0) {
-        viaNewCount = viaNew.length;
-        viaNew.sort((a, b) => {
-          if (a.id === b.parentId) return -1;
-          if (b.id === a.parentId) return 1;
-          if (a.parentId === ROOT_ID && b.parentId !== ROOT_ID) return -1;
-          if (b.parentId === ROOT_ID && a.parentId !== ROOT_ID) return 1;
-          return 0;
-        });
-
-        const mappedNew = viaNew.map(n => {
-          const copy = { ...n };
-          if (copy.parentId && copy.parentId !== ROOT_ID) {
-            const parentPK = viaIdToPK.get(copy.parentId);
-            if (parentPK && currentPKToId.has(parentPK)) {
-              copy.parentId = currentPKToId.get(parentPK);
-            }
-          }
-          if (copy.isFolder) {
-            const pk = viaPKs.get(n.id);
-            if (pk) currentPKToId.set(pk, copy.id);
-          }
-          return copy;
-        });
-
-        currentList = [...currentList, ...mappedNew];
-      }
-    }
-  }
-
-  // ===== 2. 合并 favorites.txt（source='home'）=====
-  let txt;
-  try {
-    txt = await downloadViaFavorites();
-    // ★ 文件不存在（404）按「主页区为空」处理，不再判整份 Via 读取失败：
-    //   主页文件是手机端首次使用后才创建的，缺它就把 HTML 里的合法书签一起丢掉，
-    //   随后写回还会覆盖掉手机端唯一副本（审计 2026-10-11 复现
-    //   via-missing-favorites-discards-valid-bookmarks-then-overwrites-them）。
-    //   注意：内容损坏（JSON 解析失败）仍必须 fail-closed，见下面的 catch。
-    if (txt === null) txt = '';
+    const downloadedFavorites = await downloadViaFavorites();
+    const txt = downloadedFavorites === null ? '' : downloadedFavorites;
     if (typeof txt !== 'string') throw new Error('Via favorites.txt 格式无效');
     for (const line of txt.split('\n').filter(value => value.trim())) {
       const row = JSON.parse(line);
@@ -551,130 +447,19 @@ async function mergeViaDataWithChanges(currentList, tombstoneKeys = null) {
         throw new Error('Via favorites.txt 书签节点格式无效');
       }
     }
+    const phoneList = [...viaList, ...parseFavoritesTxt(txt)];
+    let input = currentList;
+    if (phoneList.some(n => n.source === 'home') && !input.some(n => n.id === HOME_FOLDER_ID)) {
+      input = [...input, { id: HOME_FOLDER_ID, title: '主页文件夹', isFolder: true, parentId: ROOT_ID }];
+    }
+    const changes = await MiniSync.berry.bridgeIdentity.merge({ kind: 'via', storageKey: 'via_pathkey_snapshot',
+      owner: await MiniSync.utils.bridgeResourceUrl('via'), currentList: input, phoneList,
+      tombstoneKeys, context: bridgeContext, stableIds: false });
+    console.log(`[sync] Via 处理完成: ${zoneSummary(changes.list)}`);
+    return changes;
   } catch (e) {
-    changes.complete = false;
-    changes.errors.push(e.message);
+    return { list: currentList, deletedIds: [], deletedPathKeys: [], complete: false, errors: [e.message] };
   }
-  if (changes.complete && txt) {
-    const homeList = parseFavoritesTxt(txt);
-    if (homeList.length > 0) {
-      // 确保 HOME_FOLDER_ID 容器节点存在（否则 pathKey 算不出来）
-      if (!currentList.some(n => n.id === HOME_FOLDER_ID)) {
-        currentList = [...currentList, {
-          id: HOME_FOLDER_ID,
-          title: '主页文件夹',
-          url: '',
-          isFolder: true,
-          parentId: ROOT_ID,
-          addedAt: Date.now(),
-          color: '',
-          favicon: '',
-          customIcon: ''
-        }];
-      }
-
-      const currentPKs2 = computePathKeys(currentList);
-      const homePKs = computePathKeys(homeList);
-      for (const pk of homePKs.values()) viaAllPKSet.add(pk);
-      const currentPKSet2 = new Set(currentPKs2.values());
-
-      // 构建去重索引：目录层级 + 标题 + URL
-      function getParentPath2(pk) {
-        if (!pk) return '';
-        const lastSlash = pk.lastIndexOf('/');
-        return lastSlash > 0 ? pk.substring(0, lastSlash) : pk;
-      }
-      const currentDupIndex2 = new Map();
-      for (const n of currentList) {
-        const pk = currentPKs2.get(n.id);
-        const parentPath = getParentPath2(pk);
-        const key = n.isFolder
-          ? `${parentPath}/F:${n.title}`
-          : `${parentPath}/L:${n.title}:${(n.url || '').replace(/&amp;/g, '&')}`;
-        if (!currentDupIndex2.has(key)) currentDupIndex2.set(key, n.id);
-      }
-      // URL 匹配集（fallback）：归一化比较，http/https、www.、尾斜杠差异视为同一书签
-      const localUrlSet2 = new Set(
-        currentList.filter(n => !n.isFolder && n.url).map(n => normalizeUrlForDedup(n.url.replace(/&amp;/g, '&')))
-      );
-
-      const localFolderTitles2 = new Set(
-        currentList.filter(n => n.isFolder).map(n => n.title)
-      );
-      const homeNew = homeList.filter(n => {
-        const pk = homePKs.get(n.id);
-        if (!pk || currentPKSet2.has(pk)) return false;
-        if (tombstoneKeys && tombstoneKeys.has(pk)) return false;
-        // 补充去重：目录 + 标题 + URL 相同则视为重复
-        const parentPath = getParentPath2(pk);
-        const dupKey = n.isFolder
-          ? `${parentPath}/F:${n.title}`
-          : `${parentPath}/L:${n.title}:${(n.url || '').replace(/&amp;/g, '&')}`;
-        if (currentDupIndex2.has(dupKey)) return false;
-        // URL 匹配 fallback（归一化）
-        if (!n.isFolder && n.url) {
-          const normalizedUrl = normalizeUrlForDedup(n.url.replace(/&amp;/g, '&'));
-          if (localUrlSet2.has(normalizedUrl)) return false;
-        }
-        // 文件夹标题 fallback
-        if (n.isFolder && n.title && localFolderTitles2.has(n.title)) return false;
-        return true;
-      });
-
-      if (homeNew.length > 0) {
-        homeNewCount = homeNew.length;
-        currentList = [...currentList, ...homeNew];
-      }
-    }
-  }
-
-  // ===== 3. Via 删除检测（与 Berry 对称）=====
-  // 上次 Via 有但现在没有 → Via 端删除 → 从 currentList 移除
-  const allViaPKs = computePathKeys(currentList);
-  // 当前 Via 负责的节点 = 本次从 Via 文件解析出的全部 pk（含嵌套子书签，其 source 为空），
-  // 不再用 source 白名单圈定（空 source 子书签会被漏掉，导致 Via 端删除无法传播）。
-  const viaPKSet = viaAllPKSet;
-  // 对方节点的 URL / 文件夹标题集合：识别「父改名/移动导致 pathKey 变了，但并非真删」
-  const viaUrlSet = new Set(
-    viaList.filter(n => !n.isFolder && n.url).map(n => n.url.replace(/&amp;/g, '&').replace(/\/$/, ''))
-  );
-  const viaFolderTitles = new Set(
-    viaList.filter(n => n.isFolder).map(n => n.title)
-  );
-  const viaSnapshotData = await MiniSync.utils.readScopedBridgeSnapshot('via_pathkey_snapshot', viaOwner);
-  const viaSnapshotSet = new Set(viaSnapshotData);
-  let viaDeletedCount = 0;
-  if (changes.complete && viaSnapshotSet.size > 0) {
-    const filteredCurrent = currentList.filter(n => {
-      const pk = allViaPKs.get(n.id);
-      if (!pk) return true;
-      if (viaSnapshotSet.has(pk) && !viaPKSet.has(pk)) {
-        // 改名/移动兜底：URL（书签）或标题（文件夹）仍存在于对方 → 只是路径变了，不是真删
-        if (!n.isFolder && n.url) {
-          const u = n.url.replace(/&amp;/g, '&').replace(/\/$/, '');
-          if (viaUrlSet.has(u)) return true;
-        }
-        if (n.isFolder && n.title && viaFolderTitles.has(n.title)) return true;
-        viaDeletedCount++;
-        changes.deletedIds.push(n.id);
-        changes.deletedPathKeys.push(pk);
-        return false;
-      }
-      return true;
-    });
-    if (viaDeletedCount > 0) {
-      currentList = filteredCurrent;
-    }
-  }
-
-  // 保存 Via pathKey 快照（用于下次检测 Via 删除），连同所属文件一起写
-  if (changes.complete) changes.snapshotUpdates = MiniSync.utils.scopedBridgeSnapshotUpdate('via_pathkey_snapshot', viaOwner, [...viaPKSet]);
-
-  // Via 新增节点（来自 html/favorites 解析）无 _index → 补到同父已有节点之后
-  MiniSync.utils.fillMissingSiblingIndex(currentList);
-  console.log(`[sync] 📱 Via 处理完成: ${zoneSummary(currentList)}`);
-  changes.list = currentList;
-  return changes;
 }
 
 // ========== favorites.txt 读写（Berry 主页）==========
@@ -743,24 +528,7 @@ async function downloadViaFavorites() {
   if (!config.url || !config.user || !config.password) throw new Error('Via WebDAV 未配置');
   const viaPath = await getViaPath();
   if (!viaPath) throw new Error('Via 路径未配置');
-  const fullUrl = joinWebDAVUrl(config.url, viaPath + '/' + VIA_FAVORITES_FILE);
-  try {
-    const response = await fetch(fullUrl, {
-      method: 'GET',
-      cache: 'no-store',
-      headers: {
-        'Authorization': getAuthHeader(config.user, config.password),
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache'
-      }
-    });
-    if (response.status === 404) return null;
-    if (!response.ok) throw new Error(`读取 Via favorites.txt 失败: ${response.status}`);
-    return await response.text();
-  } catch (e) {
-    console.warn('[sync] 读取 Via favorites.txt 异常:', e.message);
-    throw e;
-  }
+  return MiniSync.webdav.getFile(config.url, config.user, config.password, viaPath + '/' + VIA_FAVORITES_FILE);
 }
 
 // 上传 favorites.txt 到 WebDAV
@@ -770,16 +538,8 @@ async function uploadViaFavorites(txt) {
   const viaPath = await getViaPath();
   if (!viaPath) throw new Error('Via 路径未配置');
   await ensureWebDAVDir(config.url, viaPath, config.user, config.password);
-  const fullUrl = joinWebDAVUrl(config.url, viaPath + '/' + VIA_FAVORITES_FILE);
-  const response = await fetch(fullUrl, {
-    method: 'PUT',
-    headers: {
-      'Authorization': getAuthHeader(config.user, config.password),
-      'Content-Type': 'text/plain; charset=utf-8'
-    },
-    body: txt
-  });
-  if (!response.ok) throw new Error(`写入 Via favorites.txt 失败: ${response.status}`);
+  return MiniSync.webdav.putFile(config.url, config.user, config.password,
+    viaPath + '/' + VIA_FAVORITES_FILE, txt, 'text/plain; charset=utf-8');
 }
 
 // 挂载到 MiniSync，供 sync-orchestrator 在合并阶段调用

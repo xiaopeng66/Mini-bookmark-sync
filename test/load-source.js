@@ -21,6 +21,7 @@ const ORDER = [
   'model/xbel.js',
   'model/xbel-path.js',
   'model/tombstone.js',
+  'adapters/berry-adapter.js',
   'core/storage.js',
   'lib/merge.js',
   'core/sync-input.js',

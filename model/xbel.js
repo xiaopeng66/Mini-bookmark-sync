@@ -92,12 +92,16 @@ function validateXbel(xml) {
   let pos = 0;
   let rootCount = 0;
   const stack = [];
+  const normalized = [];
   let token;
   while ((token = tokens.exec(xml))) {
     const between = xml.slice(pos, token.index);
     if (between.includes('<') || invalidEntity.test(between) || (!stack.length && between.trim())) throw new Error('Malformed XBEL XML');
     pos = tokens.lastIndex;
     const tag = token[0];
+    // Canonicalize only real closing-tag tokens, never text inside CDATA/comments
+    // or attributes. All downstream scanners then share the validator's grammar.
+    normalized.push(between, tag.startsWith('</') ? tag.replace(/\s+>$/, '>') : tag);
     if (tag.startsWith('<!--') || tag.startsWith('<?') || tag.startsWith('<!DOCTYPE')) {
       if (stack.length) throw new Error('Malformed XBEL XML');
       continue;
@@ -123,7 +127,7 @@ function validateXbel(xml) {
     }
   }
   if (xml.slice(pos).trim() || stack.length || rootCount !== 1) throw new Error('Malformed XBEL XML');
-  return xml.replace(/<xbel\b([^<>]*?)\s*\/>/, '<xbel$1></xbel>');
+  return normalized.join('').replace(/<xbel\b([^<>]*?)\s*\/>/, '<xbel$1></xbel>');
 }
 
 // 核心：扁平 JSON → XBEL XML 字符串

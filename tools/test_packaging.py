@@ -59,5 +59,12 @@ class MarkerNewlineTests(unittest.TestCase):
             self.assertEqual(P.check_markers(missing_file), ['缺文件 options.html'])
 
 
+class SourceMarkerTests(unittest.TestCase):
+    def test_release_gate_accepts_current_runtime_source(self):
+        root = Path(P.SRC)
+        self.assertEqual(P.check_markers(
+            lambda rel: (root / rel).read_text(encoding='utf-8')), [])
+
+
 if __name__ == '__main__':
     unittest.main()

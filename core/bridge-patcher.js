@@ -30,13 +30,28 @@ async function patchBridges(lists, opts) {
   const skipped = () => ({ status: 'skipped' });
   const bridgeResults = { berry: skipped(), viaHtml: skipped(), viaFavorites: skipped(), aira: skipped(), airaHome: skipped() };
   const failure = e => ({ status: 'failed', error: e && e.message ? e.message : String(e) });
-  const status = value => value && ['success', 'skipped', 'failed'].includes(value.status)
-    ? value : { status: 'failed', error: '桥接写回未返回有效状态' };
+  const status = value => {
+    if (!value || !['success', 'skipped', 'failed'].includes(value.status)) {
+      return { status: 'failed', error: '桥接写回未返回有效状态' };
+    }
+    const { snapshotUpdates, ...summary } = value;
+    return summary;
+  };
+  async function commitSnapshot(result) {
+    if (!result || !result.snapshotUpdates || !Object.keys(result.snapshotUpdates).length) return;
+    try { await MiniSync.storage.setLocal(result.snapshotUpdates); }
+    catch (e) { throw new Error('手机文件已写入，但删除检测基线保存失败: ' + e.message); }
+  }
+  async function acceptWrite(result) {
+    const summary = status(result);
+    if (summary.status === 'success') await commitSnapshot(result);
+    return summary;
+  }
 
   // Berry：必须显式开启（=== true 才启用），避免 undefined 时误开
   if (berryOn) {
     try {
-      bridgeResults.berry = status(await MiniSync.berry.patchBerryFile(berryList));
+      bridgeResults.berry = await acceptWrite(await MiniSync.berry.patchBerryFile(berryList));
     } catch (e) {
       bridgeResults.berry = failure(e);
       console.warn('[sync] Berry 写回失败:', e.message);
@@ -48,6 +63,9 @@ async function patchBridges(lists, opts) {
       const result = await MiniSync.via.patchViaFile(viaList);
       bridgeResults.viaHtml = status(result && result.html);
       bridgeResults.viaFavorites = status(result && result.favorites);
+      if (bridgeResults.viaHtml.status === 'success' && bridgeResults.viaFavorites.status === 'success') {
+        await commitSnapshot(result);
+      }
     } catch (e) {
       bridgeResults.viaHtml = failure(e);
       bridgeResults.viaFavorites = failure(e);
@@ -69,7 +87,7 @@ async function patchBridges(lists, opts) {
       } catch (e) { /* ignore */ }
     }
     try {
-      bridgeResults.aira = status(await MiniSync.aira.patchAiraFile(airaList, { rebuild: rebuildAira }));
+      bridgeResults.aira = await acceptWrite(await MiniSync.aira.patchAiraFile(airaList, { rebuild: rebuildAira }));
       if (oneShotRebuild && bridgeResults.aira.status === 'success') {
         await chrome.storage.local.remove('aira_rebuild_once');
       }
@@ -78,7 +96,7 @@ async function patchBridges(lists, opts) {
       console.warn('[sync] Aira 写回失败:', e.message);
     }
     try {
-      bridgeResults.airaHome = status(await MiniSync.aira.patchAiraPersonalization(airaList, { align: airaHomeAlign }));
+      bridgeResults.airaHome = await acceptWrite(await MiniSync.aira.patchAiraPersonalization(airaList, { align: airaHomeAlign }));
     } catch (e) {
       bridgeResults.airaHome = failure(e);
       console.warn('[sync] Aira 主页写回失败:', e.message);

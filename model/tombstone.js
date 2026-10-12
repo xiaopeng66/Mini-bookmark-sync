@@ -187,7 +187,17 @@ function buildTombstoneView(opts) {
   // 其墓碑必须保留以实现删除传播。
   const bothPresentPKs = new Set([...localPKSet].filter(pk => remotePKSet.has(pk)));
 
-  let tombstones = mergeTombstoneSources(o.localTombstones || [], o.remoteTombstones || []);
+  // v2.3.0 encoded slash as %2F inside F: titles, colliding with literal
+  // percent titles. Only actual tree/snapshot titles establish the old identity.
+  // Multiple identities for one legacy key cannot authorize deleting either.
+  const resolveLegacyKey = MiniSync.xbelPath.legacyKeyResolver([o.prevSnapshotList, localList, remoteList]);
+  const migrate = items => (Array.isArray(items) ? items : []).flatMap(item => {
+    const key = resolveLegacyKey(typeof item === 'string' ? item : item && item.key);
+    return key ? [typeof item === 'string' ? key : { ...item, key }] : [];
+  });
+  const localTombstones = migrate(o.localTombstones);
+  const remoteTombstones = migrate(o.remoteTombstones);
+  let tombstones = mergeTombstoneSources(localTombstones, remoteTombstones);
   tombstones = cleanExpired(tombstones, null, { localPKSet, remotePKSet });
   tombstones = cleanFakeTombstones(tombstones, localList, o.myDeviceId,
     Array.isArray(o.prevSnapshotList) ? o.prevSnapshotList : null);
@@ -213,7 +223,7 @@ function buildTombstoneView(opts) {
   //   基线为空（首次同步/无证据）时不撤销，宁可多留一轮墓碑也不误删。
   const remoteTombstoneKeys = (() => {
     const set = new Set();
-    for (const item of (Array.isArray(o.remoteTombstones) ? o.remoteTombstones : [])) {
+    for (const item of remoteTombstones) {
       const pk = typeof item === 'string' ? item : (item && item.key ? item.key : null);
       if (pk) set.add(pk);
     }
@@ -225,7 +235,7 @@ function buildTombstoneView(opts) {
   //   墓碑列表里见到它）。缺这条会把「本端刚删、墓碑刚记」误当成「对端重新添加」而
   //   撤销删除 —— 实测：上传等待期间删掉的书签，墓碑刚补记，云端还留着旧副本、基线
   //   也还没更新，前四条恰好都成立，删除结果被撤销、下一轮书签又被导回。
-  const ackedKeys = new Set(Array.isArray(o.ackTombstoneKeys) ? o.ackTombstoneKeys : []);
+  const ackedKeys = new Set(migrate(o.ackTombstoneKeys));
   const revokedKeys = new Set();
   if (baselineKeys) {
     tombstones = tombstones.filter(item => {

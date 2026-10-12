@@ -92,7 +92,7 @@ function computePersonalizationChecksum(sections) {
 // ====== Berry主页 → Aira personalization（home_shortcuts）写回 ======
 // opts.align=true（上传覆盖语义）：以桌面 home 为准对齐——personalization 中
 //   桌面没有的 shortcuts 一律移除（含历史残留），仅保留桌面有的并补齐缺失。
-// 默认（合并语义）：只追加桌面有而此处没有的，不移除任何端上条目。
+// 默认（合并语义）：保留端上独有条目，仅按明确墓碑传播删除。
 async function patchAiraPersonalization(mergedList, opts = {}) {
   const align = !!(opts && opts.align);
   let prev;
@@ -128,12 +128,20 @@ async function patchAiraPersonalization(mergedList, opts = {}) {
   //   顺带清理历史重复：归一化 URL 相同的 shortcuts 只保留最早创建的一条。
   //   align 模式下进一步以桌面 home 为准：桌面没有的 shortcuts 一律移除。
   const deskUrls = align ? new Set(homeItems.map(n => normalizeUrlForDedup(n.url))) : null;
+  const deletionState = await MiniSync.utils.readLocalKeys(['sync_tombstones']);
+  const deletionKeys = new Set((deletionState.sync_tombstones || []).map(t => typeof t === 'string' ? t : t && t.key));
+  const liveKeys = new Set(computePathKeys(mergedList).values());
   const allShortcuts = prev.sections.home_shortcuts.payload.shortcuts || [];
+  const homeNodes = allShortcuts.map(sc => ({ id: sc.id, title: sc.title || '', url: sc.url,
+    parentId: HOME_FOLDER_ID, source: 'home', isFolder: false, createdAt: sc.createdAt, updatedAt: sc.updatedAt }));
+  const homeKeys = computePathKeys(homeNodes);
   const seenNormUrls = new Set();
   const keptShortcutIds = new Set();
   const dedupedShortcuts = [];
   for (const sc of allShortcuts) {
     const norm = normalizeUrlForDedup(sc.url);
+    const key = homeKeys.get(sc.id);
+    if (deletionKeys.has(key) && !liveKeys.has(key)) continue;
     if (align && !deskUrls.has(norm)) continue; // 对齐：桌面没有的端上条目移除
     if (norm && seenNormUrls.has(norm)) continue; // 重复条目：丢弃（保留最早的一条）
     if (norm) seenNormUrls.add(norm);
@@ -225,7 +233,13 @@ async function patchAiraPersonalization(mergedList, opts = {}) {
       throw e;
     }
   }
-  return { status: needUpload ? 'success' : 'skipped' };
+  if (!needUpload) return { status: 'skipped' };
+  const written = prev.sections.home_shortcuts.payload.shortcuts.map(sc => ({ id: sc.id,
+    title: sc.title || '', url: sc.url, parentId: HOME_FOLDER_ID, source: 'home', isFolder: false,
+    createdAt: sc.createdAt, updatedAt: sc.updatedAt }));
+  const snapshotUpdates = await MiniSync.berry.bridgeIdentity.snapshotUpdates('aira_home_pathkey_snapshot',
+    (await MiniSync.utils.airaResourceUrls()).g2, written);
+  return { status: 'success', snapshotUpdates };
 }
 
 // 取 snapshot 容器（兼容顶层直接是三表对象的旧形态）
@@ -266,35 +280,48 @@ function airaSnapshotToList(raw) {
     throw new Error('Aira 快照 bookmarkItems 格式无效');
   }
   const items = (Array.isArray(snap.bookmarkItems) ? snap.bookmarkItems : []).filter(it => !it.type || it.type === 'bookmark-item');
-  for (const f of folders) byId.set(f.id, f);
-  for (const it of items) byId.set(it.id, it);
+  const nativeRoots = new Map();
+  for (const f of folders) {
+    const rootKey = AIRA_ROOT_MAP[f.id] ? f.id : AIRA_ROOT_MAP[f.title] ? f.title : null;
+    if (rootKey) nativeRoots.set(rootKey, f);
+  }
   for (const node of [...folders, ...items]) {
+    if (!node || typeof node.id !== 'string' || !node.id || byId.has(node.id)) {
+      throw new Error('Aira 快照节点 ID 无效或重复');
+    }
+    byId.set(node.id, node);
+  }
+  const parentOf = node => byId.get(node.parentId) || nativeRoots.get(node.parentId);
+  for (const node of [...folders, ...items]) {
+    if (node.parentId != null && (!parentOf(node) || !folders.includes(parentOf(node)))) {
+      throw new Error('Aira 快照存在悬空父节点');
+    }
     const seen = new Set();
     let parent = node;
     while (parent) {
       if (seen.has(parent.id)) throw new Error('Aira 快照包含环形父链');
       seen.add(parent.id);
-      parent = parent.parentId ? byId.get(parent.parentId) : null;
+      parent = parent.parentId != null ? parentOf(parent) : null;
     }
   }
 
   // 向上回溯，确定某个节点所属根区的 source（bar/other/mobile）
   function resolveSource(node) {
-    const rootSrc = AIRA_ROOT_MAP[node.id];
+    const rootSrc = AIRA_ROOT_MAP[node.id] || AIRA_ROOT_MAP[node.title];
     if (rootSrc) return rootSrc; // 根容器本身
     if (node.parentId && AIRA_ROOT_MAP[node.parentId]) return AIRA_ROOT_MAP[node.parentId]; // 直接挂在根容器下
     // 挂在普通文件夹下 → 向上回溯父链
-    let p = node.parentId ? byId.get(node.parentId) : null;
+    let p = node.parentId ? parentOf(node) : null;
     while (p) {
-      const ps = AIRA_ROOT_MAP[p.id];
+      const ps = AIRA_ROOT_MAP[p.id] || AIRA_ROOT_MAP[p.title];
       if (ps) return ps;
-      p = p.parentId ? byId.get(p.parentId) : null;
+      p = p.parentId ? parentOf(p) : null;
     }
     return 'bar'; // 兜底（理论上 Aira 所有节点都可回溯到根容器）
   }
 
   // 记录根容器原始 id → 规范根 key 的映射，用于把子节点 parentId 也统一成规范 key
-  const originalRootIdMap = new Map();
+  const originalRootIdMap = new Map([...nativeRoots].map(([key, node]) => [node.id, key]));
   // 1. 文件夹（type: 'bookmark-folder'）
   for (const f of folders) {
     const isAiraRoot = !!AIRA_ROOT_MAP[f.id] || !!AIRA_ROOT_MAP[f.title];
@@ -306,7 +333,7 @@ function airaSnapshotToList(raw) {
     list.push({
       id: rootKey || f.id,
       // Aira 根容器 parentId 统一挂到虚拟根，title 标准化，使 computePathKeys 生成 ROOT:bar/other/mobile
-      parentId: isAiraRoot ? ROOT_ID : (f.parentId || null),
+      parentId: isAiraRoot ? ROOT_ID : (originalRootIdMap.get(f.parentId) || f.parentId || null),
       title: rootKey ? AIRA_ROOT_STANDARD_TITLES[rootKey] : (f.title || ''),
       isFolder: true,
       source: resolveSource(f), // 按 Aira 根容器归属正确设置，而非统一 'bar'
@@ -535,74 +562,57 @@ function airaListToSnapshot(list, prevRaw) {
 // 规则：同一 pathKey（含父路径的 title/url）只保留第一份，其余并存的节点 id 全部映射到保留 id；
 //       bookmarkOrders.ids 中指向被合并 id 的，替换为保留 id 并去重，过滤掉悬空引用。
 function dedupeAiraSnapshot(folders, items, orders) {
-  const all = [...folders, ...items];
-  const byId = new Map();
-  all.forEach(n => byId.set(n.id, n));
-
-  // 计算 pathKey（复用 computePathKeys 的同一算法）
-  function pkOf(node, visiting = new Set()) {
-    if (visiting.has(node.id)) throw new Error('Aira 快照包含环形父链');
-    visiting.add(node.id);
-    if (node.id === 'root') return 'ROOT';
-    const ROOTMAP = { browser_root_toolbar: 'bar', browser_root_other: 'other', browser_root_mobile: 'mobile' };
-    if (ROOTMAP[node.id]) return 'ROOT:' + ROOTMAP[node.id];
-    const isFolder = node.type === 'bookmark-folder' || node.isFolder;
-    const seg = isFolder ? 'F:' + node.title : 'L:' + (node.url || '');
-    const p = byId.get(node.parentId);
-    if (!p) return 'ROOT:unknown/' + seg;
-    let pp = (p.id === 'root' && node.source && node.source !== 'home') ? 'ROOT:' + node.source : pkOf(p, visiting);
-    return pp + '/' + seg;
-  }
-
-  // 按 pathKey 去重，保留第一份
-  const keepIdByPK = new Map();   // pathKey -> 保留 id
-  const alias = new Map();        // 被合并 id -> 保留 id
-  const keptFolders = [];
-  const keptItems = [];
-  for (const n of folders) {
-    const pk = pkOf(n);
-    if (keepIdByPK.has(pk)) { alias.set(n.id, keepIdByPK.get(pk)); continue; }
+  const rootSources = { browser_root_toolbar: 'bar', browser_root_other: 'other', browser_root_mobile: 'mobile' };
+  const rootKey = n => rootSources[n.id] ? n.id : rootSources[n.title] ? n.title : null;
+  const list = airaSnapshotToList({ snapshot: { bookmarkFolders: folders, bookmarkItems: items } });
+  const keys = computePathKeys(list);
+  const nativeRoots = new Map();
+  for (const n of folders) if (rootKey(n) && !nativeRoots.has(rootKey(n))) nativeRoots.set(rootKey(n), n.id);
+  const keepIdByPK = new Map();
+  const alias = new Map();
+  const keep = nodes => nodes.flatMap(n => {
+    const root = rootKey(n);
+    const pk = root ? 'ROOT:' + rootSources[root] : keys.get(n.id) || 'ID:' + n.id;
+    if (keepIdByPK.has(pk)) { alias.set(n.id, keepIdByPK.get(pk)); return []; }
     keepIdByPK.set(pk, n.id);
-    keptFolders.push(n);
+    return [{ ...n }];
+  });
+  const keptFolders = keep(folders);
+  const keptItems = keep(items);
+  function resolve(id) {
+    id = nativeRoots.get(id) || id;
+    while (alias.has(id)) id = alias.get(id);
+    return id == null ? null : id;
   }
-  for (const n of items) {
-    const pk = pkOf(n);
-    if (keepIdByPK.has(pk)) { alias.set(n.id, keepIdByPK.get(pk)); continue; }
-    keepIdByPK.set(pk, n.id);
-    keptItems.push(n);
+  const kept = new Map([...keptFolders, ...keptItems].map(n => [n.id, n]));
+  const folderIds = new Set(keptFolders.map(n => n.id));
+  for (const n of kept.values()) {
+    n.parentId = resolve(n.parentId);
+    if (n.parentId !== null && !folderIds.has(n.parentId)) throw new Error('Aira 快照存在悬空父节点');
   }
-
-  // 重建 orders：
-  //   - parentId 若指向被合并的文件夹，则替换为其保留 id（避免悬空父）
-  //   - ids 中指向被合并 id 的替换为保留 id，并去重、过滤悬空
-  //   - 同 (parentId) 的多条 order 合并为一条（ids 拼接去重）
-  const orderMap = new Map(); // 保留 parentId -> ids[]
+  const orderMap = new Map();
   for (const o of orders) {
-    const parentResolved = alias.get(o.parentId) || o.parentId;
-    const seen = new Set(orderMap.get(parentResolved) || []);
-    const ids = orderMap.get(parentResolved) || [];
-    for (const id of (o.ids || [])) {
-      const resolved = alias.get(id) || id;
-      if (!byId.has(resolved) && !keptFolders.some(f => f.id === resolved) && !keptItems.some(i => i.id === resolved)) continue;
-      if (seen.has(resolved)) continue;
+    const parentId = resolve(o.parentId);
+    if (parentId !== null && !folderIds.has(parentId)) continue;
+    if (!orderMap.has(parentId)) orderMap.set(parentId, { ...o, parentId, ids: [] });
+    const order = orderMap.get(parentId);
+    const seen = new Set(order.ids);
+    for (const id of o.ids || []) {
+      const resolved = resolve(id);
+      const node = kept.get(resolved);
+      if (!node || node.parentId !== parentId || seen.has(resolved)) continue;
       seen.add(resolved);
-      ids.push(resolved);
+      order.ids.push(resolved);
     }
-    orderMap.set(parentResolved, ids);
   }
-  const keptOrders = [];
-  for (const [parentId, ids] of orderMap.entries()) {
-    keptOrders.push({ type: 'bookmark-order', parentId, ids, updatedAt: new Date().toISOString(), updatedBy: 'aira-bookmark-manager', revision: 1 });
-  }
-
-  return { folders: keptFolders, items: keptItems, orders: keptOrders };
+  return { folders: keptFolders, items: keptItems, orders: [...orderMap.values()] };
 }
 
 // ====== 桥接：将变更 patch 进 snapshot.json ======
 // 增量原则（与 Aira 同步语义一致）：
 //   - WebDAV 上已有的 snapshot.json 是「对方权威源」，原样保留其所有节点与字段（含 aira_ 前缀、扩展属性等）
 //   - 桌面端 mergedList 中、按 pathKey 判重后「对方没有」的节点，才追加进 snapshot
-//   - 绝不重建/覆盖对方节点，也不删除对方任何节点
+//   - 保留端上独有节点与原生字段；只传播已有墓碑明确证明的删除
 async function patchAiraFile(mergedList, opts = {}) {
   // rebuild 模式：忽略手机端已有节点，以桌面 mergedList 全量重建 snapshot。
   // 用于清理历史镜像/残留（Aira 文件曾因"只增不减"策略积累到 300+ 节点）。
@@ -628,80 +638,34 @@ async function patchAiraFile(mergedList, opts = {}) {
   // 没有的节点（历史镜像/残留），桌面独有节点随后由统一增量追加逻辑补齐。
   // Validate before deduplication and before any remote write.
   airaSnapshotToList(prev);
-  let folders, items, orders;
-  let prevList;
-  // 实际写入 snapshot 的节点（扁平表示）：供回写日志的四区统计使用
-  let writtenFlatList = [];
-  // 保留节点的 id 集（函数级：out 构建时用于墓碑冲突过滤，两个分支都会赋值）
-  let keptIds;
-  if (rebuild) {
-    const snapList = airaSnapshotToList({ snapshot: { bookmarkFolders: snap.bookmarkFolders || [], bookmarkItems: snap.bookmarkItems || [], bookmarkOrders: snap.bookmarkOrders || [] } });
-    const snapPKs = computePathKeys(snapList);
-    const deskPKSet = new Set(computePathKeys(mergedList).values());
-
-    // 原生节点 id → snapList id（根容器在 snapList 中被归一为 browser_root_*）
-    const rawToSnapId = new Map();
-    for (const f of (snap.bookmarkFolders || [])) {
-      const t = String(f.title || '');
-      rawToSnapId.set(String(f.id), t.startsWith('browser_root_') ? t : String(f.id));
-    }
-    for (const it of (snap.bookmarkItems || [])) rawToSnapId.set(String(it.id), String(it.id));
-    const pkOfRaw = (raw) => {
-      const sn = rawToSnapId.get(String(raw.id));
-      const pk = sn ? snapPKs.get(sn) : null;
-      return pk || null;
-    };
-    const isAiraRootId = (id) => String(id).startsWith('browser_root_');
-
-    // 桌面 pathKey 集合中没有的 Aira 节点（历史镜像/残留）一律删除；规范根容器必留
-    folders = (snap.bookmarkFolders || []).filter(f => {
-      if (isAiraRootId(f.id)) return true;
-      const pk = pkOfRaw(f);
-      return !!pk && deskPKSet.has(pk);
-    });
-    items = (snap.bookmarkItems || []).filter(it => {
-      const pk = pkOfRaw(it);
-      return !!pk && deskPKSet.has(pk);
-    });
-
-    keptIds = new Set([...folders, ...items].map(n => String(n.id)));
-    orders = (snap.bookmarkOrders || [])
-      .map(o => ({ ...o, ids: (o.ids || []).filter(id => keptIds.has(String(id))) }))
-      .filter(o => (o.ids || []).length > 0 || isAiraRootId(String(o.parentId)));
-
-    // 对齐后的手机端节点列表：供后续增量追加判重（prevByPK）使用
-    prevList = snapList.filter(n => {
-      const pk = snapPKs.get(String(n.id));
-      return !!pk && deskPKSet.has(pk);
-    });
-    writtenFlatList = prevList;
-  } else {
-    // 0) 对方快照去重/清理：
-    //    手机删除书签后，snapshot 可能残留重复/失效节点，
-    //    同一 pathKey 多份会占住判重坑，导致本地真实书签被误判"已存在"而无法上传。
-    //    这里按 pathKey 去重，并同步修正 bookmarkOrders 的 ids 指向，避免"删后传不进去"。
-    const deduped = dedupeAiraSnapshot(
-      snap.bookmarkFolders || [], snap.bookmarkItems || [], snap.bookmarkOrders || []
-    );
-    folders = deduped.folders;
-    items = deduped.items;
-    orders = deduped.orders;
-    keptIds = new Set([...folders, ...items].map(n => String(n.id)));
-    // 1) 以对方节点为基准建 pathKey 索引（原样保留，不重建）
-    // 注意：原始 Aira snapshot 节点用 type='bookmark-folder' 而非 isFolder，
-    // 直接用 raw nodes 会导致 computePathKeys 把文件夹误判为叶子，pathKey 全错，
-    // 结果每次写回都重复创建已存在的文件夹，Aira 文件越点越多。
-    prevList = airaSnapshotToList({ snapshot: { bookmarkFolders: folders, bookmarkItems: items, bookmarkOrders: orders } });
-    writtenFlatList = prevList;
-  }
-  const prevByPK = buildPathKeyMap(prevList);
+  let { folders, items, orders } = dedupeAiraSnapshot(
+    snap.bookmarkFolders || [], snap.bookmarkItems || [], snap.bookmarkOrders || []);
+  const phoneList = airaSnapshotToList({ snapshot: { bookmarkFolders: folders, bookmarkItems: items } });
+  const phoneKeys = computePathKeys(phoneList);
   const mergedPKs = computePathKeys(mergedList);
-
-  // URL 兜底去重集：Aira 已存在相同 URL 的书签（可能路径不同）→ 写回时不再重复写入，
-  // 否则桌面端 Chrome 树会被整棵镜像进 Aira 文件、越攒越大（用户侧表现为 Aira 数量暴涨到 700+）。
-  const normUrl = (u) => (u || '').replace(/&amp;/g, '&').replace(/\/$/, '');
-  const prevUrlSet = new Set(items.filter(n => n.url).map(n => normUrl(n.url)));
-  const prevItemsByUrl = new Map(items.filter(n => n.url).map(n => [normUrl(n.url), n]));
+  const deskKeys = new Set(mergedPKs.values());
+  const state = await MiniSync.utils.readLocalKeys(['sync_tombstones']);
+  const deletionKeys = new Set((state.sync_tombstones || []).map(t => typeof t === 'string' ? t : t && t.key));
+  const rootNames = new Set(['browser_root_toolbar', 'browser_root_other', 'browser_root_mobile']);
+  const rawById = new Map([...folders, ...items].map(n => [n.id, n]));
+  const removed = new Set();
+  for (const node of rawById.values()) {
+    if (rootNames.has(node.id) || rootNames.has(node.title)) continue;
+    const pk = phoneKeys.get(node.id);
+    if (pk && !deskKeys.has(pk) && (rebuild || deletionKeys.has(pk))) removed.add(node.id);
+  }
+  // An unobserved phone child is not covered by an old parent deletion.
+  for (const node of rawById.values()) {
+    if (removed.has(node.id)) continue;
+    let parent = rawById.get(node.parentId);
+    while (parent) { removed.delete(parent.id); parent = rawById.get(parent.parentId); }
+  }
+  folders = folders.filter(n => !removed.has(n.id));
+  items = items.filter(n => !removed.has(n.id));
+  orders = orders.filter(o => !removed.has(o.parentId))
+    .map(o => ({ ...o, ids: (o.ids || []).filter(id => !removed.has(id)) }));
+  const prevList = airaSnapshotToList({ snapshot: { bookmarkFolders: folders, bookmarkItems: items } });
+  const prevByPK = buildPathKeyMap(prevList);
 
   // 系统根容器（书签栏/其他书签/移动收藏夹）在桌面端树里也是节点，
   // 需映射到 Aira 根容器 id，作为新建节点的父。
@@ -710,88 +674,63 @@ async function patchAiraFile(mergedList, opts = {}) {
     other: 'browser_root_other',
     mobile: 'browser_root_mobile'
   };
-  const rootContainerMap = new Map(); // 桌面端根容器节点 id → Aira 根容器 id
+  for (const [source, canonicalId] of Object.entries(ROOT_AIRA)) {
+    const native = folders.find(n => n.id === canonicalId || n.title === canonicalId);
+    if (native) ROOT_AIRA[source] = native.id;
+  }
+  const rootContainerMap = new Map();
   for (const n of mergedList) {
-    const t = (n.title || '').toLowerCase();
-    if (['书签栏', '书签工具栏', 'bookmarks bar', '其他书签', '其他 bookmark', '移动收藏夹', '移动设备书签'].includes(t)) {
-      const src = n.source === 'other' ? 'other' : n.source === 'mobile' ? 'mobile' : 'bar';
-      rootContainerMap.set(n.id, ROOT_AIRA[src]);
+    if (n.isFolder && !mergedPKs.has(n.id) && n.id !== HOME_FOLDER_ID) {
+      rootContainerMap.set(n.id, ROOT_AIRA[n.source] || ROOT_AIRA.bar);
     }
   }
 
-  // 2) 遍历桌面端节点，按 pathKey 判重，仅追加对方没有的
   const mergedIdToAiraId = new Map();
   const now = new Date().toISOString();
-  const newFolderIds = [];
-  const newItemIds = [];
-
-  function mapParent(pid) {
-    if (!pid) return null;
-    if (mergedIdToAiraId.has(pid)) return mergedIdToAiraId.get(pid);
-    if (rootContainerMap.has(pid)) return rootContainerMap.get(pid);
-    // 兜底：按 source 挂到对应根容器
-    return null;
-  }
-
+  const allocatedIds = new Set([...folders, ...items].map(n => n.id));
+  const additions = [];
+  const idByPath = new Map([...prevByPK].map(([pk, n]) => [pk, n.id]));
   for (const n of mergedList) {
-    // Berry主页（source==='home'）不进 Aira 书签，改走 g2/personalization 的 home_shortcuts；
-    // HOME 容器（id=HOME_FOLDER_ID，source='other'）同样跳过，避免「Berry主页」空文件夹
-    // 被反复创建进 Aira 文件
     if (n.source === 'home' || n.id === HOME_FOLDER_ID) continue;
     const pk = mergedPKs.get(n.id);
     if (!pk) continue;
-    if (prevByPK.has(pk)) {
-      // 对方已有 → 不动，仅记录 id 映射（供子节点挂接）
-      const exist = prevByPK.get(pk);
-      mergedIdToAiraId.set(n.id, exist.id);
-      continue;
+    let id = idByPath.get(pk);
+    if (!id) {
+      let salt = 0;
+      do {
+        id = (n.isFolder ? 'bkf_bookmark_' : 'bkm_bookmark_') +
+          stableSuffix(n.id + now + (++salt) + Math.random());
+      } while (allocatedIds.has(id));
+      allocatedIds.add(id);
+      idByPath.set(pk, id);
+      additions.push(n);
     }
-    // 对方没有 → 新增（仅当不是系统根容器本身）
-    if (rootContainerMap.has(n.id)) continue;
-
-    const isFolder = n.isFolder || n.type === 'bookmark-folder';
-
-    // URL 兜底去重：Aira 已存在相同 URL 的书签（可能路径不同）→ 不重复写入，
-    // 避免桌面端 Chrome 树被整棵镜像进 Aira 文件、越攒越大。
-    if (!isFolder && n.url) {
-      const u = normUrl(n.url);
-      if (prevUrlSet.has(u)) {
-        const exist = prevItemsByUrl.get(u);
-        mergedIdToAiraId.set(n.id, exist ? exist.id : null);
-        continue;
-      }
-      prevUrlSet.add(u);
+    mergedIdToAiraId.set(n.id, id);
+  }
+  function mapParent(pid) {
+    return mergedIdToAiraId.get(pid) || rootContainerMap.get(pid) || null;
+  }
+  function rootFor(n) {
+    const source = (mergedPKs.get(n.id) || 'ROOT:bar').split('/')[0].slice(5);
+    const id = ROOT_AIRA[source] || ROOT_AIRA.bar;
+    if (!folders.some(f => f.id === id)) {
+      folders.push({ id, type: 'bookmark-folder', parentId: null,
+        title: { bar: '书签栏', other: '其他书签', mobile: '移动收藏夹' }[source] || '书签栏',
+        createdAt: now, updatedAt: now, updatedBy: 'aira-bookmark-manager', revision: 1 });
     }
-
-    const newId = (isFolder ? 'bkf_bookmark_' : 'bkm_bookmark_') +
-      stableSuffix(n.id + (isFolder ? 'F' : 'I') + Date.now() + Math.random());
-    mergedIdToAiraId.set(n.id, newId);
-
-    let parentId = mapParent(n.parentId);
-    if (!parentId) {
-      // 兜底挂到 source 对应根容器（默认 bar）
-      const src = n.source === 'other' ? 'other' : n.source === 'mobile' ? 'mobile' : 'bar';
-      parentId = ROOT_AIRA[src];
-    }
-
+    return id;
+  }
+  // Allocate every ID before wiring parents; input order need not be parent-first.
+  for (const n of additions) {
     const base = {
-      id: newId,
-      type: isFolder ? 'bookmark-folder' : 'bookmark-item',
-      parentId: parentId,
-      title: n.title || '',
-      createdAt: n.createdAt || now,
-      updatedAt: now,
-      updatedBy: 'aira-bookmark-manager',
-      revision: 1
+      id: mergedIdToAiraId.get(n.id),
+      type: n.isFolder ? 'bookmark-folder' : 'bookmark-item',
+      parentId: mapParent(n.parentId) || rootFor(n),
+      title: n.title || '', createdAt: n.createdAt || now, updatedAt: now,
+      updatedBy: 'aira-bookmark-manager', revision: 1
     };
-    if (isFolder) {
-      folders.push(base);
-      newFolderIds.push(newId);
-    } else {
-      base.url = n.url || '';
-      items.push(base);
-      newItemIds.push(newId);
-    }
+    if (n.isFolder) folders.push(base);
+    else items.push({ ...base, url: n.url || '' });
   }
 
   // 3) 更新 bookmarkOrders：把新增节点挂到对应父的顺序组末尾
@@ -803,21 +742,10 @@ async function patchAiraFile(mergedList, opts = {}) {
     }
     if (!ord.ids.includes(id)) ord.ids.push(id);
   }
-  // 遍历新建节点，按映射后的 parentId 追加到顺序组
-  for (const n of mergedList) {
-    if (n.source === 'home') continue;
-    if (!mergedIdToAiraId.has(n.id)) continue;
-    const pk = mergedPKs.get(n.id);
-    if (!pk || prevByPK.has(pk)) continue; // 只处理新增
-    if (rootContainerMap.has(n.id)) continue;
-    const isFolder = n.isFolder || n.type === 'bookmark-folder';
-    const newId = mergedIdToAiraId.get(n.id);
-    let parentId = mapParent(n.parentId);
-    if (!parentId) {
-      const src = n.source === 'other' ? 'other' : n.source === 'mobile' ? 'mobile' : 'bar';
-      parentId = ROOT_AIRA[src];
-    }
-    ensureOrder(parentId, newId);
+  const writtenById = new Map([...folders, ...items].map(n => [n.id, n]));
+  for (const n of additions) {
+    const written = writtenById.get(mergedIdToAiraId.get(n.id));
+    ensureOrder(written.parentId, written.id);
   }
 
   // 3.5) ★ 顺序以桌面为权威：按 mergedList 同父出现顺序（Chrome 树 DFS，文件夹与
@@ -830,13 +758,9 @@ async function patchAiraFile(mergedList, opts = {}) {
     if (rootContainerMap.has(n.id)) continue; // 系统根容器不进顺序组
     const aid = mergedIdToAiraId.get(n.id);
     if (!aid) continue;
-    let airaPid = mapParent(n.parentId);
-    if (!airaPid) {
-      const src = n.source === 'other' ? 'other' : n.source === 'mobile' ? 'mobile' : 'bar';
-      airaPid = ROOT_AIRA[src];
-    }
+    const airaPid = writtenById.get(aid).parentId;
     if (!deskOrderGroups.has(airaPid)) deskOrderGroups.set(airaPid, []);
-    deskOrderGroups.get(airaPid).push(aid);
+    if (!deskOrderGroups.get(airaPid).includes(aid)) deskOrderGroups.get(airaPid).push(aid);
   }
   for (const ord of orders) {
     const deskIds = deskOrderGroups.get(ord.parentId);
@@ -847,9 +771,11 @@ async function patchAiraFile(mergedList, opts = {}) {
   }
 
   // 4) 写回：version/history/deviceId/createdAt 原样沿用，仅重算 commitId、parentCommitId 固定 null
-  const devSuffix = stableSuffix(prev.deviceId).slice(0, 6);
-  const prevSnap = prev.snapshot || {};
+  const devSuffix = stableSuffix(prev.deviceId || '').slice(0, 6);
+  const prevSnap = snap;
+  const keptIds = new Set(writtenById.keys());
   const out = {
+    ...prev,
     version: prev.version,
     history: prev.history,
     commitId: Date.now().toString(36) + '--' + Date.now().toString(36) + '-' + devSuffix + '-' + rand36(),
@@ -857,6 +783,7 @@ async function patchAiraFile(mergedList, opts = {}) {
     deviceId: prev.deviceId,
     createdAt: prev.createdAt || new Date().toISOString(),
     snapshot: {
+      ...prevSnap,
       // ★ generatedAt 必须随每次写回更新（沿用旧值会被移动端视为过期的提交）
       meta: { ...(prevSnap.meta || { version: 2, deviceId: prev.deviceId }), generatedAt: new Date().toISOString() },
       bookmarkFolders: folders,
@@ -871,9 +798,19 @@ async function patchAiraFile(mergedList, opts = {}) {
     }
   };
 
+  const writtenFlatList = airaSnapshotToList(out);
+  for (const order of orders) {
+    if (order.parentId != null && !folders.some(n => n.id === order.parentId)) throw new Error('Aira 顺序表父节点不存在');
+    if (new Set(order.ids).size !== order.ids.length || order.ids.some(id =>
+      !writtenById.has(id) || writtenById.get(id).parentId !== order.parentId)) {
+      throw new Error('Aira 顺序表包含无效子节点引用');
+    }
+  }
   await uploadAiraBookmarks(out);
+  const snapshotUpdates = await MiniSync.berry.bridgeIdentity.snapshotUpdates('aira_pathkey_snapshot',
+    (await MiniSync.utils.airaResourceUrls()).g3, writtenFlatList);
   console.log(`[sync] 🤖 Aira 回写完成: ${zoneSummary(writtenFlatList, { includeHome: false })}`);
-  return { status: 'success' };
+  return { status: 'success', snapshotUpdates };
 }
 
 // ====== 从 Aira 文件读取变更并合并 ======
@@ -883,310 +820,52 @@ async function mergeAiraData(currentList, preferLocalOrder = false, tombstoneKey
   return result.list;
 }
 
-async function mergeAiraDataWithChanges(currentList, preferLocalOrder = false, tombstoneKeys = null) {
-  const changes = { list: currentList, deletedIds: [], deletedPathKeys: [], complete: true, errors: [] };
-  let airaData;
+async function mergeAiraDataWithChanges(currentList, preferLocalOrder = false, tombstoneKeys = null, bridgeContext = null) {
   try {
-    airaData = await downloadAiraBookmarks();
+    const airaData = await downloadAiraBookmarks();
     if (!airaData) throw new Error('Aira 文件不存在');
-    if (!airaGetSnapshotContainer(airaData) || !Array.isArray(airaGetSnapshotContainer(airaData).bookmarkFolders)) {
-      throw new Error('Aira 快照格式无效');
-    }
-    const airaList = airaSnapshotToList(airaData);
-    if (airaList.length === 0) throw new Error('Aira 根容器缺失');
-    return await mergeAiraValidated(currentList, airaList, tombstoneKeys, changes);
-  } catch (e) {
-    changes.complete = false;
-    changes.errors.push(e.message);
-    return changes;
-  }
-}
-
-async function mergeAiraValidated(currentList, airaList, tombstoneKeys, changes) {
-  const originalList = currentList;
-  let homePKSet = null;
-  // ★ 删除快照绑定所属文件（同 Berry/Via）：只换 Aira 目录时不得复用旧快照。
-  const airaOwner = (await MiniSync.utils.airaResourceUrls()).g3;
-
-  // 0. 从 Aira personalization（g2）读 home_shortcuts，合并回 Berry主页（source==='home'）
-  try {
+    const snap = airaGetSnapshotContainer(airaData);
+    if (!snap || !Array.isArray(snap.bookmarkFolders)) throw new Error('Aira 快照格式无效');
+    const phoneList = airaSnapshotToList(airaData);
+    if (!phoneList.length) throw new Error('Aira 根容器缺失');
+    const owner = await MiniSync.utils.airaResourceUrls();
+    // Validate both resources before exposing ANY deletion/identity plan.
     const pers = await downloadAiraPersonalization();
+    let homeNodes = null;
     if (pers !== null) {
-      const scs = pers && pers.sections && pers.sections.home_shortcuts && pers.sections.home_shortcuts.payload && pers.sections.home_shortcuts.payload.shortcuts;
-      if (!Array.isArray(scs)) throw new Error('Aira 主页快照格式无效');
-      homePKSet = new Set();
-      for (const sc of scs) {
+      const shortcuts = pers && pers.sections && pers.sections.home_shortcuts && pers.sections.home_shortcuts.payload && pers.sections.home_shortcuts.payload.shortcuts;
+      if (!Array.isArray(shortcuts)) throw new Error('Aira 主页快照格式无效');
+      homeNodes = shortcuts.map(sc => {
         if (!sc || typeof sc.url !== 'string' || !sc.url) throw new Error('Aira 主页书签格式无效');
-        const node = { id: sc.id || ('shortcut-' + stableSuffix(sc.url)), title: sc.title || '', url: sc.url, isFolder: false, parentId: HOME_FOLDER_ID, source: 'home' };
-        homePKSet.add(computePathKeys([node]).get(node.id));
-      }
-      const owner = await MiniSync.utils.airaResourceUrls();
-      const previousHome = await MiniSync.utils.readScopedBridgeSnapshot('aira_home_pathkey_snapshot', owner.g2);
-      const currentHomePKs = computePathKeys(currentList);
-      for (const n of currentList) {
-        const pk = currentHomePKs.get(n.id);
-        if (n.source === 'home' && pk && previousHome.includes(pk) && !homePKSet.has(pk)) {
-          changes.deletedIds.push(n.id);
-          changes.deletedPathKeys.push(pk);
-        }
-      }
-      if (changes.deletedIds.length) currentList = currentList.filter(n => !changes.deletedIds.includes(n.id));
-      changes.snapshotUpdates = { ...(changes.snapshotUpdates || {}),
-        ...MiniSync.utils.scopedBridgeSnapshotUpdate('aira_home_pathkey_snapshot', owner.g2, [...homePKSet]) };
-      // ★ 归一化匹配：http/https、www.、尾斜杠差异视为同一主页书签。
-      //   此前精确 toLowerCase 匹配导致 personalization 的历史条目（协议/斜杠略异）
-      //   每次都被误判为「主页新增」注入，home 区数量逐轮膨胀（曾在手机端出现成对重复）。
-      const localUrls = new Set(currentList.filter(n => n.source === 'home' && n.url).map(n => normalizeUrlForDedup(n.url)));
-      const homeNodes = [];
-      for (const sc of scs) {
-        if (!sc.url || localUrls.has(normalizeUrlForDedup(sc.url))) continue;
-        const homeNode = { id: sc.id || ('shortcut-' + stableSuffix(sc.url)), title: sc.title || '', url: sc.url || '', isFolder: false, parentId: HOME_FOLDER_ID, source: 'home' };
-        const homePK = computePathKeys([homeNode]).get(homeNode.id);
-        if (tombstoneKeys && tombstoneKeys.has(homePK)) continue;
-        localUrls.add(normalizeUrlForDedup(sc.url));
-        homeNodes.push({
-          id: sc.id || ('shortcut-' + stableSuffix(sc.url)),
-          title: sc.title || '',
-          url: sc.url || '',
-          isFolder: false,
-          parentId: HOME_FOLDER_ID,
-          source: 'home'
-        });
-      }
-      if (homeNodes.length > 0) {
-        // ★ 禁止原地修改传入数组：currentList 可能与调用方的列表同引用
-        //   （如 mergeViaData 无新增时原样返回 flatList），原地 push 会把 Aira 的
-        //   home 节点污染进其他桥接的回写列表（曾导致 Via 回写凭空多出 11 条）。
-        const needHomeContainer = !currentList.some(n => n.id === HOME_FOLDER_ID);
-        currentList = needHomeContainer
-          ? [...currentList, { id: HOME_FOLDER_ID, title: 'Berry主页', isFolder: true, parentId: 'root', source: 'other' }, ...homeNodes]
-          : [...currentList, ...homeNodes];
-      }
+        return { id: sc.id || ('shortcut-' + stableSuffix(sc.url)), title: sc.title || '', url: sc.url,
+          isFolder: false, parentId: HOME_FOLDER_ID, source: 'home', createdAt: sc.createdAt, updatedAt: sc.updatedAt };
+      });
     }
-  } catch (e) {
-    changes.complete = false;
-    changes.errors.push(e.message);
-    changes.list = originalList;
-    changes.deletedIds = [];
-    changes.deletedPathKeys = [];
-    delete changes.snapshotUpdates;
+    const identity = MiniSync.berry.bridgeIdentity;
+    const changes = await identity.merge({ kind: 'aira', storageKey: 'aira_pathkey_snapshot', owner: owner.g3,
+      currentList, phoneList, tombstoneKeys, context: bridgeContext });
+    if (homeNodes !== null) {
+      let input = changes.list;
+      if (homeNodes.length && !input.some(n => n.id === HOME_FOLDER_ID)) {
+        input = [...input, { id: HOME_FOLDER_ID, title: 'Berry主页', isFolder: true, parentId: ROOT_ID, source: 'other' }];
+      }
+      const data = bridgeContext || await MiniSync.utils.readLocalKeys(['sync_tombstones', 'sync_tombstone_acked']);
+      const revoked = new Set(changes.revokedTombstones.map(identity.versionKey));
+      const remaining = (data.tombstones || data.sync_tombstones || []).filter(t => !revoked.has(identity.versionKey(t)));
+      const homeKeys = tombstoneKeys ? new Set([...tombstoneKeys].filter(key => !changes.revokedPathKeys.includes(key))) : null;
+      const home = await identity.merge({ kind: 'aira_home', storageKey: 'aira_home_pathkey_snapshot', owner: owner.g2,
+        currentList: input, phoneList: homeNodes, tombstoneKeys: homeKeys,
+        context: { tombstones: remaining, ackedPathKeys: data.ackedPathKeys || data.sync_tombstone_acked || [] } });
+      for (const key of ['deletedIds', 'deletedPathKeys', 'revokedPathKeys', 'revokedTombstones', 'pathRemaps']) changes[key].push(...home[key]);
+      changes.changed = changes.changed || home.changed;
+      changes.list = home.list;
+      Object.assign(changes.snapshotUpdates, home.snapshotUpdates);
+    }
+    console.log(`[sync] Aira 处理完成: ${zoneSummary(changes.list)}`);
     return changes;
+  } catch (e) {
+    return { list: currentList, deletedIds: [], deletedPathKeys: [], complete: false, errors: [e.message] };
   }
-
-  // 建立 source → 本地 Chrome 根容器 id 的映射
-  // 优先用 Chrome 标准根 id（'1'/'2'/'3'）识别，若用户浏览器根 id 被改写，
-  // 再用系统根标题兜底，避免被 parentId='root' 的污染节点覆盖。
-  const CHROME_ROOT_IDS = new Set(['1', '2', '3']);
-  const isRealRootContainer = (n) => {
-    if (!n.isFolder) return false;
-    // ★ home 虚拟容器（移动端主页）：id 稳定不依赖标题，等同系统容器不可删/不可过滤
-    if (String(n.id) === String(HOME_FOLDER_ID)) return true;
-    if (CHROME_ROOT_IDS.has(String(n.id))) return true;
-    const isParentRoot = n.parentId === ROOT_ID || n.parentId === null || n.parentId === '0';
-    const srcByTitle = detectFolderSourceByTitle(n.title);
-    return isParentRoot && !!srcByTitle && srcByTitle !== 'home';
-  };
-  const sourceToRootId = new Map();
-  for (const n of currentList) {
-    if (!isRealRootContainer(n)) continue;
-    const src = n.source || detectFolderSourceByTitle(n.title);
-    if (!src || src === 'home') continue;
-    // 同一 source 只取第一个，避免污染节点覆盖
-    if (!sourceToRootId.has(src)) sourceToRootId.set(src, n.id);
-  }
-  // 兜底：若按标题/父级未识别到根容器（比如 Berry/Via 合并后改写了根标题），
-  // 直接以 Chrome 标准根 id '1'/'2'/'3' 建立映射，避免后续 rootIdMap 为空导致
-  // Aira 整棵树的 pathKey 偏移，所有节点被误判为新增。
-  if (sourceToRootId.size === 0) {
-    // Chrome/Edge 根容器 id 固定为 '1'/'2'/'3'，直接用做兜底映射，
-    // 避免 currentList 缺少根容器时 rootIdMap 为空、Aira 整树变孤儿。
-    sourceToRootId.set('bar', '1');
-    sourceToRootId.set('other', '2');
-    sourceToRootId.set('mobile', '3');
-  }
-  function detectFolderSourceByTitle(title) {
-    const t = (title || '').toLowerCase();
-    const titles = typeof FOLDER_TITLES !== 'undefined' ? FOLDER_TITLES : null;
-    if (!titles) return null;
-    if (titles.bookmarkBar.some(x => x.toLowerCase() === t)) return 'bar';
-    if (titles.otherBookmarks.some(x => x.toLowerCase() === t)) return 'other';
-    if (titles.mobileBookmarks.some(x => x.toLowerCase() === t)) return 'mobile';
-    return null;
-  }
-
-  // Aira 根容器 id → source，用于把 Aira 整棵树的根容器 id 替换为本地 Chrome 根容器 id
-  const AIRA_ROOT_IDS = new Map([
-    ['browser_root_toolbar', 'bar'],
-    ['browser_root_other', 'other'],
-    ['browser_root_mobile', 'mobile']
-  ]);
-  const STANDARD_ROOT_TITLES = { bar: '书签栏', other: '其他收藏夹', mobile: '移动收藏夹' };
-
-  // 规范化 Aira 列表：把 Aira 根容器 id 和直接挂在根下的 parentId 替换为本地根容器 id，
-  // 使 Aira 子节点的 pathKey 与本地 Chrome 完全一致（ROOT:bar/...），避免父文件夹重复注入和子节点变孤儿
-  const rootIdMap = new Map();
-  for (const [airaId, source] of AIRA_ROOT_IDS) {
-    const localId = sourceToRootId.get(source);
-    if (localId) rootIdMap.set(airaId, localId);
-  }
-  const normalizedAiraList = airaList.map(n => {
-    const copy = { ...n };
-    const selfSource = AIRA_ROOT_IDS.get(copy.id);
-    if (selfSource) {
-      const localId = rootIdMap.get(copy.id);
-      if (localId) {
-        copy.id = localId;
-        copy.parentId = ROOT_ID;
-        copy.title = STANDARD_ROOT_TITLES[selfSource] || copy.title;
-      }
-    }
-    if (rootIdMap.has(copy.parentId)) {
-      copy.parentId = rootIdMap.get(copy.parentId);
-    }
-    return copy;
-  });
-
-  const airaPKs = computePathKeys(normalizedAiraList);
-  const currentPKs = computePathKeys(currentList);
-  const airaByPK = buildPathKeyMap(normalizedAiraList);
-  const currentPKSet = new Set(currentPKs.values());
-
-  // 1. 继承图标/颜色
-  let enriched = currentList.map(n => {
-    const pk = currentPKs.get(n.id);
-    if (!pk) return n;
-    const a = airaByPK.get(pk);
-    if (a) {
-      const copy = { ...n };
-      if (a.favicon && !copy.favicon) copy.favicon = a.favicon;
-      if (a.color && !copy.color) copy.color = a.color;
-      return copy;
-    }
-    return n;
-  });
-
-  // 2. Aira 新增节点（pathKey 不在本地）
-  // 必须用 normalizedAiraList，否则 parentId 还是 Aira 原始根 id（browser_root_toolbar），
-  // 而 airaPKs 的 key 已经是本地根 id（'1'/'195'），会映射失败 fallback 到 'root'。
-  function getParentPath(pk) {
-    if (!pk) return '';
-    const i = pk.lastIndexOf('/');
-    return i > 0 ? pk.substring(0, i) : pk;
-  }
-  // URL 兜底去重集：Air 里大量节点其实是 Chrome 的镜像（URL 相同但路径不同），
-  // pathKey 按完整路径严格匹配会失败，若不兜底就会反复注入，撑大数量。
-  const curUrlSet = new Set(currentList.filter(n => !n.isFolder && n.url).map(n => (n.url || '').replace(/&amp;/g, '&').replace(/\/$/, '')));
-  const airaNew = normalizedAiraList.filter(n => {
-    const pk = airaPKs.get(n.id);
-    if (!pk || currentPKSet.has(pk)) return false;
-    if (tombstoneKeys && tombstoneKeys.has(pk)) return false;
-    // 兜底：Chrome 已存在相同 URL 的书签 → 视为重复，避免 Aira 里的镜像重复回灌
-    if (!n.isFolder && n.url) {
-      const u = (n.url || '').replace(/&amp;/g, '&').replace(/\/$/, '');
-      if (curUrlSet.has(u)) return false;
-    }
-    return true;
-  });
-
-  // 3. Aira 删除检测（pathKey 快照）
-  const airaPKSet = new Set(airaPKs.values());
-  // 对方节点的 URL / 文件夹标题集合：识别「父改名/移动导致 pathKey 变了，但并非真删」
-  const airaUrlSet = new Set(
-    airaList.filter(n => !n.isFolder && n.url).map(n => n.url.replace(/&amp;/g, '&').replace(/\/$/, ''))
-  );
-  const airaFolderTitles = new Set(
-    airaList.filter(n => n.isFolder).map(n => n.title)
-  );
-  const snapshotData = await MiniSync.utils.readScopedBridgeSnapshot('aira_pathkey_snapshot', airaOwner);
-  const airaSnapshotSet = new Set(snapshotData);
-  let airaDeletedCount = 0;
-  if (changes.complete && airaSnapshotSet.size > 0) {
-    enriched = enriched.filter(n => {
-      // 本地 Chrome 根容器是系统容器，Aira 不能删除，必须保留（id='1'/'2'/'3' 或系统根标题）
-      if (isRealRootContainer(n)) return true;
-      const pk = currentPKs.get(n.id);
-      if (!pk) return true;
-      // 上次快照有、本次没有 → 疑似 Aira 删了
-      if (airaSnapshotSet.has(pk) && !airaPKSet.has(pk)) {
-        // 改名/移动兜底：URL（书签）或标题（文件夹）仍存在于对方 → 只是路径变了，不是真删
-        if (!n.isFolder && n.url) {
-          const u = n.url.replace(/&amp;/g, '&').replace(/\/$/, '');
-          if (airaUrlSet.has(u)) return true;
-        }
-        if (n.isFolder && n.title && airaFolderTitles.has(n.title)) return true;
-        airaDeletedCount++;
-        changes.deletedIds.push(n.id);
-        changes.deletedPathKeys.push(pk);
-        return false; // Aira 真删了
-      }
-      return true;
-    });
-  }
-  if (changes.complete) changes.snapshotUpdates = { ...(changes.snapshotUpdates || {}),
-    ...MiniSync.utils.scopedBridgeSnapshotUpdate('aira_pathkey_snapshot', airaOwner, [...airaPKSet]) };
-
-  // ===== 4. 组装结果（保持输入数组顺序，仅追加 Aira 新增） =====
-  const combined = [...enriched];
-  // 按 pathKey 深度升序排序，确保父文件夹先于子节点注入（避免子节点找不到父而变孤儿）
-  const airaNewSorted = [...airaNew].sort((x, y) => {
-    const px = (airaPKs.get(x.id) || '').split('/').length;
-    const py = (airaPKs.get(y.id) || '').split('/').length;
-    return px - py;
-  });
-  for (const a of airaNewSorted) {
-    // 映射 parentId 到当前列表中的节点 id
-    let mappedParent = a.parentId;
-
-    // 0. 直接挂在虚拟根（'root'）下的节点，按 source 归到对应本地真实根容器
-    if (mappedParent === ROOT_ID) {
-      const srcRootId = sourceToRootId.get(a.source);
-      if (srcRootId) mappedParent = srcRootId;
-    }
-
-    const parentPK = airaPKs.get(mappedParent);
-
-    // 1. Aira 内部层级：父文件夹也是本次新增的，已先加入 combined，直接按 id 保留
-    if (combined.some(n => String(n.id) === String(mappedParent))) {
-      // mappedParent 已是 combined 中有效 id，保持不变
-    } else if (parentPK) {
-      // 2. 映射到本地已存在的节点
-      const cur = currentList.find(n => currentPKs.get(n.id) === parentPK);
-      if (cur) mappedParent = cur.id;
-    }
-    // 兜底：如果 still 找不到父，按 source 归到对应本地真实根，绝不 fallback 到虚拟 'root'
-    const isOrphan = mappedParent &&
-      !combined.some(n => String(n.id) === String(mappedParent)) &&
-      !currentList.some(n => String(n.id) === String(mappedParent));
-    if (isOrphan) {
-      const fallbackRoot = sourceToRootId.get(a.source);
-      if (fallbackRoot) mappedParent = fallbackRoot;
-    }
-    combined.push({ ...a, parentId: mappedParent });
-  }
-
-  // ★ 顺序以合并链数组为权威（桌面顺序）：不再按 Aira bookmarkOrders 重排——
-  //    回写时 patchAiraFile 已把端上 orders 重排为桌面顺序，这里若再按端上旧 orders
-  //    重排数组，会把 Berry/Via 刚传播来的新顺序打回旧序（表现为「一端调整顺序后
-  //    另一端合并顺序不变」）。仅保留原有的系统容器兜底与 pk 过滤，顺序保持输入。
-  const result = [];
-  for (const n of combined) {
-    const srcByTitle = detectFolderSourceByTitle(n.title);
-    // ★ home 虚拟容器用 id 判定保留（旧硬编码 n.title === 'Berry主页' 在改名
-    //   「移动端主页」后失配，导致容器被本过滤丢弃 → home 子节点变孤儿 → 落到书签栏）
-    const isSystemContainer = isRealRootContainer(n) || (n.isFolder && n.parentId === ROOT_ID && srcByTitle && srcByTitle !== 'home') || n.title === 'Berry主页' || String(n.id) === String(HOME_FOLDER_ID);
-    if (!isSystemContainer) {
-      const pk = currentPKs.get(n.id);
-      const aPk = airaPKs.get(n.id);
-      if (!(aPk || pk)) continue; // 与原逻辑一致：无 pathKey 的节点不进入结果
-    }
-    result.push(n);
-  }
-
-  // Aira 新增节点（来自 snapshot 解析）无 _index → 补到同父已有节点之后
-  MiniSync.utils.fillMissingSiblingIndex(result);
-  console.log(`[sync] 🤖 Aira 处理完成: ${zoneSummary(result)}`);
-  changes.list = result;
-  return changes;
 }
 
 // 构建 pathKey → 节点 映射

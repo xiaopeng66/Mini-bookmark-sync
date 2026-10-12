@@ -82,7 +82,8 @@ describe('audit action partial logs', () => {
 });
 
 test('startup restores the actual saved backup and preserves it when recovery has conflicts', async () => {
-  const state = { local_bookmark_backup: [{ id: '0', children: [] }] };
+  const state = { local_bookmark_backup: [{ id: '0', children: [] }],
+    local_bookmark_backup_meta: { id: 'unfinished', status: 'pending' } };
   let restores = 0;
   const ctx = { console, MiniSync: { storage: {
     async getLocal(keys) { return Object.fromEntries(keys.filter(k => k in state).map(k => [k, state[k]])); },

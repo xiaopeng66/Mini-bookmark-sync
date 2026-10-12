@@ -4,7 +4,7 @@
 MiniSync.xbelPath = (function() {
 
 /** 从扁平 JSON 书签列表计算 pathKey（原 computePathKeys 的代理） */
-function computeJsonPathKeys(bookmarks) {
+function computeJsonPathKeys(bookmarks, legacyFolderKeys = false) {
   const map = new Map();
   const byId = new Map();
   // 预置虚拟根节点，确保 parentId 指向它们的子节点能正确解析
@@ -14,7 +14,33 @@ function computeJsonPathKeys(bookmarks) {
   // other 区虚拟容器：Berry 端 __other_folder__ 子树的 pathKey 前缀解析为 ROOT:other，
   // 与 Chrome「其他书签」区对齐（与 __mobile_folder__ 的机制对称）
   byId.set(OTHER_FOLDER_ID, { id: OTHER_FOLDER_ID, title: '其他收藏夹', parentId: ROOT_ID, isFolder: true });
-  for (const n of bookmarks) byId.set(n.id, n);
+  const inputIds = new Set();
+  let duplicateIds = false;
+  for (const n of bookmarks) {
+    if (inputIds.has(n.id)) duplicateIds = true;
+    inputIds.add(n.id);
+    byId.set(n.id, n);
+  }
+  const pathCache = new Map();
+  const cycleCache = new Map();
+  const sysRootTitles = new Set([
+    ...FOLDER_TITLES.bookmarkBar, ...FOLDER_TITLES.otherBookmarks, ...FOLDER_TITLES.mobileBookmarks
+  ]);
+  function hasCycle(node) {
+    const visiting = new Set();
+    const traversed = [];
+    let cyclic = false;
+    for (let cur = node; cur && cur.id !== ROOT_ID; cur = byId.get(cur.parentId)) {
+      if (!duplicateIds && cycleCache.has(cur)) { cyclic = cycleCache.get(cur); break; }
+      if (visiting.has(cur.id)) { cyclic = true; break; }
+      visiting.add(cur.id);
+      traversed.push(cur);
+    }
+    // Duplicate IDs historically use the final occurrence as parent, but the
+    // current occurrence as child; that exceptional traversal is not cacheable.
+    if (!duplicateIds) for (const n of traversed) cycleCache.set(n, cyclic);
+    return cyclic;
+  }
 
   // 识别标准浏览器默认文件夹来源（bar/other/mobile/home），避免多系统文件夹
   // 拍扁到同一个 ROOT 导致 pathKey 冲突。
@@ -34,33 +60,30 @@ function computeJsonPathKeys(bookmarks) {
     return MiniSync.xbel.normalizeUrl(url);
   }
 
-  // ★ 路径段转义：pathKey 用 '/' 分隔层级、用 'F:'/'L:' 标记类型，标题里的这些字符
-  //   会让不同拓扑塌成同一个 key —— 字面文件夹「A/F:B」与真实嵌套 A→B 都得到
-  //   `ROOT:bar/F:A/F:B`，合并时被判成同一节点，一棵树被另一棵吞掉
-  //   （审计 2026-10-11 复现 pathDelimiterCollision）。
-  //   ⚠️ 只对**文件夹标题**做转义，且只转义真的会歧义的 `/`：URL 段必须保持原样 ——
-  //   给 URL 加转义会改变所有既有 pathKey，令历史快照与墓碑键全部失效（升级即误删）。
-  //   含 `/` 的文件夹标题此前根本无法正确同步（键必然冲突），因此不存在需要兼容的旧键；
-  //   普通标题逐字节不变。
-  function escapeFolderTitle(value) {
+  // Reserve a distinct type marker only for slash-bearing titles. Ordinary
+  // folder names (including literal %2F) and every URL key remain byte-identical.
+  // Snapshots store titles and recompute keys; legacy tombstones are migrated
+  // separately with tree evidence, never by blindly decoding percent strings.
+  function folderSegment(value) {
     const s = String(value == null ? '' : value);
-    if (!s.includes('/')) return s;
-    return s.replace(/\//g, '%2F');
+    if (legacyFolderKeys) return 'F:' + s.replace(/\//g, '%2F');
+    return s.includes('/') ? 'F~:' + s.replace(/%/g, '%25').replace(/\//g, '%2F') : 'F:' + s;
   }
 
   function buildPath(node) {
+    if (pathCache.has(node)) return pathCache.get(node);
+    const value = buildUncachedPath(node);
+    pathCache.set(node, value);
+    return value;
+  }
+
+  function buildUncachedPath(node) {
     // 根节点统一映射到 ROOT
     if (node.id === ROOT_ID) return 'ROOT';
 
     // 防环：若沿父链回到已访问节点，说明存在循环 parentId（如覆盖版上传的畸形数据），
     // 直接截断返回，避免无限递归卡死整个同步流程（表现为“同步进行中，请稍候”锁不释放）。
-    const visiting = new Set();
-    let cur = node;
-    while (cur && cur.id !== ROOT_ID) {
-      if (visiting.has(cur.id)) return 'ROOT:cyclic';
-      visiting.add(cur.id);
-      cur = byId.get(cur.parentId);
-    }
+    if (hasCycle(node)) return 'ROOT:cyclic';
 
     // Berry 主页虚拟容器 → ROOT:home（唯一化，避免与其它根冲突）
     if (node.id === HOME_FOLDER_ID) return 'ROOT:home';
@@ -86,18 +109,13 @@ function computeJsonPathKeys(bookmarks) {
     // 只判 parentId 会误把普通 folder（如「读书」）也截断成 ROOT:bar，造成 pathKey 冲突。
     // 兼容 null/'0' 是为了处理：云端 XBEL 解码后根容器 parentId 常为 null，
     // 或被污染的旧版数据里 parentId 是 Chrome 真实 browser root id '0'。
-    const sysRootTitles = new Set([
-      ...FOLDER_TITLES.bookmarkBar,
-      ...FOLDER_TITLES.otherBookmarks,
-      ...FOLDER_TITLES.mobileBookmarks,
-    ]);
     const isRootContainer = sysRootTitles.has(node.title) &&
                            (!node.parentId || node.parentId === ROOT_ID || String(node.parentId) === '0');
     if (folderSource && isRootContainer && node.id !== HOME_FOLDER_ID) {
       return folderSource === 'home' ? 'ROOT:home' : `ROOT:${folderSource}`;
     }
 
-    const seg = node.isFolder ? `F:${escapeFolderTitle(node.title)}` : `L:${urlSeg(node.url)}`;
+    const seg = node.isFolder ? folderSegment(node.title) : `L:${urlSeg(node.url)}`;
     const parent = byId.get(node.parentId);
     if (!parent) {
       // 父节点缺失时（典型如 Berry bookmarks.json 没有根容器条目，子节点 parentId 指向一个不存在的 id），
@@ -147,6 +165,25 @@ function computeJsonPathKeys(bookmarks) {
   return map;
 }
 
+/** Evidence-only translation of pre-disambiguation folder keys. No URL decoding. */
+function legacyKeyResolver(lists) {
+  const aliases = new Map();
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    const current = computeJsonPathKeys(list);
+    const legacy = computeJsonPathKeys(list, true);
+    for (const [id, oldPk] of legacy) {
+      if (!aliases.has(oldPk)) aliases.set(oldPk, new Set());
+      aliases.get(oldPk).add(current.get(id));
+    }
+  }
+  return key => {
+    const targets = aliases.get(key);
+    if (!targets) return key; // No evidence: retain the literal key, never decode it.
+    return targets.size === 1 ? [...targets][0] : null; // ambiguous deletion: preserve
+  };
+}
+
 /** 将 XBEL 路径指纹转换为纯字符串数组 */
 function toPathKeyArray(bookmarks) {
   const map = computeJsonPathKeys(bookmarks);
@@ -159,6 +196,7 @@ function toPathKeyArray(bookmarks) {
 
 return {
   computeJsonPathKeys,
+  legacyKeyResolver,
   computePathKeys: computeJsonPathKeys
 };
 

@@ -1379,21 +1379,15 @@ function countLocalBookmarks() {
   });
 }
 
-// 启动崩溃恢复：检测到本地书签为空且存在备份时自动恢复
+// 空树本身不是崩溃证据；只有明确未完成的事务才允许启动恢复。
 async function startupRecovery() {
-  const data = await MiniSync.storage.getLocal([STORAGE_KEYS.LOCAL_BACKUP]);
+  const data = await MiniSync.storage.getLocal([STORAGE_KEYS.LOCAL_BACKUP, 'local_bookmark_backup_meta']);
   const backup = data[STORAGE_KEYS.LOCAL_BACKUP];
-  if (!Array.isArray(backup) || backup.length === 0) return;
-  const currentCount = await countLocalBookmarks();
-  if (currentCount > 0) {
-    return;
-  }
-  console.warn(`[MiniSync] 检测到本地书签为空，正在从备份恢复 ${backup.length} 条书签...`);
-  const restored = await MiniSync.orchestrator.restoreLocalBackup();
-  if (restored && restored.ok && restored.restored > 0 && !(restored.conflicts && restored.conflicts.length)) {
-    // 恢复成功后清理备份，避免下次启动重复恢复同一份数据
-    await MiniSync.storage.removeLocal([STORAGE_KEYS.LOCAL_BACKUP]);
-  }
+  const meta = data.local_bookmark_backup_meta;
+  if (!Array.isArray(backup) || backup.length === 0 || !meta || !['pending', 'restoring', 'failed'].includes(meta.status)) return;
+  if (await countLocalBookmarks() > 0) return;
+  console.warn('[MiniSync] 检测到未完成的本地事务，正在从备份恢复...');
+  await MiniSync.orchestrator.restoreLocalBackup();
 }
 
 // 初始化
@@ -1448,14 +1442,25 @@ async function handleBookmarkRemoved(id, removeInfo) {
     return;
   }
 
-  // 1. 从删除前快照取 pathKey 映射
-  const snapData = await MiniSync.storage.getLocal([STORAGE_KEYS.SNAPSHOTS]);
-  const snapshots = snapData[STORAGE_KEYS.SNAPSHOTS];
-  const prevTree = (snapshots && snapshots.localTree) || [];
-  let prevPKMap = new Map();
-  if (prevTree.length > 0) {
-    prevPKMap = MiniSync.xbelPath.computeJsonPathKeys(prevTree);
-  }
+  // The pending committed baseline may be newer than sync_snapshots after a quota failure.
+  const prevTree = await MiniSync.syncInput.getDeletionBaseline();
+  const prevPKMap = MiniSync.xbelPath.computeJsonPathKeys(prevTree);
+  let removedPKMap = new Map();
+  try {
+    const tree = await MiniSync.syncInput.getChromeTree();
+    const parentId = String(removeInfo.parentId || removeInfo.node.parentId || '');
+    const parent = (function find(node) {
+      if (!node) return null;
+      if (String(node.id) === parentId) return node;
+      for (const child of node.children || []) { const match = find(child); if (match) return match; }
+      return null;
+    })(tree[0]);
+    if (parent && !parent.url) {
+      // Reconstruct only in the detached getTree result; never recreate user deletions in Chrome.
+      parent.children = [...(parent.children || []), removeInfo.node];
+      removedPKMap = MiniSync.xbelPath.computeJsonPathKeys(MiniSync.merger.chromeTreeToList(tree));
+    }
+  } catch (e) { console.warn('[MiniSync] 删除事件路径重建失败:', e.message); }
 
   // 2. 收集被删子树所有节点 id（含子孙）
   const removedIds = [];
@@ -1468,8 +1473,10 @@ async function handleBookmarkRemoved(id, removeInfo) {
   // 3. 取这些 id 在删除前的 pathKey，写入墓碑
   const newlyDeleted = new Set();
   for (const rid of removedIds) {
-    const pk = prevPKMap.get(rid);
+    const pk = prevPKMap.get(String(rid));
     if (pk) newlyDeleted.add(pk);
+    const removedKey = removedPKMap.get(String(rid));
+    if (removedKey) newlyDeleted.add(removedKey);
   }
 
   if (newlyDeleted.size > 0) {

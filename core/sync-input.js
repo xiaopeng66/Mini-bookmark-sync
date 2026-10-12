@@ -67,19 +67,59 @@ async function clearAllBookmarks() {
   });
 }
 
-// 备份本地树到 chrome.storage.local（key: 'local_bookmark_backup'）
-// ★ 参数可缺省：orchestrator/sync-merge 的调用点均未传参，此前把 undefined
-//   存进备份键，导致 restoreLocalBackup 永远返回 no_backup——回滚从未生效过。
+const LOCAL_BACKUP_META = 'local_bookmark_backup_meta';
+let activeLocalBackupId = null;
+let localBackupFailure = null;
+const backupNeedsRecovery = meta => !!meta && ['pending', 'restoring', 'failed'].includes(meta.status);
+const newBackupId = () => Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+
+// 备份与事务状态一起落盘。未完成的恢复副本不能被重试时的空树/半成品覆盖。
 async function backupLocalTree(tree) {
+  localBackupFailure = null;
   try {
+    const data = await MiniSync.storage.getLocal([LOCAL_BACKUP_META, 'sync_relationship_key', 'bookmark_target_id']);
+    if (backupNeedsRecovery(data[LOCAL_BACKUP_META])) {
+      localBackupFailure = { code: 'RECOVERY_REQUIRED', retryable: false,
+        message: '上次本地恢复尚未完成，请先恢复备份后再同步' };
+      return false;
+    }
     if (!tree) tree = await getChromeTree();
-    await MiniSync.storage.setLocal({ local_bookmark_backup: tree });
-    const saved = await getLocalBackup();
-    if (!Array.isArray(saved) || JSON.stringify(saved) !== JSON.stringify(tree)) throw new Error('备份校验失败');
+    const bucketId = String((MiniSync.utils.getSyncBucketId && MiniSync.utils.getSyncBucketId()) || data.bookmark_target_id || '');
+    const meta = { version: 1, id: newBackupId(), status: 'pending', createdAt: Date.now(),
+      relationshipKey: data.sync_relationship_key || null, sourceBucketId: bucketId,
+      currentBucketId: bucketId, restoredIds: {} };
+    await MiniSync.storage.setLocal({ local_bookmark_backup: tree, [LOCAL_BACKUP_META]: meta });
+    const saved = await MiniSync.storage.getLocal(['local_bookmark_backup', LOCAL_BACKUP_META]);
+    if (!Array.isArray(saved.local_bookmark_backup) || JSON.stringify(saved.local_bookmark_backup) !== JSON.stringify(tree)
+        || saved[LOCAL_BACKUP_META]?.id !== meta.id) throw new Error('备份校验失败');
+    activeLocalBackupId = meta.id;
     return true;
   } catch (e) {
+    localBackupFailure = { code: 'LOCAL_BACKUP_FAILED', retryable: false, message: e.message };
     console.warn('[orchestrator] 备份本地书签失败:', e.message);
     return false;
+  }
+}
+
+// 保持 backupLocalTree 的 boolean 契约，同时让编排层区分恢复阻断与普通存储失败。
+function getLocalBackupFailure() {
+  return localBackupFailure ? { ...localBackupFailure } : null;
+}
+
+// 只由持有本次备份的编排调用方在确认提交后调用，不能放在 finally。
+async function completeLocalBackup() {
+  try {
+    const data = await MiniSync.storage.getLocal([LOCAL_BACKUP_META]);
+    const meta = data[LOCAL_BACKUP_META];
+    if (!meta || ['committed', 'restored'].includes(meta.status)) return { ok: true, skipped: true };
+    if (meta.id !== activeLocalBackupId || meta.status !== 'pending') {
+      return { ok: false, code: 'RECOVERY_REQUIRED', error: '不能提交其他事务或尚未完成恢复的备份' };
+    }
+    await MiniSync.storage.setLocal({ [LOCAL_BACKUP_META]: { ...meta, status: 'committed', completedAt: Date.now() } });
+    activeLocalBackupId = null;
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, code: 'LOCAL_BACKUP_FAILED', error: e.message };
   }
 }
 
@@ -93,22 +133,51 @@ async function getLocalBackup() {
 // 缺省为叠加导入（现有书签保留），供用户主动恢复按钮使用。
 // 同步失败回滚用替换式，避免在半成品状态上叠加大量重复书签。
 async function restoreLocalBackup(options) {
-  options = options || {};
-  if (!options.targetParentId) {
-    // ★ 冷启动兜底：新后台/新实例的内存桶是空的，但备份与持久化的 bookmark_target_id
-    //   都还在。旧实现只读内存桶 ⇒ 返回 bucket_not_found、界面说「没有可用的备份数据」，
-    //   用户的备份明明就在（审计 2026-10-11 复现 restore-cold-worker）。
-    //   这里按「显式参数 → 内存桶 → 持久化设置」的顺序解析，与同步路径口径一致。
-    try {
-      const stored = await MiniSync.storage.getLocal(['bookmark_target_id']);
-      if (stored && stored.bookmark_target_id) options.targetParentId = String(stored.bookmark_target_id);
-    } catch (_) { /* 读不到就继续用内存桶 */ }
+  options = { ...(options || {}) };
+  const data = await MiniSync.storage.getLocal(['local_bookmark_backup', LOCAL_BACKUP_META, 'bookmark_target_id', 'sync_relationship_key']);
+  const backup = data.local_bookmark_backup;
+  if (!Array.isArray(backup) || !backup.length) return { ok: false, restored: 0, conflicts: [], reason: 'no_backup' };
+  const requested = String(options.targetParentId || data.bookmark_target_id
+    || (MiniSync.utils.getSyncBucketId && MiniSync.utils.getSyncBucketId()) || '');
+  const meta = data[LOCAL_BACKUP_META] || { version: 1, id: newBackupId(), sourceBucketId: requested,
+    currentBucketId: requested, relationshipKey: data.sync_relationship_key || null, restoredIds: {} };
+  const sourceId = String(meta.sourceBucketId || requested);
+  const currentId = String((meta.restoredIds || {})[sourceId] || meta.currentBucketId || sourceId);
+  if (requested && requested !== sourceId && requested !== currentId) {
+    return { ok: false, restored: 0, conflicts: [], reason: 'backup_target_mismatch' };
   }
-  const backup = await getLocalBackup();
-  if (!backup) return { ok: false, restored: 0, conflicts: [], reason: 'no_backup' };
+  // 默认公开重试继续尚未完成的恢复范围/写集，而不是把只补回桶误报为完整回滚。
+  if (backupNeedsRecovery(meta) && meta.restoreOptions) options = { ...meta.restoreOptions, ...options };
+  options.targetParentId = sourceId;
+  meta.sourceBucketId = sourceId;
+  meta.restoredIds = meta.restoredIds || {};
+  meta.status = 'restoring';
+  meta.restoreOptions = { ...options };
+  let result;
+  try {
+    // 必须在改树前落盘：失败/worker 回收后的下一轮仍能看到恢复未完成。
+    await MiniSync.storage.setLocal({ [LOCAL_BACKUP_META]: meta });
+    result = await restoreLocalBackupTree(backup, options, meta);
+  } catch (e) {
+    result = { ok: false, restored: 0, conflicts: [{ error: e.message }], reason: e.message };
+  }
+  try {
+    meta.status = result.ok ? 'restored' : 'failed';
+    if (result.ok) meta.completedAt = Date.now();
+    await MiniSync.storage.setLocal({ [LOCAL_BACKUP_META]: meta });
+    if (result.ok && activeLocalBackupId === meta.id) activeLocalBackupId = null;
+  } catch (e) {
+    result = { ...result, ok: false, reason: e.message,
+      conflicts: [...(result.conflicts || []), { type: 'metadata', error: e.message }] };
+  }
+  return result;
+}
+
+async function restoreLocalBackupTree(backup, options, meta) {
   const root = backup[0];
   const current = (await getChromeTree())[0];
-  const bucketId = String(options.targetParentId || (MiniSync.utils.getSyncBucketId && MiniSync.utils.getSyncBucketId()) || '');
+  const bucketId = String(meta.sourceBucketId);
+  const restoredId = id => String(meta.restoredIds[String(id)] || id);
   // ★ conflicts 必须在任何重建/恢复分支之前声明：home 重建失败会在下面的 try/catch 里
   //   往里推记录，旧实现把它声明在重建之后 ⇒ 一旦走到那条分支就抛 TDZ
   //   （"Cannot access 'conflicts' before initialization"），回滚直接失败。
@@ -142,52 +211,37 @@ async function restoreLocalBackup(options) {
     }
     return null;
   }
-  // 缓存已创建的容器：同一 (parentId::title) 只建一次，供恢复/重建共用，避免重复建同名文件夹。
-  const createdFolders = new Map();
-  // ★ 恢复目标归一化：不再要求「备份与当前都存在同 id 节点」，允许按 saved 路径重建。
-  //   返回 { saved, current }；current 可能是本轮新建的容器（真实 id 已回填）。
+  // 恢复身份按备份 id 持久化，不按标题合并。两个同名祖先也必须保持各自身份。
+  async function rememberRestored(savedId, liveId) {
+    meta.restoredIds[String(savedId)] = String(liveId);
+    await MiniSync.storage.setLocal({ [LOCAL_BACKUP_META]: meta });
+  }
   async function resolveTarget(savedNode) {
-    let live = current && find(current, String(savedNode.id));
+    const live = current && find(current, restoredId(savedNode.id));
     if (live && !live.url) return live;
     if (!options.recreateMissingHome) return null;
-    // 缺容器（甚至是整条祖先链）时，按 saved 路径从共同祖先往下逐级重建。
-    // ★ 不能按同名接管无关目录：只沿 saved 祖先链建，父锚点取「已存在的最长祖先」。
-    const chain = ancestorChain(root, String(savedNode.id)) || [];
+    const chain = [...(ancestorChain(root, String(savedNode.id)) || []), savedNode];
     let parentId = String(current.id);
     for (const ancestor of chain) {
-      const existing = current && find(current, String(ancestor.id));
+      const existing = find(current, restoredId(ancestor.id));
       if (existing && !existing.url) { parentId = String(existing.id); continue; }
-      const key = parentId + '::' + String(ancestor.title || '');
-      let created = createdFolders.get(key);
-      if (!created) {
-        created = await call('create', { parentId, title: ancestor.title || '' });
-        createdFolders.set(key, created);
-        // 立即挂进 current，供后续祖先/后代复用与比对
-        const node = { id: String(created.id), title: ancestor.title || '', url: '', children: [] };
-        const parentLive = find(current, parentId);
-        if (parentLive) { parentLive.children = parentLive.children || []; parentLive.children.push(node); }
-      }
-      parentId = String(created.id);
-    }
-    const key = parentId + '::' + String(savedNode.title || '');
-    let created = createdFolders.get(key);
-    if (!created) {
-      created = await call('create', { parentId, title: savedNode.title || '' });
-      createdFolders.set(key, created);
-      const node = { id: String(created.id), title: savedNode.title || '', url: '', children: [] };
+      const created = await call('create', { parentId, title: ancestor.title || '' });
+      const node = { ...created, id: String(created.id), parentId, children: [] };
       const parentLive = find(current, parentId);
       if (parentLive) { parentLive.children = parentLive.children || []; parentLive.children.push(node); }
+      // 在改选当前桶之前持久化 alias。后续叶子创建失败/worker 重启仍能找到该容器。
+      await rememberRestored(ancestor.id, created.id);
+      parentId = String(created.id);
     }
-    return find(current, String(created.id));
+    return find(current, parentId);
   }
   const savedBucket = root && find(root, bucketId);  if (!savedBucket) {
     return { ok: false, restored: 0, conflicts, reason: 'bucket_not_found' };
   }
   // 桶可能整个被清掉了：按备份路径重建（含祖先链）。
-  let currentBucket = current && find(current, bucketId);
-  let bucketRecreated = false;
+  let currentBucket = current && find(current, restoredId(bucketId));
   if (!currentBucket || currentBucket.url) {
-    try { currentBucket = await resolveTarget(savedBucket); bucketRecreated = !!currentBucket; }
+    try { currentBucket = await resolveTarget(savedBucket); }
     catch (e) { conflicts.push({ type: 'folder', id: bucketId, error: e.message }); }
   }
   if (!currentBucket) {
@@ -196,11 +250,11 @@ async function restoreLocalBackup(options) {
   // ★ 桶被整棵删除后重建：新容器拿到的是新 id，持久化的 bookmark_target_id 与内存桶
   //   都还指着已删除的旧 id。必须就地改指新容器，否则恢复完用户下次同步又找不到桶
   //   （审计复现：missing nested bucket 恢复后 bookmark_target_id 仍是旧 id）。
-  if (bucketRecreated && String(currentBucket.id) !== bucketId) {
-    try {
-      await MiniSync.storage.setLocal({ bookmark_target_id: String(currentBucket.id) });
-      if (MiniSync.utils.setSyncBucketId) MiniSync.utils.setSyncBucketId(currentBucket.id);
-    } catch (e) { console.warn('[sync] 恢复后改指同步文件夹失败（继续）:', e.message); }
+  if (String(currentBucket.id) !== bucketId) {
+    meta.currentBucketId = String(currentBucket.id);
+    // 即使上一轮仅重建了桶就中断，下一轮也能凭持久化 alias 补齐设置。
+    await MiniSync.storage.setLocal({ [LOCAL_BACKUP_META]: meta, bookmark_target_id: String(currentBucket.id) });
+    if (MiniSync.utils.setSyncBucketId) MiniSync.utils.setSyncBucketId(currentBucket.id);
   }
   const targets = [{ saved: savedBucket, current: currentBucket }];
   if (options.includeHome) {
@@ -216,7 +270,7 @@ async function restoreLocalBackup(options) {
     // home 若被桶包住（含祖先关系）就不单列，避免同一子树恢复两遍。
     if (savedHome && !contains(savedBucket, savedHome.id) && !contains(currentBucket, savedHome.id)
         && String(savedHome.id) !== String(currentBucket.id)) {
-      const currentHome = find(current, String(savedHome.id));
+      const currentHome = find(current, restoredId(savedHome.id));
       if (currentHome && !currentHome.url) {
         targets.push({ saved: savedHome, current: currentHome });
       } else if (options.recreateMissingHome) {
@@ -363,8 +417,11 @@ async function restoreLocalBackup(options) {
       // 删除多余节点：有写集时只删本事务新建的（保留用户并发新增与其他既有内容）；
       // 无写集时沿用「备份之外全删」的替换式语义。
       // ★ 保护祖先连接路径与所有 target 子树：恢复外层目标不能把内层目标一并删掉。
+      const cleaned = new Set();
       async function removeExtras(parent) {
-        for (const child of parent.children || []) {
+        if (!parent || cleaned.has(String(parent.id))) return;
+        cleaned.add(String(parent.id));
+        for (const child of [...(parent.children || [])]) {
           const id = String(child.id);
           if (desiredIds.has(id)) { await removeExtras(child); continue; }
           if (protectedPath.has(id)) { await removeExtras(child); continue; }
@@ -375,6 +432,11 @@ async function restoreLocalBackup(options) {
           //   （审计复现：rollback never removes a transaction folder containing user-added descendants）。
           if (!child.url && hasKeptDescendant(child)) { await removeExtras(child); continue; }
           await call(child.url ? 'remove' : 'removeTree', id);
+          parent.children = (parent.children || []).filter(n => String(n.id) !== id);
+          (function unindex(node) {
+            liveNodes.delete(String(node.id));
+            for (const descendant of node.children || []) unindex(descendant);
+          })(child);
         }
       }
       function hasKeptDescendant(node) {
@@ -407,7 +469,7 @@ async function restoreLocalBackup(options) {
           catch (e) { conflicts.push({ type: 'delete', id: String(live.id), error: e.message }); }
         }
       }
-      return { ok: true, restored, conflicts, result: { importedCount: restored, conflicts } };
+      return { ok: conflicts.length === 0, restored, conflicts, result: { importedCount: restored, conflicts } };
     } catch (e) {
       conflicts.push({ error: e.message });
       return { ok: false, restored, conflicts, reason: e.message };
@@ -506,14 +568,15 @@ async function ensureSyncRelationship(config, bucketId) {
   const url = new URL(config.url);
   const file = MiniSync.utils.joinWebDAVUrl(config.url, config.filename || DEFAULT_FILENAME);
   const key = JSON.stringify([url.origin.toLowerCase(), String(config.username || ''), file, String(bucketId || '')]);
-  const data = await MiniSync.storage.getLocal(['sync_relationship_key', 'sync_relationship_states', STORAGE_KEYS.TOMBSTONES, STORAGE_KEYS.SNAPSHOTS, STORAGE_KEYS.CLOUD_LAST_MODIFIED]);
+  const data = await MiniSync.storage.getLocal(['sync_relationship_key', 'sync_relationship_states', 'sync_baseline_repair_needed', STORAGE_KEYS.TOMBSTONES, STORAGE_KEYS.SNAPSHOTS, STORAGE_KEYS.CLOUD_LAST_MODIFIED]);
   if (data.sync_relationship_key === key) return { changed: false, key };
   const states = data.sync_relationship_states || {};
   if (data.sync_relationship_key) {
     states[data.sync_relationship_key] = {
       tombstones: data[STORAGE_KEYS.TOMBSTONES] || [],
       snapshots: data[STORAGE_KEYS.SNAPSHOTS] || {},
-      cloudLastModified: data[STORAGE_KEYS.CLOUD_LAST_MODIFIED] || 0
+      cloudLastModified: data[STORAGE_KEYS.CLOUD_LAST_MODIFIED] || 0,
+      baselineRepair: data.sync_baseline_repair_needed || null
     };
   }
   const next = states[key] || { tombstones: [], snapshots: {}, cloudLastModified: 0 };
@@ -522,8 +585,9 @@ async function ensureSyncRelationship(config, bucketId) {
     [STORAGE_KEYS.TOMBSTONES]: next.tombstones,
     [STORAGE_KEYS.SNAPSHOTS]: next.snapshots,
     [STORAGE_KEYS.CLOUD_LAST_MODIFIED]: next.cloudLastModified,
-    berry_pathkey_snapshot: [], via_pathkey_snapshot: [],
-    aira_pathkey_snapshot: [], aira_home_pathkey_snapshot: []
+    sync_baseline_repair_needed: next.baselineRepair || null,
+    ...Object.fromEntries(['berry_pathkey_snapshot', 'via_pathkey_snapshot', 'aira_pathkey_snapshot', 'aira_home_pathkey_snapshot']
+      .flatMap(name => [[name, []], [name + '_owner', null], [name + '_meta', null]]))
   });
   return { changed: true, key };
 }
@@ -640,69 +704,83 @@ async function saveLocalSnapshot(label) {
 // 保存「上次同步时的本地扁平树」到 sync_snapshots.localTree。
 // background.js 的 onRemoved 监听依赖它回溯被删节点的 pathKey 并写墓碑；
 // 若缺失，删除时拿不到 pathKey → 写不了墓碑 → 合并时被判为「云端新增」而复活。
+function pendingBaseline(data) {
+  const pending = data.sync_baseline_repair_needed;
+  return pending && Array.isArray(pending.localTree)
+    && (pending.relationshipKey || null) === (data.sync_relationship_key || null) ? pending : null;
+}
+
+async function getDeletionBaseline() {
+  const data = await MiniSync.storage.getLocal(['sync_relationship_key', 'sync_baseline_repair_needed', STORAGE_KEYS.SNAPSHOTS]);
+  const pending = pendingBaseline(data);
+  return pending ? pending.localTree : (data[STORAGE_KEYS.SNAPSHOTS] || {}).localTree || [];
+}
+
+async function recordBaselineDeletions(previous, current) {
+  const oldKeys = new Set(MiniSync.xbelPath.computeJsonPathKeys(previous).values());
+  const newKeys = new Set(MiniSync.xbelPath.computeJsonPathKeys(current).values());
+  const deleted = new Set([...oldKeys].filter(key => !newKeys.has(key)));
+  if (!deleted.size) return 0;
+  const data = await MiniSync.storage.getLocal([STORAGE_KEYS.TOMBSTONES]);
+  const tombstones = MiniSync.tombstone.mergeTombstones(data[STORAGE_KEYS.TOMBSTONES] || [], deleted, null,
+    await MiniSync.storage.getDeviceId());
+  await MiniSync.storage.setLocal({ [STORAGE_KEYS.TOMBSTONES]: tombstones });
+  return deleted.size;
+}
+
+async function writeBaseline(flat) {
+  const data = await MiniSync.storage.getLocal([STORAGE_KEYS.SNAPSHOTS]);
+  await MiniSync.storage.setLocal({
+    [STORAGE_KEYS.SNAPSHOTS]: { ...(data[STORAGE_KEYS.SNAPSHOTS] || {}), localTree: flat },
+    sync_baseline_repair_needed: null
+  });
+}
+
 async function saveLocalTreeSnapshot() {
+  let flat;
+  let relationshipKey;
+  let mayReplacePending = false;
   try {
-    const tree = await getChromeTree();
-    // 必须用 merger.chromeTreeToList（与 C2 快照差异检测读取端一致）。
-    // 不能用 _treeToFlatList：它把所有节点 source 硬编码为 'other'，
-    // 会导致 pathKey 全变成 ROOT:other/... 而实际是 ROOT:bar/...，
-    // 墓碑 key 与云端 pathKey 对不上，删除无法传播（节点被判为云端新增而复活）。
-    const flat = MiniSync.merger.chromeTreeToList(tree);
-    const write = () => new Promise((resolve, reject) => {
-      try {
-        chrome.storage.local.set({ sync_snapshots: { localTree: flat } }, () => {
-          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-          else resolve();
-        });
-      } catch (e) { reject(e); }
-    });
+    flat = MiniSync.merger.chromeTreeToList(await getChromeTree());
+    const data = await MiniSync.storage.getLocal(['sync_relationship_key', 'sync_baseline_repair_needed']);
+    relationshipKey = data.sync_relationship_key || null;
+    const previous = pendingBaseline(data);
+    // Never discard historical evidence until intervening deletions are durable.
+    if (previous) await recordBaselineDeletions(previous.localTree, flat);
+    mayReplacePending = true;
     try {
-      await write();
-    } catch (e1) {
-      // ★ 配额不足兜底：墓碑回溯快照的优先级高于人工快照——
-      //   把人工快照清到 1 份再重试一次，确保删除传播链路不断
-      console.warn('[sync] localTree 快照写入失败，清减人工快照后重试:', e1.message);
-      await new Promise((resolve) => {
-        chrome.storage.local.get(['local_snapshots'], (res) => {
-          const snaps = res.local_snapshots || [];
-          chrome.storage.local.set({ local_snapshots: snaps.slice(0, 1) }, resolve);
-        });
-      });
-      await write();
+      await writeBaseline(flat);
+    } catch (error) {
+      console.warn('[sync] localTree 快照写入失败，清减人工快照后重试:', error.message);
+      const snapshots = await MiniSync.storage.getLocal(['local_snapshots']);
+      await MiniSync.storage.setLocal({ local_snapshots: (snapshots.local_snapshots || []).slice(0, 1) });
+      await writeBaseline(flat);
     }
     return { ok: true, count: flat.length };
-  } catch (e) {
-    console.warn('[orchestrator] 保存 localTree 快照失败:', e.message);
-    // ★ 基线是删除传播的必要状态：写失败后，删除监听与快照差异检测都拿不到 pathKey，
-    //   之后用户删掉的书签无法产生墓碑，下一轮会被当成「云端新增」导回
-    //   （审计 2026-10-11 复现 snapshot-write-failure）。
-    //   这里留下一个「待补交」标记（纯本地小键，几乎不会再撞配额），
-    //   下一次同步会先重试写基线，成功后才清除标记；界面据此如实报「部分完成」。
-    try {
-      await MiniSync.storage.setLocal({
-        sync_baseline_repair_needed: { at: Date.now(), error: e.message }
-      });
-    } catch (_) { /* 连标记都写不进：至少返回值已如实报告 */ }
-    return { ok: false, error: e.message };
+  } catch (error) {
+    console.warn('[orchestrator] 保存 localTree 快照失败:', error.message);
+    if (flat && mayReplacePending) {
+      try {
+        await MiniSync.storage.setLocal({ sync_baseline_repair_needed: {
+          at: Date.now(), error: error.message, relationshipKey, localTree: flat
+        } });
+      } catch (_) { /* Both baseline stores can fail; removal events still carry their subtree. */ }
+    }
+    return { ok: false, error: error.message };
   }
 }
 
-/**
- * 若上次同步的基线快照写失败，这里重试一次（成功则清除标记）。
- * 由同步收尾阶段调用：基线恢复后，后续的用户删除才拿得到 pathKey。
- */
+// Replay the exact failed baseline. A fresh capture cannot recover lost history.
 async function repairBaselineIfNeeded() {
   try {
-    const flag = await MiniSync.storage.getLocal(['sync_baseline_repair_needed']);
-    if (!flag || !flag.sync_baseline_repair_needed) return { ok: true, skipped: true };    const retry = await saveLocalTreeSnapshot();
-    if (retry.ok) {
-      await MiniSync.storage.removeLocal(['sync_baseline_repair_needed']);
-      console.log('[sync] 上次失败的同步基线已补齐，删除传播链路恢复正常');
-      return { ok: true, repaired: true };
-    }
-    return { ok: false, error: retry.error };
-  } catch (e) {
-    return { ok: false, error: e.message };
+    const data = await MiniSync.storage.getLocal(['sync_relationship_key', 'sync_baseline_repair_needed']);
+    if (!data.sync_baseline_repair_needed) return { ok: true, skipped: true };
+    const pending = pendingBaseline(data);
+    if (!pending) return { ok: false, error: '缺少原始历史基线，无法补交' };
+    await writeBaseline(pending.localTree);
+    return { ok: true, repaired: true };
+  } catch (error) {
+    return { ok: false, error: error.message };
   }
 }
 
@@ -724,21 +802,9 @@ async function repairBaselineIfNeeded() {
  */
 async function backfillDeletedTombstones(localList) {
   try {
-    const snapData = await MiniSync.storage.getLocal([STORAGE_KEYS.SNAPSHOTS]);
-    const prev = (snapData[STORAGE_KEYS.SNAPSHOTS] && snapData[STORAGE_KEYS.SNAPSHOTS].localTree) || [];
-    if (prev.length === 0) return 0;
-    const prevSet = new Set(MiniSync.xbelPath.computeJsonPathKeys(prev).values());
-    const curSet = new Set(MiniSync.xbelPath.computeJsonPathKeys(Array.isArray(localList) ? localList : []).values());
-    const deletedPKs = new Set();
-    for (const pk of prevSet) {
-      if (!curSet.has(pk)) deletedPKs.add(pk);
-    }
-    if (deletedPKs.size === 0) return 0;
-    const existing = (await MiniSync.storage.getLocal([STORAGE_KEYS.TOMBSTONES]))[STORAGE_KEYS.TOMBSTONES] || [];
-    const devId = await MiniSync.storage.getDeviceId();
-    const merged = MiniSync.tombstone.mergeTombstones(existing, deletedPKs, null, devId);
-    await MiniSync.storage.setLocal({ [STORAGE_KEYS.TOMBSTONES]: merged });
-    return deletedPKs.size;
+    await repairBaselineIfNeeded();
+    const previous = await getDeletionBaseline();
+    return await recordBaselineDeletions(previous, Array.isArray(localList) ? localList : []);
   } catch (e) {
     console.warn('[sync] 快照差异墓碑回溯失败（继续）:', e.message);
     return 0;
@@ -844,6 +910,8 @@ return {
   getLocalTreeForXbel,
   clearAllBookmarks,
   backupLocalTree,
+  completeLocalBackup,
+  getLocalBackupFailure,
   getLocalBackup,
   restoreLocalBackup,
   ensureSyncRelationship,
@@ -851,6 +919,7 @@ return {
   resolveSyncBucketSetting,
   saveLocalSnapshot,
   saveLocalTreeSnapshot,
+  getDeletionBaseline,
   repairBaselineIfNeeded,
   backfillDeletedTombstones,
   applyTombstoneDeletions,

@@ -259,7 +259,9 @@ MARKERS = {
     ],
     'core/sync-orchestrator.js': [
         'last_write_report',
-        '没能写入本地',
+        '下载写入未完整落地',
+        'completeLocalBackup',
+        'getLocalBackupFailure',
         'conflictCount',
         'conflictSamples',
         'resolveSyncBucketSetting',
@@ -310,7 +312,10 @@ MARKERS = {
         # 桥接读入必须返回完整变更计划；仅在本地导入和主文件条件写入成功后提交快照。
         # 不再二次读 Via：旧的 mergeViaData 包装会提前写入删除基线并可能复活节点。
         'changes.complete !== true || !Array.isArray(changes.list)',
-        'MiniSync.via.mergeViaDataWithChanges(list, tombstoneKeys)',
+        'MiniSync.via.mergeViaDataWithChanges(list,',
+        'MiniSync.tombstone.extractKeys(bridgeTombstones), bridgeContext()',
+        'applyBridgeRemaps',
+        'revokedVersions',
         'Object.assign(bridgeSnapshotUpdates, changes.snapshotUpdates || {})',
         'await MiniSync.storage.setLocal(bridgeSnapshotUpdates);',
         '!mergeViaData(mergedFlatList',
