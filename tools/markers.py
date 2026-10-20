@@ -359,6 +359,9 @@ MARKERS = {
         'missedMoves',
         'movesRepaired',
         '移动未落地',
+        # v2.3.5：重建必须「先确认新节点可见、再删旧节点」；并发保护提示同一级别只提示一次
+        'createdVisible',
+        '写回前复核发现',
     ],
     'lib/import.js': [
         'byBucket',
@@ -455,6 +458,9 @@ MARKERS = {
         # v2.3.3：上传/合并提交后用「实际写进云端的树」做基线（overrideFlat），
         # 不再回读当前树 —— PUT 等待期间用户新拖的移动不在云端，不能进基线。
         'overrideFlat',
+        # v2.3.5：并发保护降档提示同一级别只出现一次（诊断里仍有完整级别）
+        'writeProtectionNoteOnce',
+        'last_write_protection',
     ],
     'popup.html': [
         '增量：云端新增的导入本机',

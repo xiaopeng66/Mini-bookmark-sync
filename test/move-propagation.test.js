@@ -288,3 +288,40 @@ test('★ 宿主 move 静默不生效且无法重建（文件夹）⇒ 合并明
   // 云端逐字节未变（没有用旧位置覆盖）
   expect(a.cloud.files.get(a.mainUrl).content).toBe(cloudBefore);
 });
+
+test('★ 重建也失败（宿主 create 不可见）⇒ 旧书签必须保住、云端不变', async () => {
+  const { a, b, src, dst } = await seed();
+  const bm = await a.add(src.id, 'Target', 'https://target.invalid/');
+  await sync(a, 'uploadBookmarks');
+  await sync(b, 'downloadBookmarks');
+
+  a.state.now += 60000;
+  await a.chrome.bookmarks.move(bm.id, { parentId: dst.id });
+  a.state.store.sync_move_intents = {};
+  await sync(a, 'mergeSync');
+  const cloudBefore = a.cloud.files.get(a.mainUrl).content;
+
+  // 宿主：move 静默无效，create 也只返回一个并不存在的 id
+  b.chrome.bookmarks.move = (id, info, cb) => {
+    if (cb) { cb({ id, parentId: info.parentId }); return undefined; }
+    return Promise.resolve({ id, parentId: info.parentId });
+  };
+  const realCreate = b.chrome.bookmarks.create;
+  b.chrome.bookmarks.create = (info, cb) => {
+    if (info && info.url === 'https://target.invalid/') {
+      const phantom = { id: 'phantom-node', parentId: String(info.parentId), title: info.title || '', url: info.url };
+      if (cb) { cb(phantom); return undefined; }
+      return Promise.resolve(phantom);
+    }
+    return realCreate(info, cb);
+  };
+  b.state.now += 60000;
+  const rb = await b.M.orchestrator.mergeSync({});
+
+  expect(rb.success).toBe(false);
+  expect(rb.message).toContain('已停止写回云端');
+  // 旧书签仍在原处（绝不先删后建）
+  expect(paths(b)).toContain('Src/Target');
+  // 云端逐字节未变
+  expect(a.cloud.files.get(a.mainUrl).content).toBe(cloudBefore);
+});

@@ -166,3 +166,27 @@ test('filtering capability notices never hides error-level records, failed resul
   expect(html).toContain('data-copy=');
   expect(d.state.store.sync_log).toEqual(original);
 });
+
+describe('并发保护提示：同一级别只提示一次', () => {
+  const { makeCloud, makeDevice } = require('./helpers/audit-harness.cjs');
+  test('连续两轮都没有并发保护 ⇒ 只有第一轮提示，第二轮不再重复', async () => {
+    const cloud = makeCloud();
+    cloud.etagMode = 'none';
+    cloud.lastModifiedMode = 'none';
+    const a = makeDevice('note-A', cloud);
+    try {
+      await a.add('1', 'One', 'https://one.invalid/');
+      await a.M.orchestrator.uploadBookmarks({});
+      await a.add('1', 'Two', 'https://two.invalid/');
+      const first = await a.M.orchestrator.mergeSync({});
+      expect(first.success).toBe(true);
+      expect(first.message).toContain('没有并发保护');
+      await a.add('1', 'Three', 'https://three.invalid/');
+      const second = await a.M.orchestrator.mergeSync({});
+      expect(second.success).toBe(true);
+      expect(second.message).not.toContain('没有并发保护');
+      // 记账仍然保留在 storage 里，诊断可以查到当前级别
+      expect(a.state.store.last_write_protection).toBe('none');
+    } finally { a.close(); }
+  });
+});

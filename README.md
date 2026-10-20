@@ -4,10 +4,21 @@
 > 本仓库是 [原项目](https://github.com/jagshen/Mini-bookmark-sync) 的维护版：保留原项目的全部功能，
 > 并补上手机端支持、双向增量增删，以及一批跨端同步的一致性修复。
 
-[![Version](https://img.shields.io/badge/version-2.3.4-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
+[![Version](https://img.shields.io/badge/version-2.3.5-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
+
+## v2.3.5 发布说明
+
+修复手机端移动书签失败时可能把书签删掉的问题，并减少重复提示。
+
+- 手机端宿主不支持直接移动时会先新建并确认，确认后才删原书签；确认不了就保留原书签并中止，不会再删掉书签。
+- 写回云端前再次核对位置，有一条不对就停止写回，云端保留原样。
+- 失败时不再留下「未完成的本地事务」，可以直接重试。
+- 「本服务未提供可用的并发校验」同一级别只提示一次，不再每次同步重复。
+
+933 条 JavaScript 回归与 6 条打包工具测试通过。验证使用隔离模拟数据，没有完成真实手机、浏览器 GUI 或生产 WebDAV 验收。安装仍由宿主浏览器确认。详见 [完整发布说明](docs/release-v2.3.5.md)。
 
 ## v2.3.4 发布说明
 

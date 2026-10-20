@@ -590,6 +590,99 @@ async function doMergeSync(options) {
           }
         }
 
+        // ★ 落盘校验：本机必须真的停在云端的位置上，才允许把本机树写回云端。
+        //   部分移动端宿主的 bookmarks.move 会「回调成功但实际不动」（或被宿主自己的
+        //   书签同步立刻改回去），旧实现只信封装的返回值：合并报告成功、随后把本机的
+        //   旧位置 PUT 上云 —— 另一台设备只能跟随，用户看到的就是「移动被还原」。
+        //   与其覆盖云端，不如明确失败：云端保留新位置，本轮报错让用户重试/排查。
+        if (appliedMoves.length > 0) {
+          const verifyLive = async () => {
+            const flat = MiniSync.merger.chromeTreeToList(await MiniSync.syncInput.getChromeTree());
+            return new Map(flat.map(n => [String(n.id), n]));
+          };
+          let liveById = await verifyLive();
+          const findMissed = () => appliedMoves.filter(m => {
+            const n = liveById.get(String(m.id));
+            return !n || String(n.parentId) !== String(m.newParentId);
+          });
+          let missedMoves = findMissed();
+          // 宿主可能把 move 推迟到下一个 tick 才落盘：先等一拍再复核，避免无谓重建。
+          if (missedMoves.length > 0) {
+            await new Promise(resolve => setTimeout(resolve, 120));
+            liveById = await verifyLive();
+            missedMoves = findMissed();
+          }
+          // 兜底：move 不生效但 create/remove 可用时，按「下载」路径的做法重建一份
+          // （先建后删，建失败就什么都不删）。只处理书签；文件夹要整棵重建，风险大，
+          // 留给用户明确失败，绝不偷偷删子树。
+          let repaired = 0;
+          const stillMissed = [];
+          for (const m of missedMoves) {
+            const node = liveById.get(String(m.id));
+            if (!node || !node.url) { stillMissed.push(m); continue; }
+            let createdId = null;
+            try {
+              const created = await bookmarkWrite('create', {
+                parentId: String(m.newParentId), title: node.title || '', url: node.url
+              });
+              createdId = String(created.id);
+              // ★ 顺序不可颠倒：必须先确认新节点真的出现在目标父节点下，才允许删旧节点。
+              //   部分宿主 create 会「回调成功但暂时读不到」，先删后就等于把唯一副本删了
+              //   （实测：移动失败 + 宿主读延迟 ⇒ 用户书签直接消失、备份事务卡住）。
+              let after = await verifyLive();
+              const createdVisible = after.get(createdId)
+                && String(after.get(createdId).parentId) === String(m.newParentId);
+              if (!createdVisible) {
+                // 再等一拍确认不是读延迟；仍看不到就撤销新建，保留旧节点。
+                await new Promise(resolve => setTimeout(resolve, 120));
+                after = await verifyLive();
+              }
+              if (!after.get(createdId) || String(after.get(createdId).parentId) !== String(m.newParentId)) {
+                try { await bookmarkWrite('remove', createdId); } catch (_) { /* 写集兜底 */ }
+                stillMissed.push(m);
+                continue;
+              }
+              await bookmarkWrite('remove', String(m.id));
+              after = await verifyLive();
+              if (after.has(String(m.id)) || !after.has(createdId)) {
+                // 旧节点没删掉 = 会留下副本。撤销新建，按失败处理（回滚交给备份）。
+                try { await bookmarkWrite('remove', createdId); } catch (_) { /* 写集兜底 */ }
+                stillMissed.push(m);
+                continue;
+              }
+              mergeCreatedIds.add(createdId);
+              // ★ 旧节点是本轮主动放弃的（已删除）：必须登记进本轮删除集，
+              //   否则导入引擎手里的 mergedData 仍带着它，会把旧位置再建一份
+              //   （实测：重建后旧文件夹里又出现一个同名书签）。
+              if (Array.isArray(mergeResult.localDeletedIds)) {
+                mergeResult.localDeletedIds.push(String(m.id));
+              }
+              // 后续（导入后、写云前）的复核要用新 id：把登记项改到重建出来的节点上。
+              m.id = createdId;
+              repaired++;
+              liveById = after;
+            } catch (e) {
+              if (createdId) { try { await bookmarkWrite('remove', createdId); } catch (_) { /* 写集兜底 */ } }
+              stillMissed.push(m);
+            }
+          }
+          movesRepaired = repaired;
+          missedMoves = stillMissed;
+          if (missedMoves.length > 0) {
+            const error = new Error(
+              `本机未能把 ${missedMoves.length} 个书签/文件夹移动到云端的新位置（宿主未落盘），`
+              + '已停止写回云端以保护书签');
+            error.failureCount = missedMoves.length;
+            error.moveVerification = missedMoves;
+            crossZoneDiag.failed += missedMoves.length;
+            crossZoneDiag.details.push(...missedMoves.map(m => ({
+              nodeId: m.id, oldPk: m.oldPk, newPk: m.newPk, error: '移动未落地（宿主未生效）'
+            })));
+            throw error;
+          }
+        }
+
+
         // ===== 删除传播修复 =====
         // merge.js 已把「命中云端墓碑的本地节点」标记在 localDeletedIds，但合并落盘时
         // mergedTree 仍含这些节点（它只是合并前的本地树快照），导致落盘把它们当「本地应有」
@@ -949,74 +1042,6 @@ async function doMergeSync(options) {
           throw error;
         }
 
-        // ★ 落盘校验：本机必须真的停在云端的位置上，才允许把本机树写回云端。
-        //   部分移动端宿主的 bookmarks.move 会「回调成功但实际不动」（或被宿主自己的
-        //   书签同步立刻改回去），旧实现只信封装的返回值：合并报告成功、随后把本机的
-        //   旧位置 PUT 上云 —— 另一台设备只能跟随，用户看到的就是「移动被还原」。
-        //   与其覆盖云端，不如明确失败：云端保留新位置，本轮报错让用户重试/排查。
-        if (appliedMoves.length > 0) {
-          const verifyLive = async () => {
-            const flat = MiniSync.merger.chromeTreeToList(await MiniSync.syncInput.getChromeTree());
-            return new Map(flat.map(n => [String(n.id), n]));
-          };
-          let liveById = await verifyLive();
-          const findMissed = () => appliedMoves.filter(m => {
-            const n = liveById.get(String(m.id));
-            return !n || String(n.parentId) !== String(m.newParentId);
-          });
-          let missedMoves = findMissed();
-          // 宿主可能把 move 推迟到下一个 tick 才落盘：先等一拍再复核，避免无谓重建。
-          if (missedMoves.length > 0) {
-            await new Promise(resolve => setTimeout(resolve, 120));
-            liveById = await verifyLive();
-            missedMoves = findMissed();
-          }
-          // 兜底：move 不生效但 create/remove 可用时，按「下载」路径的做法重建一份
-          // （先建后删，建失败就什么都不删）。只处理书签；文件夹要整棵重建，风险大，
-          // 留给用户明确失败，绝不偷偷删子树。
-          let repaired = 0;
-          const stillMissed = [];
-          for (const m of missedMoves) {
-            const node = liveById.get(String(m.id));
-            if (!node || !node.url) { stillMissed.push(m); continue; }
-            let createdId = null;
-            try {
-              const created = await bookmarkWrite('create', {
-                parentId: String(m.newParentId), title: node.title || '', url: node.url
-              });
-              createdId = String(created.id);
-              await bookmarkWrite('remove', String(m.id));
-              // 旧节点没删掉 = 重建会留下副本：撤销新建，按失败处理（回滚交给备份）。
-              const after = await verifyLive();
-              if (after.has(String(m.id)) || !after.has(createdId)) {
-                try { await bookmarkWrite('remove', createdId); } catch (_) { /* 见下：写集兜底 */ }
-                stillMissed.push(m);
-                continue;
-              }
-              mergeCreatedIds.add(createdId);
-              repaired++;
-              liveById = after;
-            } catch (e) {
-              if (createdId) { try { await bookmarkWrite('remove', createdId); } catch (_) { /* 写集兜底 */ } }
-              stillMissed.push(m);
-            }
-          }
-          movesRepaired = repaired;
-          missedMoves = stillMissed;
-          if (missedMoves.length > 0) {
-            const error = new Error(
-              `本机未能把 ${missedMoves.length} 个书签/文件夹移动到云端的新位置（宿主未落盘），`
-              + '已停止写回云端以保护书签');
-            error.failureCount = missedMoves.length;
-            error.moveVerification = missedMoves;
-            crossZoneDiag.failed += missedMoves.length;
-            crossZoneDiag.details.push(...missedMoves.map(m => ({
-              nodeId: m.id, oldPk: m.oldPk, newPk: m.newPk, error: '移动未落地（宿主未生效）'
-            })));
-            throw error;
-          }
-        }
-
         // C3（延后执行）：落盘重排之后，用「融合后的本地树」写回云端。
         // 此时本地顺序已是合并结果（含对端新顺序），写回云端不会把新顺序覆盖掉。
         if (needWriteBack) {
@@ -1024,6 +1049,24 @@ async function doMergeSync(options) {
           // ★ 云端收到的就是这棵树：提交后用它做基线。PUT 等待期间用户新拖的移动
           //   不在其中，不能进基线（否则下一轮会把它判成「跟随云端」迁回旧位置）。
           confirmedFlat = MiniSync.merger.chromeTreeToList(finalTree);
+          // 写云前最后一次复核：导入/重排/收养迁移可能又动过这些节点，宿主也可能
+          // 延迟把移动改回去。只要有一条不在目标父节点下，就绝不写回（云端保持原样）。
+          if (appliedMoves.length > 0) {
+            const finalById = new Map(confirmedFlat.map(n => [String(n.id), n]));
+            const lateMissed = appliedMoves.filter(m => {
+              const n = finalById.get(String(m.id));
+              return !n || String(n.parentId) !== String(m.newParentId);
+            });
+            if (lateMissed.length > 0) {
+              const error = new Error(
+                `写回前复核发现 ${lateMissed.length} 个书签/文件夹不在云端的新位置，`
+                + '已停止写回云端以保护书签');
+              error.failureCount = lateMissed.length;
+              error.moveVerification = lateMissed;
+              crossZoneDiag.failed += lateMissed.length;
+              throw error;
+            }
+          }
           const deviceId = await MiniSync.storage.getDeviceId();
           // ★ 墓碑用 mergeBookmarks 落定的**并集**（本地 ∪ 云端），不能用本地存储单独取：
           //   只写本机墓碑 = 把云端带来的墓碑整份冲掉，其他端从此再也学不到这次删除
@@ -1050,7 +1093,7 @@ async function doMergeSync(options) {
           const putResult = await MiniSync.webdav.putFile(config.url, config.username, config.password, config.filename, xbelString, undefined,
             remoteWriteCondition);
           mainCommitted = true;
-          mergeWriteProtectionNote = MiniSync.webdav.writeProtectionNote(putResult.protection);
+          mergeWriteProtectionNote = await MiniSync.syncInput.writeProtectionNoteOnce(putResult.protection);
           // ★ 本端把墓碑成功写上了云 ⇒ 这些 key 就是「已确认上云」。
           //   撤销判定（tombstone.js 条件 ⑤）要求这条证据：只依赖「读到云端墓碑」不够，
           //   本端自己发布的墓碑不会再被自己读到，否则「另一设备重新添加」永远撤销不了

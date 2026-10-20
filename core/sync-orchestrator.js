@@ -175,7 +175,7 @@ async function doUploadBookmarks(options) {
       writeCondition);
     mainCommitted = true;
     const backupCompletion = await MiniSync.syncInput.completeLocalBackup();
-    uploadNote += MiniSync.webdav.writeProtectionNote(putResult.protection);
+    uploadNote += await MiniSync.syncInput.writeProtectionNoteOnce(putResult.protection);
     // ★ 上传写的就是本机这一刻的树：本轮开始前的移动意图已随之上云，留着只会让
     //   下一轮把自己当成发起方、反过来拒绝跟随云端后来的移动。同步等待期间用户
     //   新拖的（time > cutoff）保留。

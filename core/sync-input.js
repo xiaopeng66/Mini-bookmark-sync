@@ -793,6 +793,34 @@ async function clearConfirmedMoveIntents(cutoffAt) {
   }
 }
 
+/**
+ * 并发保护降档提示：**同一级别只提示一次**。
+ *
+ * 坚果云这类服务不返回可用 ETag，于是每一轮上传/合并都会在结果里追加一句
+ * 「本次写入没有并发保护」。事实没错，但每 30 分钟弹一次没有新信息，用户只看到
+ * 满屏提示（实测反馈：不想要这些提示）。级别再次降档（例如从
+ * last-modified 变成 none）时重新提示一次；恢复到满档时清掉记录，之后若再降档
+ * 仍会提示。
+ *
+ * 提示本身不丢失：诊断/控制台日志里仍有完整的保护级别说明。
+ * @param {'etag'|'last-modified'|'none'|string} protection
+ * @returns {Promise<string>} 需要追加到结果文案的说明（空串=不提示）
+ */
+async function writeProtectionNoteOnce(protection) {
+  const note = MiniSync.webdav.writeProtectionNote(protection);
+  try {
+    const data = await MiniSync.storage.getLocal(['last_write_protection']);
+    const previous = data.last_write_protection || '';
+    if (!note) {
+      if (previous) await MiniSync.storage.setLocal({ last_write_protection: '' });
+      return '';
+    }
+    if (previous === protection) return '';
+    await MiniSync.storage.setLocal({ last_write_protection: protection });
+  } catch (_) { /* 记账失败不影响同步，也不能把提示弄丢 */ }
+  return note;
+}
+
 // ================================================================
 //  「同步文件夹」设置解析（单同步桶）
 // ================================================================
@@ -1116,6 +1144,7 @@ return {
   ensureSyncRelationship,
   recordLastSync,
   clearConfirmedMoveIntents,
+  writeProtectionNoteOnce,
   resolveSyncBucketSetting,
   saveLocalSnapshot,
   saveLocalTreeSnapshot,
