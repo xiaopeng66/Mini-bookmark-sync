@@ -353,6 +353,12 @@ MARKERS = {
         # v2.3.2：同步自身落盘的移动登记为事务移动；提交成功后清理已确认的移动意图
         'noteTransactionMove',
         'clearConfirmedMoveIntents',
+        # v2.3.4：移动落盘校验——宿主 move 静默不生效时先等一拍复核，书签按
+        # 「先建后删」重建落地；仍无法落地就中止（不写回云端），绝不覆盖云端。
+        'appliedMoves',
+        'missedMoves',
+        'movesRepaired',
+        '移动未落地',
     ],
     'lib/import.js': [
         'byBucket',

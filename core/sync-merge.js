@@ -397,6 +397,11 @@ async function doMergeSync(options) {
     let mergedFolderCount; // 文件夹数（无 url 的节点）供控制台日志
     let mergedTotal; // 总数（书签+文件夹）供控制台日志
     const crossZoneDiag = { moves: 0, failed: 0, degraded: 0, skippedNoParent: 0, details: [] }; // 跨区移动诊断
+    // 本轮真正要求本机落地的移动（跟随云端的位置调整）。落盘后必须逐条验证：
+    // 部分移动端宿主的 bookmarks.move 会「回调成功但实际不动」，旧实现照样写回云端 ——
+    // 等于用本机的旧位置覆盖云端，另一台设备再同步就被还原（用户实测）。
+    const appliedMoves = [];
+    let movesRepaired = 0;
     // 落盘结果（importBookmarksFromData 的返回值），供最终统计展示实际增删。
     // 必须声明在 try 外：import 调用点在 try 内深层块，而 return 在 try/catch 之后读取它。
     let importResult = null;
@@ -576,6 +581,7 @@ async function doMergeSync(options) {
             try {
               if (MiniSync.utils && MiniSync.utils.noteTransactionMove) MiniSync.utils.noteTransactionMove(nodeId);
               await bookmarkWrite('move', nodeId, { parentId: newParentId });
+              appliedMoves.push({ id: String(nodeId), oldPk, newPk, newParentId });
               await refreshMoveView();
             } catch (e) {
               crossZoneDiag.failed++;
@@ -943,6 +949,74 @@ async function doMergeSync(options) {
           throw error;
         }
 
+        // ★ 落盘校验：本机必须真的停在云端的位置上，才允许把本机树写回云端。
+        //   部分移动端宿主的 bookmarks.move 会「回调成功但实际不动」（或被宿主自己的
+        //   书签同步立刻改回去），旧实现只信封装的返回值：合并报告成功、随后把本机的
+        //   旧位置 PUT 上云 —— 另一台设备只能跟随，用户看到的就是「移动被还原」。
+        //   与其覆盖云端，不如明确失败：云端保留新位置，本轮报错让用户重试/排查。
+        if (appliedMoves.length > 0) {
+          const verifyLive = async () => {
+            const flat = MiniSync.merger.chromeTreeToList(await MiniSync.syncInput.getChromeTree());
+            return new Map(flat.map(n => [String(n.id), n]));
+          };
+          let liveById = await verifyLive();
+          const findMissed = () => appliedMoves.filter(m => {
+            const n = liveById.get(String(m.id));
+            return !n || String(n.parentId) !== String(m.newParentId);
+          });
+          let missedMoves = findMissed();
+          // 宿主可能把 move 推迟到下一个 tick 才落盘：先等一拍再复核，避免无谓重建。
+          if (missedMoves.length > 0) {
+            await new Promise(resolve => setTimeout(resolve, 120));
+            liveById = await verifyLive();
+            missedMoves = findMissed();
+          }
+          // 兜底：move 不生效但 create/remove 可用时，按「下载」路径的做法重建一份
+          // （先建后删，建失败就什么都不删）。只处理书签；文件夹要整棵重建，风险大，
+          // 留给用户明确失败，绝不偷偷删子树。
+          let repaired = 0;
+          const stillMissed = [];
+          for (const m of missedMoves) {
+            const node = liveById.get(String(m.id));
+            if (!node || !node.url) { stillMissed.push(m); continue; }
+            let createdId = null;
+            try {
+              const created = await bookmarkWrite('create', {
+                parentId: String(m.newParentId), title: node.title || '', url: node.url
+              });
+              createdId = String(created.id);
+              await bookmarkWrite('remove', String(m.id));
+              // 旧节点没删掉 = 重建会留下副本：撤销新建，按失败处理（回滚交给备份）。
+              const after = await verifyLive();
+              if (after.has(String(m.id)) || !after.has(createdId)) {
+                try { await bookmarkWrite('remove', createdId); } catch (_) { /* 见下：写集兜底 */ }
+                stillMissed.push(m);
+                continue;
+              }
+              mergeCreatedIds.add(createdId);
+              repaired++;
+              liveById = after;
+            } catch (e) {
+              if (createdId) { try { await bookmarkWrite('remove', createdId); } catch (_) { /* 写集兜底 */ } }
+              stillMissed.push(m);
+            }
+          }
+          movesRepaired = repaired;
+          missedMoves = stillMissed;
+          if (missedMoves.length > 0) {
+            const error = new Error(
+              `本机未能把 ${missedMoves.length} 个书签/文件夹移动到云端的新位置（宿主未落盘），`
+              + '已停止写回云端以保护书签');
+            error.failureCount = missedMoves.length;
+            error.moveVerification = missedMoves;
+            crossZoneDiag.failed += missedMoves.length;
+            crossZoneDiag.details.push(...missedMoves.map(m => ({
+              nodeId: m.id, oldPk: m.oldPk, newPk: m.newPk, error: '移动未落地（宿主未生效）'
+            })));
+            throw error;
+          }
+        }
+
         // C3（延后执行）：落盘重排之后，用「融合后的本地树」写回云端。
         // 此时本地顺序已是合并结果（含对端新顺序），写回云端不会把新顺序覆盖掉。
         if (needWriteBack) {
@@ -1166,6 +1240,9 @@ async function doMergeSync(options) {
           // 的唯一凭据（localMoved>0 = 本端是发起方并写回云端；movedPairs>0 = 本端跟随云端）。
           localMoved: (mergeResult && mergeResult.localMovedCount) || 0,
           movedPairs: (mergeResult && mergeResult.renamePairs ? mergeResult.renamePairs.length : 0),
+          // 本机要求落地并经过校验的移动数 / 其中宿主不支持直接 move、改为「先建后删」的条数。
+          movesApplied: appliedMoves.length,
+          movesRepaired,
           // 重排阶段的真实代价：手机端 console 读不到，这两个数是唯一能看出「卡不卡」的证据。
           // 顺序本来就一致时 movesAttempted 必须是 0（2026-10-05 手机卡顿的根因就是它不是 0）。
           movesAttempted: (importResult && importResult.movesAttempted) || 0,
@@ -1183,6 +1260,7 @@ async function doMergeSync(options) {
         partial: warnings.length > 0, bridgeResults: bridgeOutcome.bridgeResults, error: warnings.join('；') });
     } catch (e) { warnings.push('同步状态保存失败: ' + e.message); }
     const mergeMessage = buildMergeMessage(failedWrites, conflictSamples, crossZoneDiag, importResult, remoteSpliced)
+      + (movesRepaired > 0 ? `（本机宿主未支持直接移动，已重建 ${movesRepaired} 项落地）` : '')
       + (warnings.length ? '（主文件已同步，' + warnings.join('；') + '）' : '') + mergeWriteProtectionNote;
     return {
       success: true,
