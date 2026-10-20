@@ -108,6 +108,23 @@ describe('书签跨文件夹移动 — 旧位置不复活（5f 书签移动识�
     expect(result.renamePairs.length).toBe(0);
   });
 
+  // ★ 用户实测：移动后同步，位置被还原。监听在同步进行中被跳过、意图过期、或宿主
+  //   根本没派发 onMoved 时，意图表是空的 —— 此时必须靠「上次成功同步基线」判出
+  //   本端是发起方，否则合并把这次移动当成「跟随云端」，落盘时直接迁回旧位置。
+  test('发起端（意图缺失，仅基线证明本端发起）：不迁回，且必须写回云端', async () => {
+    await installStorage([]);
+    const before = localTree([X('xa')], []);             // 上次同步时：X 在 FolderA
+    storageState.sync_snapshots = { localTree: M.merger.chromeTreeToList(before) };
+    const localTreeArg = localTree([], [X('xa')]);       // 现在：X 已挪到 FolderB
+    const remote = remoteData([{ ...X('ra') }], []);     // 云端仍是旧位置
+    const result = await M.merger.mergeBookmarks(localTreeArg, remote, {});
+
+    expect(result.renamePairs.length).toBe(0);
+    expect(result.localMovedCount).toBe(1);
+    // 源文件夹里没有其它兄弟节点、也没有墓碑差异：写回只能由「本端发起的移动」触发
+    expect(result.remoteUpdated).toBe(true);
+  });
+
   test('接收端（无移动意图）：生成迁移对（本地跟随云端）', async () => {
     await installStorage([]);
     const localTreeArg = localTree([X('xa')], []); // 本地：X 在 FolderA（未同步移动）
@@ -256,5 +273,26 @@ describe('顺序传播 — _index 语义归一化（orderChanged）', () => {
     const remote = remoteData([], [RB, RA]);         // 云端 FolderB 下 [B,A]
     const result = await M.merger.mergeBookmarks(localTreeArg, remote, {});
     expect(result.orderChanged).toBe(true);
+  });
+});
+
+describe('移动身份证据 — 用 chrome id 区分「移动」与「同名同 URL 的新建副本」', () => {
+  test('移动：基线里同一 id 在云端那条路径上 ⇒ 本端是发起方', async () => {
+    await installStorage([]);
+    const before = localTree([X('xa')], []);
+    storageState.sync_snapshots = { localTree: M.merger.chromeTreeToList(before) };
+    const result = await M.merger.mergeBookmarks(localTree([], [X('xa')]), remoteData([X('ra')], []), {});
+    expect(result.localMovedCount).toBe(1);
+    expect(result.renamePairs.length).toBe(0);
+  });
+
+  test('新建同名副本（id 不在基线里）⇒ 不冒充移动，仍按接收方跟随云端', async () => {
+    await installStorage([]);
+    const before = localTree([X('xa')], []);
+    storageState.sync_snapshots = { localTree: M.merger.chromeTreeToList(before) };
+    // 本地 B 下多了一个全新的同标题同 URL 书签（新 id），云端仍在 A 下
+    const result = await M.merger.mergeBookmarks(localTree([], [X('xnew')]), remoteData([X('ra')], []), {});
+    expect(result.localMovedCount).toBe(0);
+    expect(result.renamePairs.length).toBeGreaterThan(0);
   });
 });

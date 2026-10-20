@@ -567,6 +567,7 @@ async function restoreLocalBackupTree(backup, options, meta) {
         }
         const parent = liveNodes.get(entry.parentId);
         if (String(live.parentId) !== entry.parentId || String((parent.children || [])[entry.index]?.id) !== entry.id) {
+          if (MiniSync.utils && MiniSync.utils.noteTransactionMove) MiniSync.utils.noteTransactionMove(entry.id);
           await call('move', entry.id, { parentId: entry.parentId, index: entry.index });
           const oldParent = liveNodes.get(String(live.parentId));
           if (oldParent) oldParent.children = (oldParent.children || []).filter(child => String(child.id) !== entry.id);
@@ -762,6 +763,34 @@ async function recordLastSync(mode, count) {
       chrome.storage.local.set(update, resolve);
     });
   } catch (e) {}
+}
+
+/**
+ * 成功把本机状态写回云端之后清理移动意图。
+ *
+ * 移动意图只用来回答「这次路径变化是谁改的」。一旦云端已经收到本机这一刻的树
+ * （上传/合并提交成功），cutoff 之前登记的意图都已被确认或不再影响判定，继续留着
+ * 会让下一轮合并误以为本端仍是发起方，反过来拒绝跟随云端后来的移动。
+ * cutoff 之后登记的意图（同步等待期间用户新拖的）必须保留 —— 那才是尚未上云的改动。
+ *
+ * @param {number} cutoffAt 本轮同步开始的时间
+ * @returns {Promise<number>} 清掉的条数
+ */
+async function clearConfirmedMoveIntents(cutoffAt) {
+  try {
+    const data = await MiniSync.storage.getLocal(['sync_move_intents']);
+    const intents = data.sync_move_intents || {};
+    let removed = 0;
+    for (const key of Object.keys(intents)) {
+      const at = intents[key] && typeof intents[key].time === 'number' ? intents[key].time : 0;
+      if (at <= cutoffAt) { delete intents[key]; removed++; }
+    }
+    if (removed > 0) await MiniSync.storage.setLocal({ sync_move_intents: intents });
+    return removed;
+  } catch (e) {
+    console.warn('[sync] 清理移动意图失败（忽略）:', e.message);
+    return 0;
+  }
 }
 
 // ================================================================
@@ -1079,6 +1108,7 @@ return {
   restoreLocalBackup,
   ensureSyncRelationship,
   recordLastSync,
+  clearConfirmedMoveIntents,
   resolveSyncBucketSetting,
   saveLocalSnapshot,
   saveLocalTreeSnapshot,

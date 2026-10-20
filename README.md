@@ -4,10 +4,20 @@
 > 本仓库是 [原项目](https://github.com/jagshen/Mini-bookmark-sync) 的维护版：保留原项目的全部功能，
 > 并补上手机端支持、双向增量增删，以及一批跨端同步的一致性修复。
 
-[![Version](https://img.shields.io/badge/version-2.3.1-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
+[![Version](https://img.shields.io/badge/version-2.3.2-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
+
+## v2.3.2 发布说明
+
+修复跨文件夹移动书签/文件夹后位置被还原的问题，并让浏览器启动后自动同步一次。
+
+- 把书签或文件夹拖到另一个文件夹，同步后另一端能拿到新位置，不再被还原到原处；源文件夹里只有这一项时同样能传播。
+- 同步进行中拖动书签也会被记录，不再因为「正在同步」而丢失这次移动。
+- 浏览器打开后，只要自动同步已开启且 WebDAV 配置完整，会额外同步一次，不必等定时间隔到点；与「错过补跑」不会重复执行。
+
+923 条 JavaScript 回归通过。验证使用隔离模拟数据，没有完成真实手机、浏览器 GUI 或生产 WebDAV 验收。安装仍由宿主浏览器确认。详见 [完整发布说明](docs/release-v2.3.2.md)。
 
 ## v2.3.1 发布说明
 

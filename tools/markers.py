@@ -76,9 +76,18 @@ MARKERS = {
         '_catchUpInFlight',
         '_autoSyncInFlight',
         '自动同步已有一轮在跑，本轮跳过',
+        # v2.3.2：① 浏览器启动、配置检查通过后额外同步一轮（只挂 onStartup，
+        #   绝不挂顶层 —— MV3 的 SW 会在会话里被反复唤醒）；
+        #   ② 同步进行中用户拖动书签也必须记录移动意图，同步自身的落盘移动则排除。
+        'syncOnceOnStartup',
+        'lastStartupSync',
+        'isTransactionMove',
     ],
     'lib/utils.js': [
         'PERMISSION_API_UNAVAILABLE',
+        # v2.3.2：事务内移动登记（同步自身落盘的移动不得记成用户意图）
+        'noteTransactionMove',
+        'isTransactionMove',
         'isHandlingUserInput',
         'collectDiagnostics',
         'describeBookmarkCount',
@@ -341,10 +350,15 @@ MARKERS = {
         'ensureMoveParent',
         'refreshMoveView',
         'canonicalOldPk',
+        # v2.3.2：同步自身落盘的移动登记为事务移动；提交成功后清理已确认的移动意图
+        'noteTransactionMove',
+        'clearConfirmedMoveIntents',
     ],
     'lib/import.js': [
         'byBucket',
         'byUserTarget',
+        # v2.3.2：落盘/重排自身的移动登记为事务移动（onMoved 监听不得当成用户意图）
+        'noteTransactionMove',
         'rootChildTitles',
         'zoneIds',
         'landedSample',
@@ -391,6 +405,12 @@ MARKERS = {
         'localRenamed',
         '_decideRenameDiscard',
         'homeNodeId',
+        # v2.3.2：移动方向改用「意图 + 基线身份证据」双判据；本端发起的移动必须写回云端
+        # （源文件夹只有这一个书签时，旧实现没有任何写回条件成立 ⇒ 位置被还原）。
+        'baselinePkById',
+        'localMovedSinceBaseline',
+        'localMoveAuthored',
+        'localMovedCount',
     ],
     'model/xbel-path.js': [
         'node.zoneRoot',
@@ -418,6 +438,8 @@ MARKERS = {
         'dropContainer',
         'hasKeptDescendant',
         'writeSet',
+        # v2.3.2：同步成功后清理「已确认上云」的移动意图（保留同步期间新拖的）
+        'clearConfirmedMoveIntents',
     ],
     'popup.html': [
         '增量：云端新增的导入本机',

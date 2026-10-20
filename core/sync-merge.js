@@ -208,6 +208,7 @@ async function applyBridgeRemaps(list, remaps, bucketId, createdIds) {
           Object.assign(current, update);
         }
         if (String(current.parentId) !== parentId) {
+          if (MiniSync.utils && MiniSync.utils.noteTransactionMove) MiniSync.utils.noteTransactionMove(current.id);
           await bookmarkWrite('move', String(current.id), { parentId });
           current.parentId = parentId;
         }
@@ -231,6 +232,8 @@ function mergeSync(options) {
 
 async function doMergeSync(options) {
   options = options || {};
+  // 本轮开始前登记的移动意图，在本轮提交成功后即视为已确认（见 clearConfirmedMoveIntents）
+  const moveIntentCutoff = Date.now();
   // 拿到锁后状态仍是 SYNCING → 必为 SW 崩溃/重启残留，恢复为 IDLE
   const status = await MiniSync.storage.getSyncStatus();
   if (status.status === SYNCING) {
@@ -568,6 +571,7 @@ async function doMergeSync(options) {
               continue;
             }
             try {
+              if (MiniSync.utils && MiniSync.utils.noteTransactionMove) MiniSync.utils.noteTransactionMove(nodeId);
               await bookmarkWrite('move', nodeId, { parentId: newParentId });
               await refreshMoveView();
             } catch (e) {
@@ -1102,6 +1106,13 @@ async function doMergeSync(options) {
       } catch (e) {
         console.warn('[sync] 清理移动意图失败（忽略，下轮会重新判定）:', e.message);
       }
+    }
+    // 本轮开始前登记的意图（包括本轮没匹配到移动对的）也一并清掉：提交成功意味着
+    // 云端已收到本机这一刻的树（本端发起的移动必定触发写回，见 merge.js remoteUpdated），
+    // 再留着只会让下一次合并误以为本端仍是发起方、拒绝跟随云端后来的移动。
+    // 同步等待期间用户新拖的意图（time > cutoff）保留，等下一轮带上云。
+    if (MiniSync.syncInput.clearConfirmedMoveIntents) {
+      await MiniSync.syncInput.clearConfirmedMoveIntents(moveIntentCutoff);
     }
 
     // 同步成功后刷新本地快照（供删除监听回溯被删节点 pathKey）

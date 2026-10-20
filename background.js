@@ -184,7 +184,15 @@ if (HAS_BOOKMARKS_API && chrome.bookmarks.onMoved) {
 chrome.bookmarks.onMoved.addListener((id, moveInfo) => {
   (async () => {
     const curStatus = await MiniSync.storage.getSyncStatus();
-    if (curStatus.status === SYNCING) return; // 落盘自身的移动不产生也不清理墓碑
+    const syncing = curStatus.status === SYNCING;
+    // ★ 同步进行中只忽略【本轮同步自己造成的】移动（落盘、重排、跨区迁移都走
+    //   chrome.bookmarks.move）。用户完全可能在同步期间手动拖动书签：那一次必须
+    //   照常记录移动意图，否则下一轮合并会把它判成「跟随云端」，把书签迁回原位
+    //   （实测：移动书签后同步，位置被还原；另一端也拿不到这次移动）。
+    //   旧实现这里直接 return，用户移动的意图、墓碑清理、防抖触发全部被吞掉。
+    if (syncing && MiniSync.utils.isTransactionMove && MiniSync.utils.isTransactionMove(id)) {
+      return;
+    }
     const data = await MiniSync.storage.getLocal([STORAGE_KEYS.TOMBSTONES]);
     const tombstones = data[STORAGE_KEYS.TOMBSTONES] || [];
 
@@ -232,8 +240,10 @@ chrome.bookmarks.onMoved.addListener((id, moveInfo) => {
       await MiniSync.storage.setLocal({ sync_move_intents: intents });
     }
 
-    // 4. 清理相关墓碑（有墓碑才清）
-    if (tombstones.length) {
+    // 4. 清理相关墓碑（有墓碑才清）。
+    //    同步进行中不清理：本轮合并可能正拿着这份墓碑视图在做删除判定，
+    //    中途改写会让同一次同步的两半看到不同的删除记录。意图已经记下，下一轮再清。
+    if (!syncing && tombstones.length) {
       const filtered = tombstones.filter(t => !affected.has(t.key));
       if (filtered.length !== tombstones.length) {
         await MiniSync.storage.setLocal({ [STORAGE_KEYS.TOMBSTONES]: filtered });
@@ -245,7 +255,8 @@ chrome.bookmarks.onMoved.addListener((id, moveInfo) => {
     //    若只依赖下个自动同步周期（默认 30 分钟）：① 移动要等最长一个间隔才传播；
     //    ② 一旦合并时超出移动意图 TTL，本端会被判为「接收方」，把本次移动
     //    迁回云端旧位置（表现为「挪动书签后自动同步，书签又跑回原处」）。
-    if (affected.size > 0) {
+    //    同步进行中不触发：已经有事务在跑，这一轮改动会在下一轮自动同步带上。
+    if (!syncing && affected.size > 0) {
       const moveCfg = await MiniSync.storage.getLocal(['sync_enabled', 'webdav_url']);
       if (moveCfg.sync_enabled && moveCfg.webdav_url) {
         if (_moveDebounceTimer) clearTimeout(_moveDebounceTimer);
@@ -383,6 +394,15 @@ chrome.runtime.onStartup.addListener(async () => {
   } catch (e) {
     console.warn('[MiniSync] 启动补跑自动同步失败:', e.message);
   }
+  // 用户要求：浏览器打开、配置检查完就额外同步一次，不必等定时器到点。
+  // 放在补跑之后：补跑已经跑过一轮时本轮启动就不再重复（见 syncOnceOnStartup）。
+  try {
+    await syncOnceOnStartup('startup');
+  } catch (e) {
+    console.warn('[MiniSync] 启动后额外同步失败:', e.message);
+  }
+  // 结论落盘：消息通道不通的宿主上，设置页/诊断报告仍能读到这轮启动同步跑了没有。
+  await persistAutoSyncReport();
 });
 
 // ★ 同步任务（上传/下载/合并）进行中判定：供检测类消息短路，
@@ -1243,9 +1263,10 @@ async function setupAutoSyncAlarm() {
  *   SYNC_BUSY，往日志里写下「自动同步未完成: 同步进行中，请稍候」。用户看到的
  *   是「同步失败报错」，其实同步跑成了，只是被自己的第二趟撞了一下。
  *   锁挡得住并发，但挡不住这种自撞：这里在更外层先合流，第二趟直接搭第一趟的车。
- * @param {{from:'alarm'|'catch-up'}} [opts] 触发来源，只进日志与下次时间台账
+ * @param {{from:'alarm'|'catch-up'|'startup'}} [opts] 触发来源，只进日志与下次时间台账
  */
 let _autoSyncInFlight = null;
+let _lastAutoSyncStartedAt = 0;
 function runAutoSyncSafely(opts) {
   if (_autoSyncInFlight) return _autoSyncInFlight;
   const p = _doRunAutoSyncSafely(opts)
@@ -1259,6 +1280,7 @@ async function _doRunAutoSyncSafely(opts) {
   try {
     const status = await MiniSync.storage.getSyncStatus();
     if (status.status === SYNCING) return;   // 上一轮还在跑，本轮跳过（不并发写云端）
+    _lastAutoSyncStartedAt = Date.now();
     const result = await runAutoSync();
     // 记下次该跑的时间：关着的窗口由 catchUpMissedAutoSync 补，开着的时候由 alarm 到点跑
     const cfg = await MiniSync.storage.getLocal(['sync_interval']);
@@ -1329,6 +1351,74 @@ async function _doCatchUpMissedAutoSync() {
   note(true, '到点补跑', { dueAt: dueAt });
   await runAutoSyncSafely({ from: 'catch-up' });
   return { ran: true, dueAt: dueAt };
+}
+
+/**
+ * 浏览器启动后的「额外一轮」同步（用户明确要求：打开浏览器、配置检查完就同步一次，
+ * 不必等定时器到点）。
+ *
+ * 与「错过补跑」的分工：
+ *   · 补跑只在**已到点**时跑（间隔没到就不跑）；
+ *   · 这里不管间隔，只要自动同步开着、WebDAV 配置完整，就同步一次 ——
+ *     浏览器刚打开时本机书签很可能已被上次会话的离线改动改过，先对齐一次最稳。
+ *
+ * 必须防的三件事：
+ *   ① 同一轮启动里补跑已经跑过 ⇒ 不重复跑（两次背靠背的云端写入没有意义）；
+ *   ② MV3 的 Service Worker 会在会话中被反复唤醒，而 onStartup 只在浏览器启动时派发 ——
+ *      本函数只挂在 onStartup 上，绝不放顶层，否则每次唤醒都会同步；
+ *   ③ 与手动点击/定时器并发 ⇒ 走 runAutoSyncSafely 的在途合流与 storage 锁。
+ *
+ * 诊断：结论写进 _autoAlarm.lastStartupSync（随 auto_sync_report 落盘），
+ * 手机端 console 读不到时，设置页/诊断报告照样能看出「这轮启动到底同步没有、为什么没同步」。
+ * @param {string} [reason] 触发来源，只进台账
+ * @returns {Promise<{ran:boolean, reason?:string}>}
+ */
+let _startupSyncPromise = null;
+function syncOnceOnStartup(reason) {
+  if (_startupSyncPromise) return _startupSyncPromise;
+  _startupSyncPromise = (async () => {
+    const note = (ran, text, extra) => {
+      _autoAlarm = Object.assign({}, _autoAlarm, {
+        lastStartupSync: Object.assign({ at: Date.now(), ran: !!ran, reason: text || null,
+          from: reason || 'startup' }, extra || {})
+      });
+      return Object.assign({ ran: !!ran, reason: text || undefined }, extra || {});
+    };
+    const r = await MiniSync.storage.getLocal([
+      'sync_enabled', 'webdav_url', 'webdav_user', 'webdav_password', 'sync_interval'
+    ]);
+    // 「配置检查」：自动同步开着 + WebDAV 三项齐全才动手。缺一项就如实记账，
+    // 绝不拿空配置去发请求（那只会得到一次必然失败的网络错误）。
+    const syncEnabled = !!r.sync_enabled;
+    const configComplete = !!(r.webdav_url && r.webdav_user && r.webdav_password);
+    if (!syncEnabled || !configComplete) {
+      return note(false, !syncEnabled ? '自动同步未开启' : 'WebDAV 配置不完整',
+        { syncEnabled, configComplete });
+    }
+    // 补跑刚跑过就别再跑：同一轮启动只对齐一次云端（默认间隔 30 分钟，
+    // 用 2 分钟窗口判定"刚刚"；正常的浏览器启动不会在两分钟内发生两次）。
+    if (_lastAutoSyncStartedAt && Date.now() - _lastAutoSyncStartedAt < 2 * 60 * 1000) {
+      return note(false, '本轮启动已同步过', { sinceLast: Date.now() - _lastAutoSyncStartedAt });
+    }
+    // 先把下次时间推到未来：这一轮就是本会话的第一轮，避免并发进来的补跑判定
+    // 把同一次再算一遍（与 _doCatchUpMissedAutoSync 的写入屏障同口径）。
+    const interval = MiniSync.utils.clampSyncInterval(r.sync_interval);
+    try {
+      await MiniSync.storage.setLocal({ auto_sync_next_at: Date.now() + interval * 60000 });
+    } catch (e) {
+      console.warn('[MiniSync] 启动同步记账失败（继续同步）:', e.message);
+    }
+    note(true, '启动后同步');
+    await runAutoSyncSafely({ from: 'startup' });
+    return { ran: true };
+  })().catch((e) => {
+    _autoAlarm = Object.assign({}, _autoAlarm, {
+      lastStartupSync: { at: Date.now(), ran: false, reason: 'error: ' + ((e && e.message) || String(e)) }
+    });
+    console.warn('[MiniSync] 启动后额外同步失败:', e && e.message);
+    return { ran: false, reason: 'error' };
+  });
+  return _startupSyncPromise;
 }
 
 /**

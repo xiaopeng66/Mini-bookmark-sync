@@ -1022,3 +1022,112 @@ describe('自动同步：宿主给的是「一调就抛」的 alarms + 消息通
     expect(self.autoSync.state.lastError).toContain('宿主拒绝创建定时器');
   });
 });
+
+// 用户要求：浏览器打开、配置检查完就额外同步一次，不必等自动同步间隔到点。
+// 关键约束：
+//   ① 只在【浏览器启动】(onStartup) 跑，绝不能挂到顶层 —— MV3 的 Service Worker
+//      会在会话里被反复唤醒，挂顶层就是每次唤醒都同步一次；
+//   ② 配置不完整（缺地址/账号/密码）不跑，也不发必然失败的请求；
+//   ③ 同一轮启动里「错过补跑」已经跑过就不再跑第二轮；
+//   ④ 结论必须落盘（auto_sync_report.alarm.lastStartupSync），消息通道坏掉也看得见。
+describe('自动同步：浏览器启动后的额外一轮（配置检查通过才跑）', () => {
+  const CONFIGURED = {
+    sync_enabled: true, webdav_url: 'https://dav.example/dav/',
+    webdav_user: 'user', webdav_password: 'pass', sync_interval: 30
+  };
+  const flush = (ms) => new Promise((r) => realSetTimeout(r, ms || 5));
+  const makeStub = (calls) => (sandbox) => {
+    sandbox.MiniSync.actions.mergeSync = (o) => {
+      calls.push(o);
+      return Promise.resolve({ success: true, message: '启动同步成功', stats: { added: 0, removed: 0 } });
+    };
+  };
+
+  test('★ 间隔没到也跑（启动即对齐一次），并把下次时间推到未来', async () => {
+    const calls = [];
+    const bg = loadBackground({
+      withBookmarks: true,
+      initialStorage: Object.assign({}, CONFIGURED, { auto_sync_next_at: Date.now() + 600000 }),
+      patch: makeStub(calls)
+    });
+    await flush();                                   // 顶层启动段：未到点、不补跑
+    expect(calls.length).toBe(0);
+    await bg.alarmEvents.onStartup[0]();
+    expect(calls.length).toBe(1);
+    expect(bg.storage._data.auto_sync_next_at).toBeGreaterThan(Date.now());
+    expect(bg.storage._data.auto_sync_report.alarm.lastStartupSync).toMatchObject({ ran: true });
+  });
+
+  test('★ 只在浏览器启动时跑：后台被唤醒（顶层启动段）不额外同步', async () => {
+    const calls = [];
+    loadBackground({
+      withBookmarks: true,
+      initialStorage: Object.assign({}, CONFIGURED, { auto_sync_next_at: Date.now() + 600000 }),
+      patch: makeStub(calls)
+    });
+    await flush(20);
+    expect(calls.length).toBe(0);                    // 没有 onStartup 就没有额外同步
+  });
+
+  test('WebDAV 配置不完整（缺密码）⇒ 不跑，并把原因记账', async () => {
+    const calls = [];
+    const bg = loadBackground({
+      withBookmarks: true,
+      initialStorage: Object.assign({}, CONFIGURED, { webdav_password: '', auto_sync_next_at: Date.now() + 600000 }),
+      patch: makeStub(calls)
+    });
+    await flush();
+    await bg.alarmEvents.onStartup[0]();
+    expect(calls.length).toBe(0);
+    expect(bg.storage._data.auto_sync_report.alarm.lastStartupSync)
+      .toMatchObject({ ran: false, reason: 'WebDAV 配置不完整' });
+  });
+
+  test('自动同步关着 ⇒ 尊重设置，不跑', async () => {
+    const calls = [];
+    const bg = loadBackground({
+      withBookmarks: true,
+      initialStorage: Object.assign({}, CONFIGURED, { sync_enabled: false, auto_sync_next_at: Date.now() + 600000 }),
+      patch: makeStub(calls)
+    });
+    await flush();
+    await bg.alarmEvents.onStartup[0]();
+    expect(calls.length).toBe(0);
+    expect(bg.storage._data.auto_sync_report.alarm.lastStartupSync)
+      .toMatchObject({ ran: false, reason: '自动同步未开启' });
+  });
+
+  test('同一轮启动里补跑已经跑过 ⇒ 不再背靠背跑第二轮', async () => {
+    const calls = [];
+    const bg = loadBackground({
+      withBookmarks: true,
+      initialStorage: Object.assign({}, CONFIGURED, { auto_sync_next_at: Date.now() - 1000 }),
+      patch: makeStub(calls)
+    });
+    await flush(20);                                 // 顶层补跑已经完成
+    expect(calls.length).toBe(1);
+    await bg.alarmEvents.onStartup[0]();
+    expect(calls.length).toBe(1);
+    expect(bg.storage._data.auto_sync_report.alarm.lastStartupSync)
+      .toMatchObject({ ran: false, reason: '本轮启动已同步过' });
+  });
+
+  test('onStartup 与顶层补跑同一 tick 到达 ⇒ 仍只跑一轮', async () => {
+    const calls = [];
+    const bg = loadBackground({
+      withBookmarks: true,
+      initialStorage: Object.assign({}, CONFIGURED, { auto_sync_next_at: Date.now() - 1000 }),
+      patch: (sandbox) => {
+        sandbox.MiniSync.actions.mergeSync = () => {
+          calls.push(1);
+          return new Promise((res) => realSetTimeout(
+            () => res({ success: true, message: 'ok', stats: { added: 0, removed: 0 } }), 40));
+        };
+      }
+    });
+    // 不等顶层那趟，直接同一 tick 触发 onStartup
+    await bg.alarmEvents.onStartup[0]();
+    await flush(80);
+    expect(calls.length).toBe(1);
+  });
+});

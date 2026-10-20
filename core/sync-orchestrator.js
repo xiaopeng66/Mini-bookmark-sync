@@ -14,6 +14,8 @@ function uploadBookmarks(options) {
 
 async function doUploadBookmarks(options) {
   options = options || {};
+  // 本轮开始前登记的移动意图在本轮写云成功后即视为已确认（见 clearConfirmedMoveIntents）
+  const moveIntentCutoff = Date.now();
   // 拿到互斥锁后状态仍是 SYNCING → 必为 SW 崩溃/重启残留（真在跑的流程占着内存锁），
   // 恢复为 IDLE；storage.getSyncStatus 自带 5 分钟看门狗兜底释放陈旧状态。
   const status = await MiniSync.storage.getSyncStatus();
@@ -174,6 +176,12 @@ async function doUploadBookmarks(options) {
     mainCommitted = true;
     const backupCompletion = await MiniSync.syncInput.completeLocalBackup();
     uploadNote += MiniSync.webdav.writeProtectionNote(putResult.protection);
+    // ★ 上传写的就是本机这一刻的树：本轮开始前的移动意图已随之上云，留着只会让
+    //   下一轮把自己当成发起方、反过来拒绝跟随云端后来的移动。同步等待期间用户
+    //   新拖的（time > cutoff）保留。
+    if (MiniSync.syncInput.clearConfirmedMoveIntents) {
+      await MiniSync.syncInput.clearConfirmedMoveIntents(moveIntentCutoff);
+    }
     // ★ 本端把墓碑成功写上了云 ⇒ 这些 key 就是「已确认上云」（撤销判定的条件 ⑤）。
     try {
       const acked = new Set([

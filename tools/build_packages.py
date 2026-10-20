@@ -99,7 +99,7 @@ def main():
             os.remove(packed)
         cp = subprocess.run([args.chrome, '--pack-extension=' + stage_mv3, '--pack-extension-key=' + args.key,
                              '--no-message-box', '--user-data-dir=' + os.path.join(P.BUILD, 'chrome-pack-profile')],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         if os.path.exists(packed):
             shutil.copyfile(packed, crx_path)
             targets.insert(0, ('crx', crx_path))
