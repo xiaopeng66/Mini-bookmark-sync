@@ -127,6 +127,47 @@ function bookmarkWrite(method, ...args) {
   });
 }
 
+/**
+ * 宿主兼容的移动：一次 move 没生效不等于宿主不支持移动，可能只是调用形式不同。
+ * 依次尝试几种常见形态，每次读完树确认节点的父节点真的变了才算成功：
+ *   ① chrome 回调版 {parentId}（桌面浏览器与多数宿主）
+ *   ② 带 index —— 部分宿主没给 index 就静默不动
+ *   ③ 数值型 parentId —— 有的宿主按数字比较 id，字符串比不上就悄悄丢弃
+ *   ④ browser.* Promise 版（Gecko 系宿主原生形态）
+ *   ⑤ chrome 无回调（返回 Promise 的宿主）
+ * ★ 全程不新建、不删除任何书签：全部形式都不生效就返回 false，
+ *   由调用方明确报错并保留两端数据（这是用户书签的最后一道保险）。
+ * @returns {Promise<boolean>} 节点是否确实到了目标父节点下
+ */
+async function moveBookmarkCompat(id, parentId) {
+  const nodeId = String(id);
+  const target = String(parentId);
+  const numericTarget = /^-?\d+$/.test(target) ? Number(target) : null;
+  const attempts = [
+    () => bookmarkWrite('move', nodeId, { parentId: target }),
+    () => bookmarkWrite('move', nodeId, { parentId: target, index: 0 }),
+    numericTarget === null ? null : () => bookmarkWrite('move', nodeId, { parentId: numericTarget }),
+    (typeof browser !== 'undefined' && browser.bookmarks && typeof browser.bookmarks.move === 'function')
+      ? () => browser.bookmarks.move(nodeId, { parentId: target }) : null,
+    () => {
+      const maybe = chrome.bookmarks.move(nodeId, { parentId: target });
+      if (!maybe || typeof maybe.then !== 'function') throw new Error('move 未返回 Promise');
+      return maybe;
+    }
+  ];
+  for (const attempt of attempts) {
+    if (!attempt) continue;
+    try { await attempt(); } catch (_) { continue; }
+    await new Promise(resolve => setTimeout(resolve, 80));
+    let flat;
+    try { flat = MiniSync.merger.chromeTreeToList(await MiniSync.syncInput.getChromeTree()); }
+    catch (_) { continue; }
+    const node = flat.find(n => String(n.id) === nodeId);
+    if (node && String(node.parentId) === target) return true;
+  }
+  return false;
+}
+
 function bridgeListSignature(list) {
   return JSON.stringify(list.map(n => [String(n.id), String(n.parentId || ROOT_ID),
     n.title || '', n.url || '', n.source || '', n._index, !!n.isFolder])
@@ -580,7 +621,8 @@ async function doMergeSync(options) {
             }
             try {
               if (MiniSync.utils && MiniSync.utils.noteTransactionMove) MiniSync.utils.noteTransactionMove(nodeId);
-              await bookmarkWrite('move', nodeId, { parentId: newParentId });
+              // 用兼容重试：宿主可能只认某一种调用形式（带 index、数值 id、browser.*）
+              await moveBookmarkCompat(nodeId, newParentId);
               appliedMoves.push({ id: String(nodeId), oldPk, newPk, newParentId });
               await refreshMoveView();
             } catch (e) {
@@ -619,9 +661,7 @@ async function doMergeSync(options) {
           //   宿主可能只是落盘慢：先重发一次 move、再等一拍，仍不生效才报错。
           if (missedMoves.length > 0) {
             for (const m of missedMoves) {
-              try {
-                await bookmarkWrite('move', String(m.id), { parentId: String(m.newParentId) });
-              } catch (_) { /* 失败照常进入最终复核 */ }
+              await moveBookmarkCompat(m.id, m.newParentId);
             }
             await new Promise(resolve => setTimeout(resolve, 300));
             liveById = await verifyLive();
@@ -630,7 +670,8 @@ async function doMergeSync(options) {
           movesRepaired = 0;
           if (missedMoves.length > 0) {
             const error = new Error(
-              `本机未能把 ${missedMoves.length} 个书签/文件夹移动到云端的新位置（宿主未落盘），`
+              `本机未能把 ${missedMoves.length} 个书签/文件夹移动到云端的新位置`
+              + '（已尝试 回调版 / 带 index / 数值 id / browser.* / Promise 版，宿主均未落盘），'
               + '已停止写回云端以保护书签');
             error.failureCount = missedMoves.length;
             error.moveVerification = missedMoves;

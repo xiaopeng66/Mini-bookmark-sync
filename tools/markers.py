@@ -357,6 +357,8 @@ MARKERS = {
         # 「先建后删」重建落地；仍无法落地就中止（不写回云端），绝不覆盖云端。
         'appliedMoves',
         'missedMoves',
+        # v2.3.7：移动按多种调用形式依次重试（带 index / 数值 id / browser.* / Promise 版）
+        'moveBookmarkCompat',
         'movesRepaired',
         '移动未落地',
         # v2.3.5：重建必须「先确认新节点可见、再删旧节点」；并发保护提示同一级别只提示一次

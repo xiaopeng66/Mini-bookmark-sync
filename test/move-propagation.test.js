@@ -321,3 +321,53 @@ test('★ 重建也失败（宿主 create 不可见）⇒ 旧书签必须保住�
   // 云端逐字节未变
   expect(a.cloud.files.get(a.mainUrl).content).toBe(cloudBefore);
 });
+
+test('★ 宿主只认「带 index 的 move」⇒ 兼容重试后移动成功', async () => {
+  const { a, b, src, dst } = await seed();
+  const bm = await a.add(src.id, 'Target', 'https://target.invalid/');
+  await sync(a, 'uploadBookmarks');
+  await sync(b, 'downloadBookmarks');
+
+  a.state.now += 60000;
+  await a.chrome.bookmarks.move(bm.id, { parentId: dst.id });
+  a.state.store.sync_move_intents = {};
+  await sync(a, 'mergeSync');   // 桌面先把新位置写进云端
+
+  // 宿主形态：不给 index 就静默不动；给了 index 才真正移动
+  const realMove = b.chrome.bookmarks.move;
+  b.chrome.bookmarks.move = (id, info, cb) => {
+    if (info.index === undefined) {
+      if (cb) { cb({ id, parentId: info.parentId }); return undefined; }
+      return Promise.resolve({ id, parentId: info.parentId });
+    }
+    return realMove(id, info, cb);
+  };
+  b.state.now += 60000;
+  const rb = await sync(b, 'mergeSync');
+  expect(rb.success).toBe(true);
+  expect(paths(b)).toEqual(['Dst/Target', 'Sentinel']);
+});
+
+test('★ 宿主只认 browser.* Promise 版 move ⇒ 兼容重试后移动成功', async () => {
+  const { a, b, src, dst } = await seed();
+  const bm = await a.add(src.id, 'Target', 'https://target.invalid/');
+  await sync(a, 'uploadBookmarks');
+  await sync(b, 'downloadBookmarks');
+
+  a.state.now += 60000;
+  await a.chrome.bookmarks.move(bm.id, { parentId: dst.id });
+  a.state.store.sync_move_intents = {};
+  await sync(a, 'mergeSync');   // 桌面先把新位置写进云端
+
+  // 宿主形态：chrome 回调版全部静默不动，只有 browser.* Promise 版生效
+  const realMove = b.chrome.bookmarks.move;
+  b.chrome.bookmarks.move = (id, info, cb) => {
+    if (cb) { cb({ id, parentId: info.parentId }); return undefined; }
+    return Promise.resolve({ id, parentId: info.parentId });
+  };
+  b.sandbox.browser = { bookmarks: { move: (id, info) => realMove(id, info, undefined) } };
+  b.state.now += 60000;
+  const rb = await sync(b, 'mergeSync');
+  expect(rb.success).toBe(true);
+  expect(paths(b)).toEqual(['Dst/Target', 'Sentinel']);
+});
