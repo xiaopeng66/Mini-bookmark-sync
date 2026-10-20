@@ -230,7 +230,7 @@ test('★ 剪切/粘贴式移动（新 id + 删旧节点，无 onMoved）同样�
   for (const d of [a, b]) expect(paths(d)).toEqual(['Dst/Target', 'Sentinel']);
 });
 
-test('★ 宿主 move 静默不生效（回调成功但不落盘）⇒ 自动按「先建后删」修复，绝不把旧位置写回云端', async () => {
+test('★ 宿主 move 静默不生效 ⇒ 明确失败，旧书签原样保留、云端不变（绝不自动删旧）', async () => {
   const { a, b, src, dst } = await seed();
   const bm = await a.add(src.id, 'Target', 'https://target.invalid/');
   await a.add(src.id, 'Stay', 'https://stay.invalid/');
@@ -241,26 +241,22 @@ test('★ 宿主 move 静默不生效（回调成功但不落盘）⇒ 自动按
   await a.chrome.bookmarks.move(bm.id, { parentId: dst.id });
   a.state.store.sync_move_intents = {};
   await sync(a, 'mergeSync');
+  const cloudBefore = a.cloud.files.get(a.mainUrl).content;
 
-  // 手机宿主的真实形态：bookmarks.move 回调成功，但书签实际上没动
   b.chrome.bookmarks.move = (id, info, cb) => {
     if (cb) { cb({ id, parentId: info.parentId }); return undefined; }
     return Promise.resolve({ id, parentId: info.parentId });
   };
   b.state.now += 60000;
-  const rb = await sync(b, 'mergeSync');
+  const rb = await b.M.orchestrator.mergeSync({});
 
-  expect(rb.success).toBe(true);
-  // 本机最终真的落在云端的位置上（只能靠重建完成），而且云端没有被旧位置覆盖
-  expect(paths(b)).toEqual(['Dst/Target', 'Sentinel', 'Src/Stay'].sort());
-  const cloudData = a.M.xbel.xbelToJson(a.cloud.files.get(a.mainUrl).content);
-  const byId = new Map(cloudData.bookmarks.map(n => [n.id, n]));
-  const cloudPaths = cloudData.bookmarks.filter(n => n.url).map(n => {
-    const chain = []; let cur = n;
-    while (cur) { chain.unshift(cur.title || cur.url); cur = byId.get(cur.parentId); }
-    return chain.join('/');
-  }).sort();
-  expect(cloudPaths).toEqual(['Dst/Target', 'Sentinel', 'Src/Stay'].sort());
+  expect(rb.success).toBe(false);
+  expect(rb.message).toContain('已停止写回云端');
+  // 旧书签必须还在原处；绝不因为「移动失败」而删除任何书签
+  expect(paths(b)).toContain('Src/Target');
+  expect(paths(b)).toContain('Src/Stay');
+  // 云端逐字节未变
+  expect(a.cloud.files.get(a.mainUrl).content).toBe(cloudBefore);
 });
 
 test('★ 宿主 move 静默不生效且无法重建（文件夹）⇒ 合并明确失败，云端保持新位置', async () => {

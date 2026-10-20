@@ -360,7 +360,6 @@ MARKERS = {
         'movesRepaired',
         '移动未落地',
         # v2.3.5：重建必须「先确认新节点可见、再删旧节点」；并发保护提示同一级别只提示一次
-        'createdVisible',
         '写回前复核发现',
     ],
     'lib/import.js': [

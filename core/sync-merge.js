@@ -612,62 +612,22 @@ async function doMergeSync(options) {
             liveById = await verifyLive();
             missedMoves = findMissed();
           }
-          // 兜底：move 不生效但 create/remove 可用时，按「下载」路径的做法重建一份
-          // （先建后删，建失败就什么都不删）。只处理书签；文件夹要整棵重建，风险大，
-          // 留给用户明确失败，绝不偷偷删子树。
-          let repaired = 0;
-          const stillMissed = [];
-          for (const m of missedMoves) {
-            const node = liveById.get(String(m.id));
-            if (!node || !node.url) { stillMissed.push(m); continue; }
-            let createdId = null;
-            try {
-              const created = await bookmarkWrite('create', {
-                parentId: String(m.newParentId), title: node.title || '', url: node.url
-              });
-              createdId = String(created.id);
-              // ★ 顺序不可颠倒：必须先确认新节点真的出现在目标父节点下，才允许删旧节点。
-              //   部分宿主 create 会「回调成功但暂时读不到」，先删后就等于把唯一副本删了
-              //   （实测：移动失败 + 宿主读延迟 ⇒ 用户书签直接消失、备份事务卡住）。
-              let after = await verifyLive();
-              const createdVisible = after.get(createdId)
-                && String(after.get(createdId).parentId) === String(m.newParentId);
-              if (!createdVisible) {
-                // 再等一拍确认不是读延迟；仍看不到就撤销新建，保留旧节点。
-                await new Promise(resolve => setTimeout(resolve, 120));
-                after = await verifyLive();
-              }
-              if (!after.get(createdId) || String(after.get(createdId).parentId) !== String(m.newParentId)) {
-                try { await bookmarkWrite('remove', createdId); } catch (_) { /* 写集兜底 */ }
-                stillMissed.push(m);
-                continue;
-              }
-              await bookmarkWrite('remove', String(m.id));
-              after = await verifyLive();
-              if (after.has(String(m.id)) || !after.has(createdId)) {
-                // 旧节点没删掉 = 会留下副本。撤销新建，按失败处理（回滚交给备份）。
-                try { await bookmarkWrite('remove', createdId); } catch (_) { /* 写集兜底 */ }
-                stillMissed.push(m);
-                continue;
-              }
-              mergeCreatedIds.add(createdId);
-              // ★ 旧节点是本轮主动放弃的（已删除）：必须登记进本轮删除集，
-              //   否则导入引擎手里的 mergedData 仍带着它，会把旧位置再建一份
-              //   （实测：重建后旧文件夹里又出现一个同名书签）。
-              if (Array.isArray(mergeResult.localDeletedIds)) {
-                mergeResult.localDeletedIds.push(String(m.id));
-              }
-              // 后续（导入后、写云前）的复核要用新 id：把登记项改到重建出来的节点上。
-              m.id = createdId;
-              repaired++;
-              liveById = after;
-            } catch (e) {
-              if (createdId) { try { await bookmarkWrite('remove', createdId); } catch (_) { /* 写集兜底 */ } }
-              stillMissed.push(m);
+          // ★ 这里**不再自动「新建 + 删旧」**：部分手机宿主的书签树在同步后会把
+          //   新建的节点丢掉（或被宿主自己的书签同步回滚），而旧的已经被删 ——
+          //   用户的书签就此消失（实测：2.3.4/2.3.5 在 Firefox Android 上重建 1 项，
+          //   同步后总数反而少 1）。宁可明确失败、两端原样保留，也不拿用户书签冒险。
+          //   宿主可能只是落盘慢：先重发一次 move、再等一拍，仍不生效才报错。
+          if (missedMoves.length > 0) {
+            for (const m of missedMoves) {
+              try {
+                await bookmarkWrite('move', String(m.id), { parentId: String(m.newParentId) });
+              } catch (_) { /* 失败照常进入最终复核 */ }
             }
+            await new Promise(resolve => setTimeout(resolve, 300));
+            liveById = await verifyLive();
+            missedMoves = findMissed();
           }
-          movesRepaired = repaired;
-          missedMoves = stillMissed;
+          movesRepaired = 0;
           if (missedMoves.length > 0) {
             const error = new Error(
               `本机未能把 ${missedMoves.length} 个书签/文件夹移动到云端的新位置（宿主未落盘），`
