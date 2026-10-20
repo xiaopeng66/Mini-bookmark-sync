@@ -271,7 +271,9 @@ async function doUploadBookmarks(options) {
     //   （审计 2026-10-11 复现 snapshot-write-failure）。
     await MiniSync.syncInput.saveLocalSnapshot();
     const baselineRepair = await MiniSync.syncInput.repairBaselineIfNeeded();
-    const baselineSave = await MiniSync.syncInput.saveLocalTreeSnapshot();
+    // 基线必须记「这次真正写进云端的树」（flatList 由上传用的 tree 生成）：
+    // PUT 等待期间用户新拖的移动不在云端，不能进基线，否则下一轮会把它迁回旧位置。
+    const baselineSave = await MiniSync.syncInput.saveLocalTreeSnapshot(flatList);
     const baselineIncomplete = !baselineSave.ok || baselineRepair.ok === false;
     const warnings = [];
     if (!backupCompletion.ok) warnings.push('备份事务状态保存失败: ' + backupCompletion.error);

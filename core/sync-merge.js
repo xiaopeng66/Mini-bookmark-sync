@@ -400,6 +400,9 @@ async function doMergeSync(options) {
     // 落盘结果（importBookmarksFromData 的返回值），供最终统计展示实际增删。
     // 必须声明在 try 外：import 调用点在 try 内深层块，而 return 在 try/catch 之后读取它。
     let importResult = null;
+    // 本轮实际写进云端的扁平树（未写回时为 null ⇒ 基线按当前树记录）。
+    // 基线只能代表云端已确认的状态：PUT 等待期间用户新拖的移动不在其中。
+    let confirmedFlat = null;
     const mergeCreatedIds = new Set();
     let bridgeOutcome = { bridgeResults: {}, partial: false };
     const bridgeReadFailures = [];
@@ -944,6 +947,9 @@ async function doMergeSync(options) {
         // 此时本地顺序已是合并结果（含对端新顺序），写回云端不会把新顺序覆盖掉。
         if (needWriteBack) {
           const finalTree = await MiniSync.syncInput.getChromeTree();
+          // ★ 云端收到的就是这棵树：提交后用它做基线。PUT 等待期间用户新拖的移动
+          //   不在其中，不能进基线（否则下一轮会把它判成「跟随云端」迁回旧位置）。
+          confirmedFlat = MiniSync.merger.chromeTreeToList(finalTree);
           const deviceId = await MiniSync.storage.getDeviceId();
           // ★ 墓碑用 mergeBookmarks 落定的**并集**（本地 ∪ 云端），不能用本地存储单独取：
           //   只写本机墓碑 = 把云端带来的墓碑整份冲掉，其他端从此再也学不到这次删除
@@ -1120,7 +1126,7 @@ async function doMergeSync(options) {
     // 基线快照是删除传播的必要状态：写失败会被记录，先尝试补交上次欠的，
     // 再把本次结果如实并入 partial（见 core/sync-input.js saveLocalTreeSnapshot）。
     const baselineRepair = await MiniSync.syncInput.repairBaselineIfNeeded();
-    const baselineSave = await MiniSync.syncInput.saveLocalTreeSnapshot();
+    const baselineSave = await MiniSync.syncInput.saveLocalTreeSnapshot(confirmedFlat || undefined);
     const baselineIncomplete = !baselineSave.ok || baselineRepair.ok === false;
     // ★ 同「下载」的真缺陷修复：processNode 的 create() 抛错会收进 conflicts，
     //   旧实现把它丢掉、对外仍说「合并成功」——手机上一条都没落地也看不出来。
@@ -1156,6 +1162,10 @@ async function doMergeSync(options) {
           rootChildTitles: (importResult && importResult.rootChildTitles) || [],
           landedSample: (importResult && importResult.landedSample) || [],
           crossZoneSkipped: crossZoneDiag.skippedNoParent,
+          // 本轮移动判定结果：手机端 console 读不到时，这两个数是「为什么位置没变/被搬回」
+          // 的唯一凭据（localMoved>0 = 本端是发起方并写回云端；movedPairs>0 = 本端跟随云端）。
+          localMoved: (mergeResult && mergeResult.localMovedCount) || 0,
+          movedPairs: (mergeResult && mergeResult.renamePairs ? mergeResult.renamePairs.length : 0),
           // 重排阶段的真实代价：手机端 console 读不到，这两个数是唯一能看出「卡不卡」的证据。
           // 顺序本来就一致时 movesAttempted 必须是 0（2026-10-05 手机卡顿的根因就是它不是 0）。
           movesAttempted: (importResult && importResult.movesAttempted) || 0,
@@ -1197,7 +1207,7 @@ async function doMergeSync(options) {
   } catch (error) {
     console.error('[sync] 合并失败:', error.message);
     if (mainCommitted || localCommitted) {
-      try { await MiniSync.syncInput.saveLocalTreeSnapshot(); }
+      try { await MiniSync.syncInput.saveLocalTreeSnapshot(confirmedFlat || undefined); }
       catch (e) { warnings.push('本地基线快照写入失败: ' + e.message); }
       warnings.push(error.message);
       try { await MiniSync.storage.setSyncStatus({ status: 'partial', partial: true, error: warnings.join('；') }); }

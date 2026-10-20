@@ -286,13 +286,54 @@ describe('移动身份证据 — 用 chrome id 区分「移动」与「同名同
     expect(result.renamePairs.length).toBe(0);
   });
 
-  test('新建同名副本（id 不在基线里）⇒ 不冒充移动，仍按接收方跟随云端', async () => {
+  test('新建同名副本（原节点还在原处、新节点 id 不在基线）⇒ 不冒充移动', async () => {
     await installStorage([]);
     const before = localTree([X('xa')], []);
     storageState.sync_snapshots = { localTree: M.merger.chromeTreeToList(before) };
-    // 本地 B 下多了一个全新的同标题同 URL 书签（新 id），云端仍在 A 下
-    const result = await M.merger.mergeBookmarks(localTree([], [X('xnew')]), remoteData([X('ra')], []), {});
+    // 本地 A 下原节点仍在，B 下另有一个全新的同标题同 URL 书签（新 id）；
+    // 云端仍只有 A 下那一个。这不是移动，新节点应按「本地独有」保留。
+    const local = localTree([X('xa')], [X('xnew')]);
+    const result = await M.merger.mergeBookmarks(local, remoteData([X('ra')], []), {});
+    expect(result.localMovedCount).toBe(0);
+    expect(result.localOnlyIds).toContain('xnew');
+  });
+});
+
+describe('移动方向 — 基线优先，意图只兜底', () => {
+  test('★ 本端停在基线路径、云端换了位置 ⇒ 即使有残留意图也必须跟随云端', async () => {
+    await installStorage([]);
+    const atOld = localTree([X('xa')], []);
+    storageState.sync_snapshots = { localTree: M.merger.chromeTreeToList(atOld) };
+    // 本端自上次同步后没动过它；意图表里却留着一条（同步失败/下载路径没清理）
+    storageState.sync_move_intents = {
+      'ROOT:bar/F:FolderA/L:https://x': { time: Date.now(), deviceId: DEV_EDGE }
+    };
+    const result = await M.merger.mergeBookmarks(localTree([X('xa')], []), remoteData([], [X('rb')]), {});
+    // 接收方：必须生成迁移对跟随云端，绝不能反过来把旧位置写回云端
     expect(result.localMovedCount).toBe(0);
     expect(result.renamePairs.length).toBeGreaterThan(0);
+    expect(result.renamePairs[0].newPk).toContain('FolderB');
+  });
+
+  test('跨文件夹移动 + 改名（URL 归一化后唯一）⇒ 识别为移动，本端为发起方', async () => {
+    await installStorage([]);
+    const before = localTree([X('xa')], []);
+    storageState.sync_snapshots = { localTree: M.merger.chromeTreeToList(before) };
+    const renamed = { ...X('xa'), title: 'Renamed' };
+    const result = await M.merger.mergeBookmarks(localTree([], [renamed]), remoteData([{ ...X('ra'), url: 'https://x/' }], []), {});
+    expect(result.localMovedCount).toBe(1);
+    expect(result.renamePairs.length).toBe(0);
+    expect(result.remoteUpdated).toBe(true);
+  });
+
+  test('URL 只差尾斜杠也认作同一书签（按归一化 URL 比较）', async () => {
+    await installStorage([]);
+    const before = localTree([{ ...X('xa'), url: 'https://x/' }], []);
+    storageState.sync_snapshots = { localTree: M.merger.chromeTreeToList(before) };
+    const result = await M.merger.mergeBookmarks(
+      localTree([], [{ ...X('xa'), url: 'https://x/' }]),
+      remoteData([{ ...X('ra'), url: 'https://x' }], []), {});
+    expect(result.localMovedCount).toBe(1);
+    expect(result.remoteOnlyIds).not.toContain('ra');
   });
 });

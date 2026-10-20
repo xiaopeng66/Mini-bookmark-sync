@@ -140,3 +140,92 @@ test('★ 同步进行中用户拖动书签 = 记录意图；同步自身落盘�
   expect(intents[newPk]).toBeTruthy();
   expect(Object.keys(intents).filter(k => k.includes('OwnMove'))).toEqual([]);
 });
+
+test('★ 手机端残留移动意图（上次移动遗留、未清理）⇒ 不能被当成发起方把旧位置写回云端', async () => {
+  const { a, b } = await seed();
+  const bsrc = [...b.byId.values()].find(n => !n.url && n.title === 'Src');
+  const bdst = [...b.byId.values()].find(n => !n.url && n.title === 'Dst');
+  const bm = await b.add(bsrc.id, 'Target', 'https://target.invalid/');
+  await sync(b, 'uploadBookmarks');
+  await sync(a, 'downloadBookmarks');
+
+  // 桌面把书签挪到 Dst 并同步（意图在提交后清除）
+  a.state.now += 60000;
+  await a.chrome.bookmarks.move([...a.byId.values()].find(n => n.url && n.title === 'Target').id, { parentId: [...a.byId.values()].find(n => !n.url && n.title === 'Dst').id });
+  await sync(a, 'mergeSync');
+
+  // 手机端残留一条旧意图：它此前也动过这条路径，但那次同步失败/走了下载路径
+  const oldTree = b.M.merger.chromeTreeToList([b.state.root]);
+  const oldPk = b.M.xbelPath.computeJsonPathKeys(oldTree).get(bm.id);
+  b.state.store.sync_move_intents = { [oldPk]: { time: b.state.now, deviceId: b.state.store.sync_device_id } };
+  // 把手机的基线恢复为「书签在 Src」的状态（它上次成功同步时就是这样）
+  b.state.store.sync_snapshots = { localTree: oldTree };
+
+  b.state.now += 60000;
+  const rb = await sync(b, 'mergeSync');
+  expect(rb.crossZoneDiag.moves).toBe(1);
+  expect(paths(b)).toEqual(['Dst/Target', 'Sentinel']);
+  // 云端仍是桌面的新位置（没有被手机的旧位置覆盖）
+  const cloudData = a.M.xbel.xbelToJson(a.cloud.files.get(a.mainUrl).content);
+  const byId = new Map(cloudData.bookmarks.map(n => [n.id, n]));
+  const cloudPaths = cloudData.bookmarks.filter(n => n.url).map(n => {
+    const chain = []; let cur = n;
+    while (cur) { chain.unshift(cur.title || cur.url); cur = byId.get(cur.parentId); }
+    return chain.join('/');
+  }).sort();
+  expect(cloudPaths).toEqual(['Dst/Target', 'Sentinel']);
+});
+
+test('★ PUT 等待期间用户又移动了书签：基线记「已上传的树」，下一轮不把这次移动迁回', async () => {
+  const cloud = makeCloud();
+  const a = device('inflight-A', cloud);
+  const src = await a.add('1', 'Src');
+  const dst = await a.add('1', 'Dst');
+  const bm = await a.add(src.id, 'Target', 'https://target.invalid/');
+  await sync(a, 'uploadBookmarks');
+  // 先制造一个必然写回云端的改动（新增书签），保证这一轮真的走 PUT
+  await a.add('1', 'Extra', 'https://extra.invalid/');
+
+  a.state.now += 60000;
+  const originalPut = a.M.webdav.putFile;
+  let moved = false;
+  a.M.webdav.putFile = async (...args) => {
+    if (!moved) {
+      moved = true;
+      // PUT 发出前的树已经算好；此刻用户把书签挪走，云端不会包含这次移动
+      await a.chrome.bookmarks.move(bm.id, { parentId: dst.id });
+      a.state.store.sync_move_intents = {};
+    }
+    return originalPut(...args);
+  };
+  await sync(a, 'mergeSync');
+  expect(moved).toBe(true);
+  // 基线里必须仍是上传时的旧位置（不是 PUT 之后的新位置）
+  const baseKeys = a.M.xbelPath.computeJsonPathKeys(a.state.store.sync_snapshots.localTree).values();
+  expect([...baseKeys].some(k => k.includes('Src/L:https://target.invalid'))).toBe(true);
+  expect([...baseKeys].some(k => k.includes('Dst/L:https://target.invalid'))).toBe(false);
+
+  // 下一轮：本端移动发生在基线之后 ⇒ 仍判本端发起，不回迁
+  a.state.now += 60000;
+  await sync(a, 'mergeSync');
+  expect(paths(a)).toEqual(['Dst/Target', 'Extra']);
+});
+
+test('★ 剪切/粘贴式移动（新 id + 删旧节点，无 onMoved）同样传播', async () => {
+  const { a, b, src, dst } = await seed();
+  const bm = await a.add(src.id, 'Target', 'https://target.invalid/');
+  await sync(a, 'uploadBookmarks');
+  await sync(b, 'downloadBookmarks');
+
+  a.state.now += 60000;
+  // 书签管理器「剪切→粘贴」：新节点拿到新 id，旧节点被删，浏览器不派发 onMoved
+  await a.add(dst.id, 'Target', 'https://target.invalid/');
+  await a.chrome.bookmarks.remove(bm.id);
+  a.state.store.sync_move_intents = {};
+
+  await sync(a, 'mergeSync');
+  expect(paths(a)).toEqual(['Dst/Target', 'Sentinel']);
+
+  await converge(a, b);
+  for (const d of [a, b]) expect(paths(d)).toEqual(['Dst/Target', 'Sentinel']);
+});

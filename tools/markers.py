@@ -408,9 +408,15 @@ MARKERS = {
         # v2.3.2：移动方向改用「意图 + 基线身份证据」双判据；本端发起的移动必须写回云端
         # （源文件夹只有这一个书签时，旧实现没有任何写回条件成立 ⇒ 位置被还原）。
         'baselinePkById',
-        'localMovedSinceBaseline',
         'localMoveAuthored',
         'localMovedCount',
+        # v2.3.3：方向判定改为「基线优先、意图只兜底」——本端自上次同步后没动过
+        # 这个节点时，残留意图不得把云端的新位置覆盖回旧位置；并识别剪切/粘贴式移动。
+        'baselineSaysLocalMoved',
+        'baselineSaysLocalStill',
+        'baselineNodeGone',
+        'baselineIdsByPk',
+        'localUrlCount',
     ],
     'model/xbel-path.js': [
         'node.zoneRoot',
@@ -440,6 +446,9 @@ MARKERS = {
         'writeSet',
         # v2.3.2：同步成功后清理「已确认上云」的移动意图（保留同步期间新拖的）
         'clearConfirmedMoveIntents',
+        # v2.3.3：上传/合并提交后用「实际写进云端的树」做基线（overrideFlat），
+        # 不再回读当前树 —— PUT 等待期间用户新拖的移动不在云端，不能进基线。
+        'overrideFlat',
     ],
     'popup.html': [
         '增量：云端新增的导入本机',

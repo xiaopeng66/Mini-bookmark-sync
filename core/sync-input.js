@@ -924,12 +924,19 @@ async function writeBaseline(flat) {
   });
 }
 
-async function saveLocalTreeSnapshot() {
+async function saveLocalTreeSnapshot(overrideFlat) {
   let flat;
   let relationshipKey;
   let mayReplacePending = false;
   try {
-    flat = MiniSync.merger.chromeTreeToList(await getChromeTree());
+    // ★ 上传/合并提交成功时必须传入**实际写进云端的扁平树**（overrideFlat）：
+    //   在这里再读一次当前树，会把「PUT 等待期间用户新拖的书签」记进基线 ——
+    //   云端并没有这次移动，下一轮三方比较就会把它当成「上次同步时就在那里」，
+    //   于是把用户的移动判成「跟随云端」并迁回原位（实测：移动后同步，位置被还原）。
+    //   基线只应代表**云端已确认的状态**。下载路径不写云端，仍按当前树记录。
+    flat = Array.isArray(overrideFlat)
+      ? overrideFlat
+      : MiniSync.merger.chromeTreeToList(await getChromeTree());
     const data = await MiniSync.storage.getLocal(['sync_relationship_key', 'sync_baseline_repair_needed']);
     relationshipKey = data.sync_relationship_key || null;
     const previous = pendingBaseline(data);

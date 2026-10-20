@@ -4,10 +4,20 @@
 > 本仓库是 [原项目](https://github.com/jagshen/Mini-bookmark-sync) 的维护版：保留原项目的全部功能，
 > 并补上手机端支持、双向增量增删，以及一批跨端同步的一致性修复。
 
-[![Version](https://img.shields.io/badge/version-2.3.2-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
+[![Version](https://img.shields.io/badge/version-2.3.3-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
+
+## v2.3.3 发布说明
+
+修复移动书签后另一台设备收不到、云端反被旧位置覆盖的问题。
+
+- 一台设备把书签或文件夹移到别处并同步后，另一台设备同步时能拿到新位置，不再把旧位置写回云端。
+- 移动方向以「上次同步时这个书签在哪里」为准，本机残留的旧移动记录不会再反向覆盖云端。
+- 剪切/粘贴式移动、网址只差末尾斜杠、移动同时改标题，也都能识别为同一次移动。
+
+929 条 JavaScript 回归与 6 条打包工具测试通过。验证使用隔离模拟数据，没有完成真实手机、浏览器 GUI 或生产 WebDAV 验收。安装仍由宿主浏览器确认。详见 [完整发布说明](docs/release-v2.3.3.md)。
 
 ## v2.3.2 发布说明
 
