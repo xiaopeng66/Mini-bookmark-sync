@@ -232,3 +232,26 @@ describe('popup configuration identity integration', () => {
     expect(h.statuses.at(-1).text).toBe('配置未就绪');
   });
 });
+
+test('本地事务卡片：同步进行中不显示，同步结束后仍缺收尾才显示', () => {
+  const el = { hidden: null, classList: { toggle(_cls, hide) { el.hidden = hide; } } };
+  const ctx = {
+    document: { getElementById: (id) => (id === 'localRecoveryEntry' ? el : { onclick: null }) },
+    chrome: { runtime: { openOptionsPage() {} } },
+    MiniSync: { utils: { localBackupNeedsRecovery: (meta) => !!meta && ['pending', 'restoring', 'failed'].includes(meta.status) } },
+  };
+  vm.createContext(ctx);
+  vm.runInContext(section("const localRecoveryEntry = document.getElementById", "if (openRecoveryBtn)"), ctx);
+
+  // 同步进行中：事务备份本来就是 pending，这张卡绝不能弹（用户每点一次同步都会看到）
+  ctx.renderLocalRecoveryEntry({ status: 'pending' }, 'syncing');
+  expect(el.hidden).toBe(true);
+  // 同步结束、事务已提交：不显示
+  ctx.renderLocalRecoveryEntry({ status: 'committed' }, 'success');
+  expect(el.hidden).toBe(true);
+  // 同步结束、事务仍没完成（没有同步在跑）：必须显示，提示用户检查备份
+  ctx.renderLocalRecoveryEntry({ status: 'pending' }, 'failed');
+  expect(el.hidden).toBe(false);
+  ctx.renderLocalRecoveryEntry({ status: 'failed' }, undefined);
+  expect(el.hidden).toBe(false);
+});

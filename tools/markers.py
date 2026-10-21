@@ -243,6 +243,8 @@ MARKERS = {
         'a.btn-mini, a.btn-mini:visited',
     ],
     'popup.js': [
+        # v2.3.8：同步进行中不显示「有未完成的本地事务」卡片（事务 pending 是同步的中间态）
+        'busy || !MiniSync.utils.localBackupNeedsRecovery',
         'requestHostPermission',
         'describeMessageFailure',
         'installSendMessageFallback',

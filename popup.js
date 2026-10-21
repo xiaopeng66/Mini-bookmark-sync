@@ -45,8 +45,13 @@ const emptyHero = document.getElementById('emptyHero');
 const localRecoveryEntry = document.getElementById('localRecoveryEntry');
 const openRecoveryBtn = document.getElementById('openRecoveryBtn');
 
-function renderLocalRecoveryEntry(meta) {
-  localRecoveryEntry?.classList.toggle('hide', !MiniSync.utils.localBackupNeedsRecovery(meta));
+// ★ 只有「这轮同步已经结束、事务仍没完成」才提示。
+//   同步进行中备份状态本来就是 pending（事务还在写），旧实现照样弹
+//   「有未完成的本地事务…请检查后再同步」——用户每点一次同步都先看到这张卡，
+//   等提交完成才消失，看起来像「卡了一下」。同步在跑时不显示它。
+function renderLocalRecoveryEntry(meta, syncStatus) {
+  const busy = syncStatus === 'syncing';
+  localRecoveryEntry?.classList.toggle('hide', busy || !MiniSync.utils.localBackupNeedsRecovery(meta));
 }
 if (openRecoveryBtn) openRecoveryBtn.onclick = () => chrome.runtime.openOptionsPage();
 
@@ -618,7 +623,7 @@ async function updateHomeStatus() {
     return;
   }
 
-  if (r.local_bookmark_backup_meta) renderLocalRecoveryEntry(r.local_bookmark_backup_meta);
+  if (r.local_bookmark_backup_meta) renderLocalRecoveryEntry(r.local_bookmark_backup_meta, r.sync_status);
   if (r.sync_status === 'syncing') {
     renderBusySync(r.sync_action);
     return;
@@ -1445,7 +1450,17 @@ chrome.storage.onChanged.addListener((changes, area) => {
     });
   }
   if (changes.local_bookmark_backup_meta) {
-    renderLocalRecoveryEntry(changes.local_bookmark_backup_meta.newValue);
+    const meta = changes.local_bookmark_backup_meta.newValue;
+    const changedSync = changes.sync_status ? changes.sync_status.newValue : undefined;
+    if (changedSync !== undefined) {
+      renderLocalRecoveryEntry(meta, changedSync);
+    } else {
+      // 备份状态与同步状态不在同一次变更里：读一次当前同步状态再决定，
+      // 否则同步刚开始（pending）时这张卡又会闪出来。
+      chrome.storage.local.get(['sync_status']).then(r => {
+        renderLocalRecoveryEntry(meta, r && r.sync_status);
+      }).catch(() => { renderLocalRecoveryEntry(meta); });
+    }
   }
   if (changes.last_sync_at) {
     renderLastSync(changes.last_sync_at.newValue);
