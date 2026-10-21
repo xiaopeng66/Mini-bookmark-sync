@@ -4,14 +4,13 @@
 > 本仓库是 [原项目](https://github.com/jagshen/Mini-bookmark-sync) 的维护版：保留原项目的全部功能，
 > 并补上手机端支持、双向增量增删，以及一批跨端同步的一致性修复。
 
-[![Version](https://img.shields.io/badge/version-2.4.0-blue.svg)](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
 
-## 版本与更新
+## 获取安装包
 
-变更记录、安装包与校验值都在 [Releases 页](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)，扩展设置页的「检查更新」也指向那里。
+安装包与变更记录见 [Releases 页](https://github.com/xiaopeng66/Mini-bookmark-sync/releases)；扩展设置页的「检查更新」也指向那里。
 
 ## ✨ 功能特色
 
