@@ -76,7 +76,7 @@ MARKERS = {
         '_catchUpInFlight',
         '_autoSyncInFlight',
         '自动同步已有一轮在跑，本轮跳过',
-        # v2.3.2：① 浏览器启动、配置检查通过后额外同步一轮（只挂 onStartup，
+        # ① 浏览器启动、配置检查通过后额外同步一轮（只挂 onStartup，
         #   绝不挂顶层 —— MV3 的 SW 会在会话里被反复唤醒）；
         #   ② 同步进行中用户拖动书签也必须记录移动意图，同步自身的落盘移动则排除。
         'syncOnceOnStartup',
@@ -85,7 +85,7 @@ MARKERS = {
     ],
     'lib/utils.js': [
         'PERMISSION_API_UNAVAILABLE',
-        # v2.3.2：事务内移动登记（同步自身落盘的移动不得记成用户意图）
+        # 事务内移动登记（同步自身落盘的移动不得记成用户意图）
         'noteTransactionMove',
         'isTransactionMove',
         'isHandlingUserInput',
@@ -243,7 +243,7 @@ MARKERS = {
         'a.btn-mini, a.btn-mini:visited',
     ],
     'popup.js': [
-        # v2.3.8：同步进行中不显示「有未完成的本地事务」卡片（事务 pending 是同步的中间态）
+        # 同步进行中不显示「有未完成的本地事务」卡片（事务 pending 是同步的中间态）
         'busy || !MiniSync.utils.localBackupNeedsRecovery',
         'requestHostPermission',
         'describeMessageFailure',
@@ -352,24 +352,24 @@ MARKERS = {
         'ensureMoveParent',
         'refreshMoveView',
         'canonicalOldPk',
-        # v2.3.2：同步自身落盘的移动登记为事务移动；提交成功后清理已确认的移动意图
+        # 同步自身落盘的移动登记为事务移动；提交成功后清理已确认的移动意图
         'noteTransactionMove',
         'clearConfirmedMoveIntents',
-        # v2.3.4：移动落盘校验——宿主 move 静默不生效时先等一拍复核，书签按
+        # 移动落盘校验——宿主 move 静默不生效时先等一拍复核，书签按
         # 「先建后删」重建落地；仍无法落地就中止（不写回云端），绝不覆盖云端。
         'appliedMoves',
         'missedMoves',
-        # v2.3.7：移动按多种调用形式依次重试（带 index / 数值 id / browser.* / Promise 版）
+        # 移动按多种调用形式依次重试（带 index / 数值 id / browser.* / Promise 版）
         'moveBookmarkCompat',
         'movesRepaired',
         '移动未落地',
-        # v2.3.5：重建必须「先确认新节点可见、再删旧节点」；并发保护提示同一级别只提示一次
+        # 重建必须「先确认新节点可见、再删旧节点」；并发保护提示同一级别只提示一次
         '写回前复核发现',
     ],
     'lib/import.js': [
         'byBucket',
         'byUserTarget',
-        # v2.3.2：落盘/重排自身的移动登记为事务移动（onMoved 监听不得当成用户意图）
+        # 落盘/重排自身的移动登记为事务移动（onMoved 监听不得当成用户意图）
         'noteTransactionMove',
         'rootChildTitles',
         'zoneIds',
@@ -417,12 +417,12 @@ MARKERS = {
         'localRenamed',
         '_decideRenameDiscard',
         'homeNodeId',
-        # v2.3.2：移动方向改用「意图 + 基线身份证据」双判据；本端发起的移动必须写回云端
+        # 移动方向改用「意图 + 基线身份证据」双判据；本端发起的移动必须写回云端
         # （源文件夹只有这一个书签时，旧实现没有任何写回条件成立 ⇒ 位置被还原）。
         'baselinePkById',
         'localMoveAuthored',
         'localMovedCount',
-        # v2.3.3：方向判定改为「基线优先、意图只兜底」——本端自上次同步后没动过
+        # 方向判定改为「基线优先、意图只兜底」——本端自上次同步后没动过
         # 这个节点时，残留意图不得把云端的新位置覆盖回旧位置；并识别剪切/粘贴式移动。
         'baselineSaysLocalMoved',
         'baselineSaysLocalStill',
@@ -456,12 +456,12 @@ MARKERS = {
         'dropContainer',
         'hasKeptDescendant',
         'writeSet',
-        # v2.3.2：同步成功后清理「已确认上云」的移动意图（保留同步期间新拖的）
+        # 同步成功后清理「已确认上云」的移动意图（保留同步期间新拖的）
         'clearConfirmedMoveIntents',
-        # v2.3.3：上传/合并提交后用「实际写进云端的树」做基线（overrideFlat），
+        # 上传/合并提交后用「实际写进云端的树」做基线（overrideFlat），
         # 不再回读当前树 —— PUT 等待期间用户新拖的移动不在云端，不能进基线。
         'overrideFlat',
-        # v2.3.5：并发保护降档提示同一级别只出现一次（诊断里仍有完整级别）
+        # 并发保护降档提示同一级别只出现一次（诊断里仍有完整级别）
         'writeProtectionNoteOnce',
         'last_write_protection',
     ],
