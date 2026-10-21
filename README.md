@@ -165,6 +165,12 @@ Mini-bookmark-sync/
 └── docs/                  # 仓库文档资源（README 截图等，不进安装包）
 ```
 
+## 🔐 安全
+
+书签数据直连你自己的云盘、不经过第三方服务器，WebDAV 凭据只保存在本机浏览器里。
+发现安全问题请用 GitHub 仓库「Security → Report a vulnerability」私下报告，不要在公开 Issue 里贴出可利用细节；
+一般使用问题走 [问题反馈](https://github.com/xiaopeng66/Mini-bookmark-sync/issues)。
+
 ## 🙏 感谢原项目
 
 本项目的原始版本由 **[jagshen](https://github.com/jagshen)** 开发并开源：

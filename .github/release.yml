@@ -1,0 +1,14 @@
+# GitHub 自动生成发行说明的分类配置（发行说明口径见仓库约定：只写 更新 / 优化 / 修复）
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+  categories:
+    - title: 更新
+      labels: [feature]
+    - title: 优化
+      labels: [enhancement, performance]
+    - title: 修复
+      labels: [bug, security]
+    - title: 其他
+      labels: ["*"]
